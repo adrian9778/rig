@@ -9,7 +9,7 @@ use std::sync::{
 };
 
 use rig::{
-    completion::{CompletionModel, Prompt, ToolDefinition},
+    completion::{CompletionModel, ToolDefinition},
     message::{AssistantContent, Message, UserContent},
     prelude::*,
     providers::anthropic::completion::CLAUDE_SONNET_4_6,
@@ -210,7 +210,6 @@ async fn prompt_loop_accepts_empty_terminal_turn_after_tool_result() {
             let response = agent
                 .prompt(TERMINAL_NOTIFY_PROMPT)
                 .max_turns(5)
-                .extended_details()
                 .await
                 .expect("agent prompt should not fail on an empty terminal Anthropic turn");
 
@@ -229,18 +228,15 @@ async fn prompt_loop_accepts_empty_terminal_turn_after_tool_result() {
                 .expect("extended details should include history");
             assert!(
                 messages.iter().any(assistant_message_has_notify_tool_call),
-                "expected notify tool call in history, got {:?}",
-                messages
+                "expected notify tool call in history, got {messages:?}"
             );
             assert!(
                 messages.iter().any(message_has_tool_result),
-                "expected tool result in history, got {:?}",
-                messages
+                "expected tool result in history, got {messages:?}"
             );
             assert!(
                 !history_has_empty_assistant_text(&messages),
-                "history should not contain the normalized empty assistant sentinel: {:?}",
-                messages
+                "history should not contain the normalized empty assistant sentinel: {messages:?}"
             );
         },
     )
@@ -261,7 +257,6 @@ async fn prompt_loop_preserves_pre_tool_text_when_terminal_followup_is_empty() {
     let response = agent
         .prompt(TERMINAL_NOTIFY_PROMPT)
         .max_turns(5)
-        .extended_details()
         .await
         .expect("agent prompt should preserve prior-turn text when Anthropic ends empty");
 
@@ -282,18 +277,15 @@ async fn prompt_loop_preserves_pre_tool_text_when_terminal_followup_is_empty() {
         messages
             .iter()
             .any(assistant_message_has_nonempty_text_and_notify_tool_call),
-        "expected an assistant message that preserved pre-tool text alongside the notify tool call, got {:?}",
-        messages
+        "expected an assistant message that preserved pre-tool text alongside the notify tool call, got {messages:?}"
     );
     assert!(
         messages.iter().any(message_has_tool_result),
-        "expected tool result in history, got {:?}",
-        messages
+        "expected tool result in history, got {messages:?}"
     );
     assert!(
         !history_has_empty_assistant_text(&messages),
-        "history should not contain the normalized empty assistant sentinel: {:?}",
-        messages
+        "history should not contain the normalized empty assistant sentinel: {messages:?}"
     );
 
     })

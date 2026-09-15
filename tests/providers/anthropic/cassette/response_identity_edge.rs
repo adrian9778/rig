@@ -10,10 +10,10 @@ use rig::agent::{
     AgentHook, HookContext, InvalidToolCallAction, InvalidToolCallContext, ModelTurnAction,
     ModelTurnFinished,
 };
-use rig::completion::{CompletionModel, Document, Message, Prompt};
+use rig::completion::{CompletionModel, Document, Message};
 use rig::prelude::*;
 use rig::providers::anthropic::completion::{CLAUDE_SONNET_4_6, CacheTtl};
-use rig::streaming::StreamedAssistantContent;
+use rig::streaming::StreamEvent;
 use rig::tool::{Tool, ToolContext, ToolExecutionError};
 
 use super::super::support::with_anthropic_cassette;
@@ -41,7 +41,7 @@ async fn caching_and_identity_share_the_wire_blocking() {
                 .completion_model(CLAUDE_SONNET_4_6)
                 .with_prompt_caching()
                 .with_static_prefix_cache_ttl(CacheTtl::OneHour);
-            let send = |model: rig::providers::anthropic::completion::CompletionModel| async move {
+            let send = |model: rig::providers::anthropic::CompletionModel| async move {
                 model
                     .raw_completion(
                         model
@@ -98,7 +98,7 @@ async fn caching_and_identity_share_the_wire_streaming() {
                 .completion_model(CLAUDE_SONNET_4_6)
                 .with_prompt_caching()
                 .with_static_prefix_cache_ttl(CacheTtl::OneHour);
-            let send = |model: rig::providers::anthropic::completion::CompletionModel| async move {
+            let send = |model: rig::providers::anthropic::CompletionModel| async move {
                 let mut stream = model
                     .completion_request("Reply with exactly: stream edge probe")
                     .preamble(cache_padding("caching-streaming"))
@@ -109,9 +109,7 @@ async fn caching_and_identity_share_the_wire_streaming() {
                     .expect("stream should open");
                 let mut terminal = None;
                 while let Some(item) = stream.next().await {
-                    if let StreamedAssistantContent::Final(final_record) =
-                        item.expect("stream item")
-                    {
+                    if let StreamEvent::Final(final_record) = item.expect("stream item") {
                         terminal = Some(final_record);
                     }
                 }
@@ -273,7 +271,6 @@ async fn tool_error_retry_reports_distinct_ids_blocking() {
             let response = agent
                 .prompt("What is 2 + 3? Use the tool.")
                 .max_turns(5)
-                .extended_details()
                 .await
                 .expect("run should recover from the transient tool failure");
 
@@ -323,10 +320,9 @@ async fn tool_error_retry_reports_distinct_ids_streamed() {
                 .build();
 
             let mut stream = agent
-                .runner(Message::user("What is 2 + 3? Use the tool."))
+                .prompt(Message::user("What is 2 + 3? Use the tool."))
                 .max_turns(5)
-                .stream()
-                .await;
+                .stream();
             while let Some(item) = stream.next().await {
                 item.expect("stream item should succeed");
             }
@@ -394,10 +390,9 @@ async fn streamed_hook_retry_uses_second_connections_id() {
                 .build();
 
             let mut stream = agent
-                .runner(Message::user("Reply with exactly: first probe"))
+                .prompt(Message::user("Reply with exactly: first probe"))
                 .max_turns(3)
-                .stream()
-                .await;
+                .stream();
             while let Some(item) = stream.next().await {
                 item.expect("stream item should succeed");
             }
@@ -485,7 +480,6 @@ async fn repaired_invalid_call_keeps_call_identity() {
                     .clone(),
                 )
                 .max_turns(4)
-                .extended_details()
                 .await
                 .expect("repaired run should succeed");
 
@@ -535,7 +529,6 @@ async fn max_turns_exhaustion_still_observed_completed_calls() {
             let error = agent
                 .prompt("What is 2 + 3? Use the tool.")
                 .max_turns(1)
-                .extended_details()
                 .await
                 .expect_err("a tool run under max_turns(1) must exhaust");
             let message = error.to_string();
@@ -577,7 +570,6 @@ async fn parallel_tool_calls_one_identity_per_turn() {
             let response = agent
                 .prompt("Compute 2 + 3 and 10 + 20. Emit both add calls together, then state both results.")
                 .max_turns(4)
-                .extended_details()
                 .await
                 .expect("parallel tool run should succeed");
 
@@ -615,14 +607,13 @@ async fn history_replay_does_not_leak_prior_run_identity() {
 
             let first = agent
                 .prompt("Reply with exactly: run A probe")
-                .extended_details()
                 .await
                 .expect("run A should succeed");
             let history = first.messages.clone().expect("run A history");
             let run_a_identity = probe.turn_identities()[0].clone();
 
             let second = agent
-                .runner(Message::user("Reply with exactly: run B probe"))
+                .prompt(Message::user("Reply with exactly: run B probe"))
                 .history(history)
                 .run()
                 .await
@@ -661,13 +652,13 @@ async fn stream_conversion_carries_live_identity() {
                 .expect("stream should open");
             let mut terminal_id = None;
             while let Some(item) = stream.next().await {
-                if let StreamedAssistantContent::Final(final_record) = item.expect("stream item") {
+                if let StreamEvent::Final(final_record) = item.expect("stream item") {
                     terminal_id = final_record.provider_request_id.clone();
                 }
             }
             assert_transport_request_id(terminal_id.as_deref(), "live terminal");
 
-            let response: rig::completion::CompletionResponse = stream.into();
+            let response: rig::completion::CompletionResponse = stream.finish();
             assert_eq!(
                 response.provider_request_id, terminal_id,
                 "conversion carries the live terminal's id"

@@ -1,6 +1,5 @@
 //! Common imports for Rig's classic runtime.
 
-pub use rig_core::client::ProviderClient;
 pub use rig_core::client::embeddings::EmbeddingsClient;
 pub use rig_core::client::model_listing::ModelListingClient;
 pub use rig_core::client::transcription::TranscriptionClient;
@@ -12,15 +11,13 @@ pub use rig_core::client::audio_generation::AudioGenerationClient;
 pub use rig_core::client::image_generation::ImageGenerationClient;
 
 pub use crate::agent::{
-    Agent, AgentHook, HookContext, ModelHandle, ModelSelection, ModelSelectionAction,
-    MultiTurnStreamItem, StreamingResult,
+    Agent, AgentHook, HookContext, ModelHandle, ModelRef, ModelSelection, ModelSelectionAction,
+    MultiTurnStreamItem, RunEvents, StreamingResult,
 };
 pub use crate::client::{AgentClientExt, AgentModelExt};
 pub use crate::completion::{
-    Chat, CompletionError, CompletionModel, Message, Prompt, PromptError, StructuredOutputError,
-    TypedPrompt,
+    CompletionError, CompletionModel, Message, PromptError, StructuredOutputError,
 };
-pub use crate::streaming::{StreamingChat, StreamingPrompt};
 pub use crate::tool::{Tool, ToolSet};
 pub use rig_core::client::completion::CompletionClient;
 

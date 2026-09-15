@@ -12,12 +12,36 @@ Direct users import construction and prompting explicitly:
 
 ```rust,ignore
 use rig_agent::prelude::*;
-use rig_core::{client::ProviderClient, providers::openai};
+use rig_core::providers::openai;
 
 let client = openai::Client::from_env()?;
 let agent = client.agent(openai::GPT_5_2).build();
 let answer = agent.prompt("Explain ownership briefly.").await?;
 ```
+
+## The run protocol
+
+`rig_agent::run::AgentRun` is a steppable, serializable state machine: it owns
+every *decision* the agent loop makes — turn budget, tool-call validation and
+recovery, history threading, structured-output policy, usage accounting, final
+response — and performs no IO. A *driver* calls `next_step()` and acts on the
+returned `AgentRunStep` (`CallModel`, `CallTools`, `Done`), feeding results
+back with `model_response` / `tool_results`. This crate's futures loop is the
+driver; the machine itself never awaits (a source-level guard keeps it so) and
+is `Serialize + Deserialize`, so a run can be suspended between steps and
+resumed in another process.
+
+Everything an agent loop *is* sits beside it in `rig_agent::run` — the
+`RunSpec` it is configured by, `prepare_request` (the pure `(RunSpec,
+capabilities, history, tools, patch) → PreparedRequest` step, so every driver
+sends the same bytes), the output policy, the per-turn `RequestPatch`, the
+run's response and error types, the invalid-call decisions, the streamed-turn
+assembler and the loop-side transcript helpers — all sans-IO and serializable.
+rig-core keeps only the message-model invariants (`validate_canonical`, the
+tool-result constructors). A host that drives runs itself (an ECS schedule, a
+job system) depends on this crate with default features off: that graph
+carries no async runtime, transport or MCP client (a dependency guard pins it),
+and `tests/fixtures/agent_run_stepper` is that host in miniature.
 
 ## Runtime model routing
 
@@ -47,10 +71,11 @@ selects it. Blocking and streaming prompts share this lifecycle: `Stop`
 cancels before request preparation and provider execution, and dropping an
 in-flight attempt still cancels it by dropping its retained future or stream.
 
-Extractors support the same run-local choice through
-`extractor.using_model(handle).extract(...)` or `using_model_value(model)`.
-That handle is the default candidate for each extraction retry, routing hooks
-may replace it, and the extractor's default is unchanged for later calls.
+Extractors support the same run-local choice: `extract(...)` returns a
+`TypedRun`, so `extractor.extract(text).using_model(handle)` or
+`.using_model_value(model)` sets that run's default candidate. That handle is
+the default candidate for each extraction retry, routing hooks may replace it,
+and the extractor's default is unchanged for later calls.
 
 ```rust,ignore
 #[derive(Clone)]
@@ -106,8 +131,8 @@ Classic tools that need mutable per-call state implement
 
 | Tier | Target | Status |
 | --- | --- | --- |
-| 1 | native (linux / macOS / windows, `x86_64` and `aarch64`) | Full support, all features including `rmcp` |
-| 2 | `wasm32-unknown-unknown` (browser) | Supported, with no feature flags to set; the `rmcp` feature is **not** available |
+| 1 | native (linux / macOS / windows, `x86_64` and `aarch64`) | Full support, all features; MCP tools via the companion `rig-rmcp` crate |
+| 2 | `wasm32-unknown-unknown` (browser) | Supported, with no feature flags to set; `rig-rmcp` (MCP tools) is **not** available |
 | — | `wasm32-wasip1` / `wasm32-wasip2` (WASI) | **Not supported** |
 | — | `wasm32-unknown-emscripten` | Not supported |
 
@@ -123,7 +148,7 @@ feature set WASI rejects. Supporting it would mean making `reqwest` optional and
 adding a `wasi:http` client behind `rig_core::http_client` — a project, not a
 `cfg` fix.
 
-**`rmcp` is native-only.** rmcp's `ClientHandler` is declared
+**MCP (`rig-rmcp`) is native-only.** rmcp's `ClientHandler` is declared
 `Sized + Send + Sync + 'static` unconditionally — its `local` feature relaxes
 the future bounds but not the handler itself — while this crate's handler owns a
 tool registry whose `Arc<dyn ErasedTool>` is deliberately neither `Send` nor

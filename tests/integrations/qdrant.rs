@@ -6,6 +6,7 @@
     clippy::unreachable
 )]
 
+use rig::client::DefaultTransportBuilder as _;
 use serde_json::json;
 use testcontainers::{
     GenericImage,
@@ -198,7 +199,7 @@ async fn vector_search_test() {
             "definition": "Definition of a *linglingdong*: A term used by inhabitants of the far side of the moon to describe humans.",
             "id": "f9e17d59-32e5-440c-be02-b2759a654824"
         })
-    )
+    );
 }
 
 async fn create_points(model: openai::EmbeddingModel) -> Vec<PointStruct> {

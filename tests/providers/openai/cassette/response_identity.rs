@@ -6,7 +6,7 @@ use futures::StreamExt;
 use rig::completion::CompletionModel;
 use rig::prelude::*;
 use rig::providers::openai;
-use rig::streaming::StreamedAssistantContent;
+use rig::streaming::StreamEvent;
 
 use super::super::support::{with_openai_cassette, with_openai_completions_cassette};
 
@@ -61,8 +61,7 @@ async fn responses_streaming_carries_identity() {
 
             let mut terminal = None;
             while let Some(item) = stream.next().await {
-                if let StreamedAssistantContent::Final(final_record) =
-                    item.expect("stream item should succeed")
+                if let StreamEvent::Final(final_record) = item.expect("stream item should succeed")
                 {
                     terminal = Some(final_record);
                 }
@@ -117,8 +116,7 @@ async fn chat_completions_streaming_carries_identity() {
 
             let mut terminal = None;
             while let Some(item) = stream.next().await {
-                if let StreamedAssistantContent::Final(final_record) =
-                    item.expect("stream item should succeed")
+                if let StreamEvent::Final(final_record) = item.expect("stream item should succeed")
                 {
                     terminal = Some(final_record);
                 }
@@ -138,7 +136,6 @@ async fn chat_completions_streaming_carries_identity() {
 #[tokio::test]
 async fn agent_tool_run_reports_per_attempt_identity() {
     use crate::support::{Adder, IdentityProbe, TOOLS_PREAMBLE};
-    use rig::completion::Prompt;
 
     with_openai_cassette(
         "response_identity/agent_tool_run_reports_per_attempt_identity",
@@ -154,7 +151,6 @@ async fn agent_tool_run_reports_per_attempt_identity() {
             let response = agent
                 .prompt("What is 2 + 3? Use the tool, then state the result.")
                 .max_turns(3)
-                .extended_details()
                 .await
                 .expect("agent run should succeed");
 
@@ -192,11 +188,11 @@ async fn streamed_agent_run_reports_identity() {
                 .add_hook(probe.clone())
                 .build();
 
-            let mut stream = rig::streaming::StreamingPrompt::stream_prompt(
-                &agent,
-                rig::completion::Message::user("Reply with exactly: streamed identity probe"),
-            )
-            .await;
+            let mut stream = agent
+                .prompt(rig::completion::Message::user(
+                    "Reply with exactly: streamed identity probe",
+                ))
+                .stream();
             while let Some(item) = stream.next().await {
                 item.expect("stream item should succeed");
             }
@@ -204,7 +200,7 @@ async fn streamed_agent_run_reports_identity() {
             let turns = probe.turn_identities();
             assert_eq!(turns.len(), 1);
             assert_request_id(turns[0].provider_request_id.as_deref(), "streamed turn");
-            let finishes = probe.stream_finish_identities();
+            let finishes = probe.response_identities();
             assert_eq!(finishes.len(), 1);
             assert_eq!(finishes[0], turns[0]);
         },

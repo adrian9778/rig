@@ -1,3 +1,6 @@
+// Tests assert on filter shapes, where a failed conversion should panic loudly
+// rather than be handled; matches the other vector-store crates (e.g. rig-lancedb).
+#![cfg_attr(test, allow(clippy::expect_used))]
 //! AWS S3Vectors vector store integration for Rig.
 //!
 //! This crate provides [`S3VectorsVectorStore`], a Rig vector store backed by
@@ -8,9 +11,6 @@
 //! The root `rig` facade re-exports this crate as `rig::s3vectors` when the
 //! `s3vectors` feature is enabled.
 
-#[macro_use]
-mod document;
-
 use aws_sdk_s3vectors::{
     Client,
     types::{PutInputVector, VectorData},
@@ -20,7 +20,7 @@ use rig_core::{
     embeddings::EmbeddingModel,
     vector_store::{
         InsertDocuments, VectorStoreError, VectorStoreIndex,
-        request::{SearchFilter, VectorSearchRequest},
+        request::{DynamicSearchFilter, Filter, FilterError, SearchFilter, VectorSearchRequest},
     },
 };
 use serde::{Deserialize, Serialize};
@@ -34,7 +34,7 @@ pub struct CreateRecord {
     embedded_text: String,
 }
 
-// NOTE: Cannot be used in dynamic store due to aws_smithy_types::Document not impl'ing Serialize or Deserialize
+/// S3Vectors filter backed by the AWS SDK's native document type.
 #[derive(Clone, Debug)]
 pub struct S3SearchFilter(aws_smithy_types::Document);
 
@@ -42,26 +42,54 @@ impl SearchFilter for S3SearchFilter {
     type Value = aws_smithy_types::Document;
 
     fn eq(key: impl AsRef<str>, value: Self::Value) -> Self {
-        let key = key.as_ref().to_owned();
-        Self(document!({ key: { "$eq": value } }))
+        Self(document_comparison(key, "$eq", value))
     }
 
     fn gt(key: impl AsRef<str>, value: Self::Value) -> Self {
-        let key = key.as_ref().to_owned();
-        Self(document!({ key: { "$gt": value } }))
+        Self(document_comparison(key, "$gt", value))
     }
 
     fn lt(key: impl AsRef<str>, value: Self::Value) -> Self {
-        let key = key.as_ref().to_owned();
-        Self(document!({ key: { "$lt": value } }))
+        Self(document_comparison(key, "$lt", value))
     }
 
     fn and(self, rhs: Self) -> Self {
-        Self(document!({ "$and": [ self.0, rhs.0 ]}))
+        Self(document_object([(
+            "$and",
+            Document::Array(vec![self.0, rhs.0]),
+        )]))
     }
 
     fn or(self, rhs: Self) -> Self {
-        Self(document!({ "$or": [ self.0, rhs.0 ]}))
+        Self(document_object([(
+            "$or",
+            Document::Array(vec![self.0, rhs.0]),
+        )]))
+    }
+}
+
+/// Builds a `Document::Object` from the given entries.
+fn document_object<K>(entries: impl IntoIterator<Item = (K, Document)>) -> Document
+where
+    K: Into<String>,
+{
+    Document::Object(
+        entries
+            .into_iter()
+            .map(|(key, value)| (key.into(), value))
+            .collect(),
+    )
+}
+
+/// Builds the `{ key: { op: value } }` shape S3Vectors uses for comparison
+/// operators such as `$eq` and `$gt`.
+fn document_comparison(key: impl AsRef<str>, op: &str, value: Document) -> Document {
+    document_object([(key.as_ref(), document_object([(op, value)]))])
+}
+
+impl DynamicSearchFilter for S3SearchFilter {
+    fn from_dynamic_filter(filter: Filter<serde_json::Value>) -> Result<Self, FilterError> {
+        Ok(filter.interpret_with(|value| json_value_to_document(&value)))
     }
 }
 
@@ -74,24 +102,33 @@ impl S3SearchFilter {
         self.0
     }
 
-    pub fn gte(key: String, value: <Self as SearchFilter>::Value) -> Self {
-        Self(document!({ key: { "$gte": value } }))
+    pub fn gte(key: impl Into<String>, value: <Self as SearchFilter>::Value) -> Self {
+        let key = key.into();
+        Self(document_comparison(key, "$gte", value))
     }
 
-    pub fn lte(key: String, value: <Self as SearchFilter>::Value) -> Self {
-        Self(document!({ key: { "$lte": value } }))
+    pub fn lte(key: impl Into<String>, value: <Self as SearchFilter>::Value) -> Self {
+        let key = key.into();
+        Self(document_comparison(key, "$lte", value))
     }
 
-    pub fn exists(key: String) -> Self {
-        Self(document!({ "$exists": { key: true } }))
+    pub fn exists(key: impl Into<String>) -> Self {
+        let key = key.into();
+        Self(document_object([(
+            "$exists",
+            document_object([(key, Document::Bool(true))]),
+        )]))
     }
 
     #[allow(clippy::should_implement_trait)]
     pub fn not(self) -> Self {
-        Self(document!({ "$not": self.0 }))
+        Self(document_object([("$not", self.0)]))
     }
 }
 
+/// The store is generic over its embedding model `M`, which is fixed for the
+/// store's lifetime: an index populated under one model is only meaningful under
+/// that same model.
 pub struct S3VectorsVectorStore<M> {
     embedding_model: M,
     client: Client,
@@ -99,10 +136,7 @@ pub struct S3VectorsVectorStore<M> {
     index_name: String,
 }
 
-impl<M> S3VectorsVectorStore<M>
-where
-    M: EmbeddingModel,
-{
+impl<M: EmbeddingModel> S3VectorsVectorStore<M> {
     pub fn new(
         embedding_model: M,
         client: aws_sdk_s3vectors::Client,
@@ -121,16 +155,8 @@ where
         &self.bucket_name
     }
 
-    pub fn set_bucket_name(&mut self, bucket_name: &str) {
-        self.bucket_name = bucket_name.to_string();
-    }
-
     pub fn index_name(&self) -> &str {
         &self.index_name
-    }
-
-    pub fn set_index_name(&mut self, index_name: &str) {
-        self.index_name = index_name.to_string();
     }
 
     pub fn client(&self) -> &Client {
@@ -171,7 +197,7 @@ where
         }
 
         if let Some(filter) = req.filter() {
-            query_builder = query_builder.filter(filter.inner().clone())
+            query_builder = query_builder.filter(filter.inner().clone());
         }
 
         let query = query_builder
@@ -199,10 +225,7 @@ where
     }
 }
 
-impl<M> InsertDocuments for S3VectorsVectorStore<M>
-where
-    M: EmbeddingModel,
-{
+impl<M: EmbeddingModel> InsertDocuments for S3VectorsVectorStore<M> {
     async fn insert_documents<Doc: serde::Serialize + rig_core::Embed + Send>(
         &self,
         documents: Vec<(Doc, Vec<rig_core::embeddings::Embedding>)>,
@@ -218,7 +241,7 @@ where
                 let document = json_value_to_document(&document);
                 let vec = y.vec.into_iter().map(|item| item as f32).collect();
                 PutInputVector::builder()
-                    .metadata(document.clone())
+                    .metadata(document)
                     .data(VectorData::Float32(vec))
                     .key(Uuid::new_v4())
                     .build()
@@ -282,8 +305,7 @@ fn document_to_json_value(value: &Document) -> Value {
         Document::Bool(b) => Value::Bool(*b),
         Document::Number(n) => match n {
             aws_smithy_types::Number::Float(f) => serde_json::Number::from_f64(*f)
-                .map(Value::Number)
-                .unwrap_or_else(|| Value::String(f.to_string())),
+                .map_or_else(|| Value::String(f.to_string()), Value::Number),
             aws_smithy_types::Number::NegInt(i) => {
                 serde_json::Value::Number(serde_json::Number::from(*i))
             }
@@ -304,10 +326,7 @@ fn document_to_json_value(value: &Document) -> Value {
     }
 }
 
-impl<M> VectorStoreIndex for S3VectorsVectorStore<M>
-where
-    M: EmbeddingModel,
-{
+impl<M: EmbeddingModel> VectorStoreIndex for S3VectorsVectorStore<M> {
     type Filter = S3SearchFilter;
 
     async fn top_n<T: for<'a> serde::Deserialize<'a> + Send>(
@@ -341,3 +360,6 @@ where
             .collect())
     }
 }
+
+#[cfg(test)]
+mod tests;

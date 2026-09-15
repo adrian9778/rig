@@ -2,7 +2,6 @@ use anyhow::Result;
 use rig::prelude::*;
 use rig::providers::openai;
 use rig::{
-    completion::Prompt,
     embeddings::EmbeddingsBuilder,
     providers::openai::Client,
     tool::{Tool, ToolEmbedding, ToolSet},
@@ -138,10 +137,9 @@ async fn main() -> Result<(), anyhow::Error> {
     // Create OpenAI client
     let openai_client = Client::from_env()?;
     let embedding_model = openai_client.embedding_model(openai::TEXT_EMBEDDING_ADA_002);
-    let toolset = ToolSet::builder()
-        .retrieved_tool(Add)
-        .retrieved_tool(Subtract)
-        .build();
+    let mut toolset = ToolSet::default();
+    toolset.add_retrieved_tool(Add)?;
+    toolset.add_retrieved_tool(Subtract)?;
     let embeddings = EmbeddingsBuilder::new(embedding_model.clone())
         .documents(toolset.schemas()?)?
         .build()
@@ -165,7 +163,7 @@ async fn main() -> Result<(), anyhow::Error> {
         .build();
 
     // Prompt the agent and print the response
-    let response = calculator_rag.prompt("Calculate 3 - 7").await?;
+    let response = calculator_rag.prompt("Calculate 3 - 7").await?.output;
 
     println!("{response}");
 

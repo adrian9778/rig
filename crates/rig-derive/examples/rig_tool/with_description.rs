@@ -1,8 +1,7 @@
-use rig_agent::completion::Prompt;
 use rig_agent::prelude::*;
-use rig_core::client::ProviderClient;
 use rig_core::providers;
 use rig_derive::rig_tool;
+use rig_reqwest::prelude::*;
 
 // Demonstrates explicit attribute override.
 // The description and params() attributes override any doc comments.
@@ -63,7 +62,7 @@ async fn main() -> Result<(), anyhow::Error> {
         "What is 10 / 0?",
     ] {
         println!("User: {prompt}");
-        println!("Agent: {}", calculator_agent.prompt(prompt).await?);
+        println!("Agent: {}", calculator_agent.prompt(prompt).await?.output);
     }
 
     Ok(())

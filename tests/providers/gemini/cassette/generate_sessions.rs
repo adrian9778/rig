@@ -8,11 +8,10 @@
 //! Run cassette tests in replay mode by default, or set
 //! `RIG_PROVIDER_TEST_MODE=record` to record against the real provider.
 
-use rig::completion::{Chat, CompletionModel, Message};
+use rig::completion::{CompletionModel, Message};
 use rig::message::{AssistantContent, UserContent};
 use rig::prelude::*;
 use rig::providers::gemini;
-use rig::streaming::StreamingChat;
 use rig::tool::Tool;
 
 use super::super::support::with_gemini_cassette;
@@ -73,10 +72,14 @@ fn history_tool_results(history: &[Message]) -> Vec<ToolEvent> {
     results
 }
 
+/// The result answering `call`: the first result after the call's message
+/// with its id. Gemini's calls carry no wire id, so each turn's calls are
+/// named `tool-<index>` per response and two turns' first calls share an
+/// id — a result is only the answer to the call it follows.
 fn result_index_for_call(results: &[ToolEvent], call: &ToolEvent) -> usize {
     results
         .iter()
-        .find(|result| result.call_id == call.call_id)
+        .find(|result| result.message_index > call.message_index && result.call_id == call.call_id)
         .unwrap_or_else(|| {
             panic!(
                 "chat history is missing the tool result answering call {:?} (call_id {:?})",
@@ -106,7 +109,7 @@ async fn sequential_tool_calls_ordering_nonstreaming() {
                 .await
                 .expect("sequential tool chat should succeed");
 
-            assert_mentions_expected_number(&result, 2);
+            assert_mentions_expected_number(&result.output, 2);
 
             let calls = history_tool_calls(&history);
             let results = history_tool_results(&history);
@@ -152,9 +155,10 @@ async fn sequential_tool_calls_ordering_streaming() {
                 .build();
 
             let mut stream = agent
-                .stream_chat(SEQUENTIAL_TOOLS_PROMPT, Vec::<Message>::new())
+                .prompt(SEQUENTIAL_TOOLS_PROMPT)
+                .history(Vec::<Message>::new())
                 .max_turns(6)
-                .await;
+                .stream();
             let observation = collect_stream_observation(&mut stream).await;
 
             assert!(

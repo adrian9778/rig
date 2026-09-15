@@ -5,7 +5,6 @@ use std::sync::atomic::AtomicUsize;
 
 use rig::completion::Message;
 use rig::prelude::*;
-use rig::streaming::StreamingChat;
 
 use crate::chatgpt::{LIVE_MODEL, live_client};
 use crate::reasoning::{self, WeatherTool};
@@ -25,9 +24,10 @@ async fn streaming() {
         .build();
 
     let stream = agent
-        .stream_chat(reasoning::TOOL_USER_PROMPT, Vec::<Message>::new())
+        .prompt(reasoning::TOOL_USER_PROMPT)
+        .history(Vec::<Message>::new())
         .max_turns(3)
-        .await;
+        .stream();
 
     let stats = reasoning::collect_stream_stats(stream, "chatgpt").await;
     reasoning::assert_universal(&stats, &call_count, "chatgpt");

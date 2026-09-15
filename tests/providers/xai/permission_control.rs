@@ -2,13 +2,10 @@
 
 use anyhow::Result;
 use rig::agent::{
-    AgentHook, ToolCall as ToolCallEvent, ToolCallAction, ToolResultAction, ToolResultEvent,
-    stream_to_stdout,
+    AgentHook, DispatchAction, DispatchEvent, OutcomeAction, OutcomeEvent, stream_to_stdout,
 };
-use rig::completion::Prompt;
 use rig::prelude::*;
 use rig::providers::xai;
-use rig::streaming::StreamingPrompt;
 use rig::tool::Tool;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -143,30 +140,35 @@ struct PermissionHook {
 }
 
 impl AgentHook for PermissionHook {
-    async fn on_tool_call(
+    async fn on_dispatch(
         &self,
         _ctx: &rig::agent::HookContext,
-        event: ToolCallEvent<'_>,
-    ) -> ToolCallAction {
+        event: DispatchEvent<'_>,
+    ) -> DispatchAction {
+        let Some(tool_name) = event.tool_name() else {
+            return DispatchAction::proceed();
+        };
         let count = self.call_count.fetch_add(1, Ordering::SeqCst);
         if count == 0 {
-            ToolCallAction::skip(format!(
-                "Tool '{}' is currently unavailable. Please use 'read_file_tail' instead to read the file.",
-                event.tool_name
+            DispatchAction::skip(format!(
+                "Tool '{tool_name}' is currently unavailable. Please use 'read_file_tail' instead to read the file."
             ))
         } else {
-            ToolCallAction::run()
+            DispatchAction::proceed()
         }
     }
 
-    async fn on_tool_result(
+    async fn on_outcome(
         &self,
         _ctx: &rig::agent::HookContext,
-        event: ToolResultEvent<'_>,
-    ) -> ToolResultAction {
-        let normalized = event.presentation.render();
+        event: OutcomeEvent<'_>,
+    ) -> OutcomeAction {
+        let Some(result) = event.tool_result() else {
+            return OutcomeAction::proceed();
+        };
+        let normalized = result.output().render();
         *self.last_result.lock().expect("lock last_result") = Some(normalized);
-        ToolResultAction::keep()
+        OutcomeAction::proceed()
     }
 }
 
@@ -240,13 +242,13 @@ async fn permission_control_streaming_example() -> Result<()> {
             };
 
             let mut stream = agent
-                .stream_prompt(
+                .prompt(
                     "Use the available tools to read test.txt now. \
                      Do not ask any follow-up questions; just read the file and report its content.",
                 )
                 .max_turns(5)
                 .add_hook(hook)
-                .await;
+                .stream();
 
             let final_response = stream_to_stdout(&mut stream).await?;
             let last = last_result.lock().expect("lock last_result").clone();

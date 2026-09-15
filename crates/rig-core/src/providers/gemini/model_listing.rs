@@ -1,8 +1,11 @@
 use crate::{
     client::{self, ModelLister, Provider},
-    http_client::{self, HttpClientExt},
+    http_client::HttpClientExt,
     model::{Model, ModelList, ModelListingError},
-    providers::gemini::{Client, InteractionsClient},
+    providers::{
+        gemini::{Client, InteractionsClient},
+        internal,
+    },
     wasm_compat::{WasmCompatSend, WasmCompatSync},
 };
 use serde::Deserialize;
@@ -27,6 +30,11 @@ struct ListModelEntry {
     display_name: Option<String>,
     description: Option<String>,
     input_token_limit: Option<u64>,
+    /// The model's output ceiling. Gemini reports this for every model
+    /// (`gemini-2.5-flash`: 65536) and rig used to drop it on the floor, which
+    /// is why a hardcoded 4096 default went unnoticed for so long — nothing in
+    /// the library ever knew the real limit was ~16x larger (rig#2322).
+    output_token_limit: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -73,25 +81,26 @@ impl TryFrom<ListModelEntry> for Model {
         model.context_length = value
             .input_token_limit
             .and_then(|limit| u32::try_from(limit).ok());
+        model.max_output_tokens = value
+            .output_token_limit
+            .and_then(|limit| u32::try_from(limit).ok());
         Ok(model)
     }
 }
 
 fn list_models_path(page_token: Option<&str>) -> String {
-    let mut serializer = url::form_urlencoded::Serializer::new(String::new());
-    serializer.append_pair("pageSize", &MAX_PAGE_SIZE.to_string());
-
+    let page_size = MAX_PAGE_SIZE.to_string();
+    let mut pairs = vec![("pageSize", page_size.as_str())];
     if let Some(page_token) = page_token {
-        serializer.append_pair("pageToken", page_token);
+        pairs.push(("pageToken", page_token));
     }
-
-    format!("/v1beta/models?{}", serializer.finish())
+    internal::model_listing::with_query_pairs("/v1beta/models", &pairs)
 }
 
 fn parse_models_page(
     body: &[u8],
     path: &str,
-) -> Result<(Vec<Model>, Option<String>), ModelListingError> {
+) -> Result<internal::model_listing::ListingPage, ModelListingError> {
     let page: ListModelsResponse = serde_json::from_slice(body).map_err(|error| {
         ModelListingError::parse_error_with_context("Gemini", path, &error, body)
     })?;
@@ -106,7 +115,14 @@ fn parse_models_page(
         })
         .collect::<Result<Vec<_>, _>>()?;
 
-    Ok((models, page.next_page_token))
+    // An empty cursor counts as absent, matching how every other
+    // provider-reported identifier in rig is read. Reporting `Some("")` would
+    // tell the shared loop there is a next page, and re-sending an empty
+    // `pageToken` returns the same page forever.
+    Ok(internal::model_listing::ListingPage {
+        models,
+        next_cursor: page.next_page_token.filter(|token| !token.is_empty()),
+    })
 }
 
 async fn list_all_models<Ext, H>(
@@ -116,42 +132,13 @@ where
     Ext: Provider + WasmCompatSend + WasmCompatSync + 'static,
     H: HttpClientExt + WasmCompatSend + WasmCompatSync + 'static,
 {
-    let mut all_models = Vec::new();
-    let mut next_page_token: Option<String> = None;
-
-    loop {
-        let path = list_models_path(next_page_token.as_deref());
-        let req = client.get(&path)?.body(http_client::NoBody)?;
-        let response = client.send::<_, Vec<u8>>(req).await?;
-
-        if !response.status().is_success() {
-            let status_code = response.status().as_u16();
-            let body = response.into_body().await?;
-            return Err(ModelListingError::api_error_with_context(
-                "Gemini",
-                &path,
-                status_code,
-                &body,
-            ));
-        }
-
-        let body = response.into_body().await?;
-        let (models, next_page_token_for_page) = parse_models_page(&body, &path)?;
-        all_models.extend(models);
-
-        if next_page_token_for_page.is_none() {
-            break;
-        }
-
-        next_page_token = next_page_token_for_page;
-    }
-
-    Ok(ModelList::new(all_models))
+    internal::model_listing::paginate_models(client, "Gemini", list_models_path, parse_models_page)
+        .await
 }
 
 /// [`ModelLister`] implementation for Gemini GenerateContent clients.
 #[derive(Clone)]
-pub struct GeminiModelLister<H = reqwest::Client> {
+pub struct GeminiModelLister<H = crate::http_client::BoxedHttpClient> {
     client: Client<H>,
 }
 
@@ -159,125 +146,27 @@ impl<H> ModelLister<H> for GeminiModelLister<H>
 where
     H: HttpClientExt + WasmCompatSend + WasmCompatSync + 'static,
 {
-    type Client = Client<H>;
-
-    fn new(client: Self::Client) -> Self {
-        Self { client }
-    }
-
     async fn list_all(&self) -> Result<ModelList, ModelListingError> {
         list_all_models(&self.client).await
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn parse_models_page_accepts_omitted_empty_models_list() {
-        let (models, next_page_token) =
-            parse_models_page(br#"{}"#, "/v1beta/models?pageSize=1000").expect("page should parse");
-
-        assert!(models.is_empty());
-        assert_eq!(next_page_token, None);
-    }
-
-    #[test]
-    fn parse_models_page_falls_back_to_name_when_base_model_id_is_missing() {
-        let body = br#"{
-            "models": [
-                {
-                    "name": "models/gemini-2.0-flash-001",
-                    "displayName": "Gemini 2.0 Flash 001",
-                    "description": "Stable Gemini 2.0 Flash",
-                    "inputTokenLimit": 1048576
-                }
-            ]
-        }"#;
-
-        let (models, next_page_token) =
-            parse_models_page(body, "/v1beta/models?pageSize=1000").expect("page should parse");
-
-        assert_eq!(next_page_token, None);
-        assert_eq!(models.len(), 1);
-        assert_eq!(models[0].id, "gemini-2.0-flash-001");
-        assert_eq!(models[0].name.as_deref(), Some("Gemini 2.0 Flash 001"));
-        assert_eq!(
-            models[0].description.as_deref(),
-            Some("Stable Gemini 2.0 Flash")
-        );
-        assert_eq!(models[0].context_length, Some(1_048_576));
-    }
-
-    #[test]
-    fn parse_models_page_prefers_base_model_id_when_present() {
-        let body = br#"{
-            "models": [
-                {
-                    "name": "models/gemini-2.0-flash-001",
-                    "baseModelId": "gemini-2.0-flash",
-                    "displayName": "Gemini 2.0 Flash 001"
-                }
-            ]
-        }"#;
-
-        let (models, _) =
-            parse_models_page(body, "/v1beta/models?pageSize=1000").expect("page should parse");
-
-        assert_eq!(models.len(), 1);
-        assert_eq!(models[0].id, "gemini-2.0-flash");
-    }
-
-    #[test]
-    fn parse_models_page_reports_missing_model_id_when_name_is_omitted() {
-        let error = parse_models_page(br#"{"models":[{}]}"#, "/v1beta/models?pageSize=1000")
-            .expect_err("entry without name/baseModelId should fail with contextual error");
-
-        match error {
-            ModelListingError::ParseError { message } => {
-                assert!(message.contains("provider=Gemini"));
-                assert!(message.contains("path=/v1beta/models?pageSize=1000"));
-                assert!(message.contains(
-                    "parse_error=model entry missing usable `baseModelId` and `name` values"
-                ));
-            }
-            _ => panic!("expected parse error"),
-        }
-    }
-
-    #[test]
-    fn parse_models_page_returns_parse_error_when_entry_has_no_usable_id() {
-        let body = br#"{
-            "models": [
-                {
-                    "name": "models/",
-                    "baseModelId": "   ",
-                    "displayName": "Broken Gemini"
-                }
-            ]
-        }"#;
-
-        let error = parse_models_page(body, "/v1beta/models?pageSize=1000")
-            .expect_err("page should fail when no usable ID is available");
-
-        match error {
-            ModelListingError::ParseError { message } => {
-                assert!(message.contains("provider=Gemini"));
-                assert!(message.contains("path=/v1beta/models?pageSize=1000"));
-                assert!(message.contains(
-                    "parse_error=model entry missing usable `baseModelId` and `name` values"
-                ));
-                assert!(message.contains(r#""name": "models/""#));
-            }
-            _ => panic!("expected parse error"),
-        }
+impl<H> GeminiModelLister<H>
+where
+    H: HttpClientExt + WasmCompatSend + WasmCompatSync + 'static + Clone,
+{
+    /// Build the lister over `client`.
+    pub fn new(client: Client<H>) -> Self {
+        Self { client }
     }
 }
 
+#[cfg(test)]
+mod tests;
+
 /// [`ModelLister`] implementation for Gemini Interactions API clients.
 #[derive(Clone)]
-pub struct GeminiInteractionsModelLister<H = reqwest::Client> {
+pub struct GeminiInteractionsModelLister<H = crate::http_client::BoxedHttpClient> {
     client: InteractionsClient<H>,
 }
 
@@ -285,13 +174,17 @@ impl<H> ModelLister<H> for GeminiInteractionsModelLister<H>
 where
     H: HttpClientExt + WasmCompatSend + WasmCompatSync + 'static,
 {
-    type Client = InteractionsClient<H>;
-
-    fn new(client: Self::Client) -> Self {
-        Self { client }
-    }
-
     async fn list_all(&self) -> Result<ModelList, ModelListingError> {
         list_all_models(&self.client).await
+    }
+}
+
+impl<H> GeminiInteractionsModelLister<H>
+where
+    H: HttpClientExt + WasmCompatSend + WasmCompatSync + 'static + Clone,
+{
+    /// Build the lister over `client`.
+    pub fn new(client: InteractionsClient<H>) -> Self {
+        Self { client }
     }
 }

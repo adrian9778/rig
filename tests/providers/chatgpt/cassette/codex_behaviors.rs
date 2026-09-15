@@ -6,7 +6,7 @@
 //! Run cassette tests in replay mode by default, or set
 //! `RIG_PROVIDER_TEST_MODE=record` to record against the real provider.
 
-use rig::completion::{Chat, CompletionModel, Message};
+use rig::completion::{CompletionModel, Message};
 use rig::message::AssistantContent;
 use rig::prelude::*;
 use rig::providers::chatgpt;
@@ -51,7 +51,7 @@ async fn strict_tools_opt_in_roundtrip() {
                     .function
                     .arguments
                     .get("x")
-                    .and_then(|value| value.as_f64()),
+                    .and_then(serde_json::Value::as_f64),
                 Some(7.0),
                 "strict-mode arguments should carry both required fields: {:?}",
                 tool_call.function.arguments
@@ -61,7 +61,7 @@ async fn strict_tools_opt_in_roundtrip() {
                     .function
                     .arguments
                     .get("y")
-                    .and_then(|value| value.as_f64()),
+                    .and_then(serde_json::Value::as_f64),
                 Some(5.0),
                 "strict-mode arguments should carry both required fields: {:?}",
                 tool_call.function.arguments
@@ -145,7 +145,7 @@ async fn explicit_preamble_and_mid_conversation_system_messages_are_instructions
                 .expect("chat with a mid-conversation system message should succeed");
 
             assert!(
-                result.contains("FALCON-9"),
+                result.output.contains("FALCON-9"),
                 "the mid-conversation system message must reach the model, got {result:?}"
             );
         },
@@ -174,8 +174,8 @@ async fn default_instructions_merge_with_explicit_preamble() {
                 .expect("default and explicit instructions should both reach the backend");
 
             assert!(
-                result.contains("DEFAULT-CODEX-MARKER")
-                    && result.contains("EXPLICIT-CODEX-MARKER"),
+                result.output.contains("DEFAULT-CODEX-MARKER")
+                    && result.output.contains("EXPLICIT-CODEX-MARKER"),
                 "merged instructions should influence the answer, got {result:?}"
             );
         },

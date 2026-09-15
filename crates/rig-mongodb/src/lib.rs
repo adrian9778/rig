@@ -13,10 +13,9 @@ use rig_core::{
     Embed,
     embeddings::embedding::{Embedding, EmbeddingModel},
     vector_store::{
-        InsertDocuments, TopNResults, VectorStoreError, VectorStoreIndex, VectorStoreIndexDyn,
-        request::{Filter, SearchFilter, VectorSearchRequest},
+        InsertDocuments, VectorStoreError, VectorStoreIndex,
+        request::{DynamicSearchFilter, Filter, FilterError, SearchFilter, VectorSearchRequest},
     },
-    wasm_compat::WasmBoxedFuture,
 };
 use serde::{Deserialize, Serialize};
 
@@ -47,7 +46,7 @@ impl SearchIndex {
             .await
             .transpose()
             .map_err(VectorStoreError::datastore)?
-            .ok_or(VectorStoreError::DatastoreError("Index not found".into()))
+            .ok_or_else(|| VectorStoreError::DatastoreError("Index not found".into()))
     }
 }
 
@@ -70,7 +69,8 @@ struct Field {
 /// # Example
 /// ```no_run
 /// use rig_mongodb::{MongoDbVectorIndex, SearchParams};
-/// use rig_core::{providers::openai, vector_store::{VectorStoreIndex, VectorSearchRequest}, client::{ProviderClient, EmbeddingsClient}};
+/// use rig_core::{providers::openai, vector_store::{VectorStoreIndex, VectorSearchRequest}, client::EmbeddingsClient};
+/// use rig_reqwest::prelude::*;
 ///
 /// # async fn example() -> anyhow::Result<()> {
 /// #[derive(serde::Deserialize, serde::Serialize, Debug)]
@@ -108,10 +108,13 @@ struct Field {
 /// # }
 /// # let _ = example();
 /// ```
+///
+/// The store is generic over its embedding model `M`, which is fixed for the
+/// store's lifetime: an index populated under one model is only meaningful under
+/// that same model.
 pub struct MongoDbVectorIndex<C, M>
 where
     C: Send + Sync,
-    M: EmbeddingModel,
 {
     collection: mongodb::Collection<C>,
     model: M,
@@ -120,10 +123,9 @@ where
     search_params: SearchParams,
 }
 
-impl<C, M> MongoDbVectorIndex<C, M>
+impl<C, M: EmbeddingModel> MongoDbVectorIndex<C, M>
 where
     C: Send + Sync,
-    M: EmbeddingModel,
 {
     /// Vector search stage of aggregation pipeline of mongoDB collection.
     /// To be used by implementations of top_n and top_n_ids methods on VectorStoreIndex trait for MongoDbVectorIndex.
@@ -141,7 +143,7 @@ where
 
         let thresh = req
             .threshold()
-            .map(|thresh| MongoDbSearchFilter::gte("score".into(), thresh.into()));
+            .map(|thresh| MongoDbSearchFilter::gte("score", thresh.into()));
 
         let filter = match (thresh, req.filter()) {
             (Some(thresh), Some(filt)) => thresh.and(filt.clone()).into_inner(),
@@ -229,9 +231,8 @@ where
     }
 }
 
-impl<C, M> MongoDbVectorIndex<C, M>
+impl<C, M: EmbeddingModel> MongoDbVectorIndex<C, M>
 where
-    M: EmbeddingModel,
     C: Send + Sync,
 {
     /// Create a new `MongoDbVectorIndex`.
@@ -344,11 +345,13 @@ impl MongoDbSearchFilter {
         self.0
     }
 
-    pub fn gte(key: String, value: <Self as SearchFilter>::Value) -> Self {
+    pub fn gte(key: impl Into<String>, value: <Self as SearchFilter>::Value) -> Self {
+        let key = key.into();
         Self(doc! { key: { "$gte": value } })
     }
 
-    pub fn lte(key: String, value: <Self as SearchFilter>::Value) -> Self {
+    pub fn lte(key: impl Into<String>, value: <Self as SearchFilter>::Value) -> Self {
+        let key = key.into();
         Self(doc! { key: { "$lte": value } })
     }
 
@@ -358,20 +361,24 @@ impl MongoDbSearchFilter {
     }
 
     /// Tests whether the value at `key` is the BSON type `typ`
-    pub fn is_type(key: String, typ: &'static str) -> Self {
+    pub fn is_type(key: impl Into<String>, typ: &'static str) -> Self {
+        let key = key.into();
         Self(doc! { key: { "$type": typ } })
     }
 
-    pub fn size(key: String, size: i32) -> Self {
+    pub fn size(key: impl Into<String>, size: i32) -> Self {
+        let key = key.into();
         Self(doc! { key: { "$size": size } })
     }
 
     // Array ops
-    pub fn all(key: String, values: Vec<Bson>) -> Self {
+    pub fn all(key: impl Into<String>, values: Vec<Bson>) -> Self {
+        let key = key.into();
         Self(doc! { key: { "$all": values } })
     }
 
-    pub fn any(key: String, condition: Document) -> Self {
+    pub fn any(key: impl Into<String>, condition: Document) -> Self {
+        let key = key.into();
         Self(doc! { key: { "$elemMatch": condition } })
     }
 }
@@ -382,10 +389,15 @@ impl From<Filter<serde_json::Value>> for MongoDbSearchFilter {
     }
 }
 
-impl<C, M> VectorStoreIndex for MongoDbVectorIndex<C, M>
+impl DynamicSearchFilter for MongoDbSearchFilter {
+    fn from_dynamic_filter(filter: Filter<serde_json::Value>) -> Result<Self, FilterError> {
+        Ok(filter.into())
+    }
+}
+
+impl<C, M: EmbeddingModel> VectorStoreIndex for MongoDbVectorIndex<C, M>
 where
     C: Sync + Send,
-    M: EmbeddingModel + Sync + Send,
 {
     type Filter = MongoDbSearchFilter;
 
@@ -433,42 +445,9 @@ where
     }
 }
 
-impl<C, M> VectorStoreIndexDyn for MongoDbVectorIndex<C, M>
-where
-    C: Sync + Send,
-    M: EmbeddingModel + Sync + Send,
-{
-    fn top_n<'a>(
-        &'a self,
-        req: VectorSearchRequest<Filter<serde_json::Value>>,
-    ) -> WasmBoxedFuture<'a, TopNResults> {
-        let req = req.map_filter(MongoDbSearchFilter::from);
-
-        Box::pin(async move {
-            let results = <Self as VectorStoreIndex>::top_n::<serde_json::Value>(self, req).await?;
-
-            Ok(results)
-        })
-    }
-
-    /// Implement the `top_n_ids` method of the `VectorStoreIndex` trait for `MongoDbVectorIndex`.
-    fn top_n_ids<'a>(
-        &'a self,
-        req: VectorSearchRequest<Filter<serde_json::Value>>,
-    ) -> WasmBoxedFuture<'a, Result<Vec<(f64, String)>, VectorStoreError>> {
-        let req = req.map_filter(MongoDbSearchFilter::from);
-        Box::pin(async move {
-            let results = <Self as VectorStoreIndex>::top_n_ids(self, req).await?;
-
-            Ok(results)
-        })
-    }
-}
-
-impl<C, M> InsertDocuments for MongoDbVectorIndex<C, M>
+impl<C, M: EmbeddingModel> InsertDocuments for MongoDbVectorIndex<C, M>
 where
     C: Send + Sync,
-    M: EmbeddingModel + Send + Sync,
 {
     async fn insert_documents<Doc: Serialize + Embed + Send>(
         &self,

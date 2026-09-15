@@ -77,7 +77,7 @@ impl Readable for Vec<u8> {
 ///         .collect();
 ///
 ///     for content in contents {
-///         println!("{}", content);
+///         println!("{content}");
 ///     }
 ///
 ///     Ok(())
@@ -104,8 +104,8 @@ impl<'a, T: Readable + 'a> FileLoader<'a, T> {
     /// let content = FileLoader::with_glob("files/*.txt")?.read();
     /// for result in content {
     ///     match result {
-    ///         Ok(content) => println!("{}", content),
-    ///         Err(e) => eprintln!("Error reading file: {}", e),
+    ///         Ok(content) => println!("{content}"),
+    ///         Err(e) => eprintln!("Error reading file: {e}"),
     ///     }
     /// }
     /// # Ok(())
@@ -113,7 +113,7 @@ impl<'a, T: Readable + 'a> FileLoader<'a, T> {
     /// ```
     pub fn read(self) -> FileLoader<'a, Result<String, FileLoaderError>> {
         FileLoader {
-            iterator: Box::new(self.iterator.map(|res| res.read())),
+            iterator: Box::new(self.iterator.map(Readable::read)),
         }
     }
     /// Reads the contents of the files within the iterator returned by [FileLoader::with_glob] or
@@ -129,8 +129,8 @@ impl<'a, T: Readable + 'a> FileLoader<'a, T> {
     /// let content = FileLoader::with_glob("files/*.txt")?.read_with_path();
     /// for result in content {
     ///     match result {
-    ///         Ok((path, content)) => println!("{:?} {}", path, content),
-    ///         Err(e) => eprintln!("Error reading file: {}", e),
+    ///         Ok((path, content)) => println!("{path:?} {content}"),
+    ///         Err(e) => eprintln!("Error reading file: {e}"),
     ///     }
     /// }
     /// # Ok(())
@@ -138,7 +138,7 @@ impl<'a, T: Readable + 'a> FileLoader<'a, T> {
     /// ```
     pub fn read_with_path(self) -> FileLoader<'a, Result<(PathBuf, String), FileLoaderError>> {
         FileLoader {
-            iterator: Box::new(self.iterator.map(|res| res.read_with_path())),
+            iterator: Box::new(self.iterator.map(Readable::read_with_path)),
         }
     }
 }
@@ -147,68 +147,4 @@ loader_scaffold!(FileLoader, FileLoaderError, dir: files_only);
 loader_from_bytes!(FileLoader);
 
 #[cfg(test)]
-mod tests {
-    use assert_fs::prelude::{FileTouch, FileWriteStr, PathChild};
-
-    use super::FileLoader;
-
-    #[test]
-    fn test_file_loader() {
-        let temp = assert_fs::TempDir::new().expect("Failed to create temp dir");
-        let foo_file = temp.child("foo.txt");
-        let bar_file = temp.child("bar.txt");
-
-        foo_file.touch().expect("Failed to create foo.txt");
-        bar_file.touch().expect("Failed to create bar.txt");
-
-        foo_file.write_str("foo").expect("Failed to write to foo");
-        bar_file.write_str("bar").expect("Failed to write to bar");
-
-        let glob = temp.path().to_string_lossy().to_string() + "/*.txt";
-
-        let loader = FileLoader::with_glob(&glob).unwrap();
-        let mut actual = loader
-            .ignore_errors()
-            .read()
-            .ignore_errors()
-            .into_iter()
-            .collect::<Vec<_>>();
-        let mut expected = vec!["foo".to_string(), "bar".to_string()];
-
-        actual.sort();
-        expected.sort();
-
-        assert!(!actual.is_empty());
-        assert!(expected == actual)
-    }
-
-    #[test]
-    fn test_file_loader_bytes() {
-        let temp = assert_fs::TempDir::new().expect("Failed to create temp dir");
-        let foo_file = temp.child("foo.txt");
-        let bar_file = temp.child("bar.txt");
-
-        foo_file.touch().expect("Failed to create foo.txt");
-        bar_file.touch().expect("Failed to create bar.txt");
-
-        foo_file.write_str("foo").expect("Failed to write to foo");
-        bar_file.write_str("bar").expect("Failed to write to bar");
-
-        let foo_bytes = std::fs::read(foo_file.path()).unwrap();
-        let bar_bytes = std::fs::read(bar_file.path()).unwrap();
-
-        let loader = FileLoader::from_bytes_multi(vec![foo_bytes, bar_bytes]);
-        let mut actual = loader
-            .read()
-            .ignore_errors()
-            .into_iter()
-            .collect::<Vec<_>>();
-        let mut expected = vec!["foo".to_string(), "bar".to_string()];
-
-        actual.sort();
-        expected.sort();
-
-        assert!(!actual.is_empty());
-        assert!(expected == actual)
-    }
-}
+mod tests;

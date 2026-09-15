@@ -5,7 +5,7 @@
 use anyhow::Result;
 use rig::prelude::*;
 use rig::providers::openai;
-use rig::providers::openai::client::Client;
+use rig::providers::openai::Client;
 
 use schemars::JsonSchema;
 
@@ -21,7 +21,7 @@ const STEP_DELAY: std::time::Duration = std::time::Duration::from_secs(1);
 fn build_counter_extractor(client: &Client) -> rig::extractor::Extractor<Counter> {
     client
         .extractor::<Counter>(openai::GPT_4)
-        .preamble(
+        .append_preamble(
             "
             Add a random whole number between 1 and 64 to the number you receive.
             Return only the updated number.
@@ -39,7 +39,11 @@ async fn main() -> Result<()> {
     let mut interval = tokio::time::interval(STEP_DELAY);
 
     loop {
-        let next_number = extractor.extract(&current_number.to_string()).await?.number;
+        let next_number = extractor
+            .extract(current_number.to_string())
+            .await?
+            .output
+            .number;
         println!("Step {step}: {current_number} -> {next_number}");
 
         current_number = next_number;

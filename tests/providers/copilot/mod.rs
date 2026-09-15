@@ -1,5 +1,11 @@
 mod agent;
 mod auth;
+#[path = "cassette/ecs_completion.rs"]
+mod ecs_completion;
+#[path = "cassette/ecs_extractor.rs"]
+mod ecs_extractor;
+#[path = "cassette/ecs_extractor_usage.rs"]
+mod ecs_extractor_usage;
 mod embeddings;
 mod extractor;
 mod extractor_usage;
@@ -7,6 +13,9 @@ mod models;
 mod multi_extract;
 mod noninteractive_oauth_cassette;
 mod permission_control;
+mod raw_capture_matrix;
+mod raw_completion_parity_matrix;
+mod raw_stream_capture_matrix;
 mod reasoning_roundtrip;
 mod reasoning_tool_roundtrip;
 mod request_hook;
@@ -17,6 +26,7 @@ mod structured_output;
 mod typed_prompt_tools;
 
 use assert_fs::TempDir;
+use rig::client::DefaultTransportBuilder as _;
 use rig::providers::copilot;
 use std::borrow::Cow;
 use std::future::Future;
@@ -46,14 +56,14 @@ pub(crate) fn copilot_github_access_token() -> Option<String> {
 
 pub(crate) fn live_responses_model() -> Cow<'static, str> {
     first_env_value(&["GITHUB_COPILOT_RESPONSES_MODEL", "COPILOT_RESPONSES_MODEL"])
-        .map(Cow::Owned)
-        .unwrap_or_else(|| Cow::Borrowed(copilot::GPT_5_3_CODEX))
+        .map_or_else(|| Cow::Borrowed(copilot::GPT_5_3_CODEX), Cow::Owned)
 }
 
 pub(crate) fn live_embedding_model() -> Cow<'static, str> {
-    first_env_value(&["GITHUB_COPILOT_EMBEDDING_MODEL", "COPILOT_EMBEDDING_MODEL"])
-        .map(Cow::Owned)
-        .unwrap_or_else(|| Cow::Borrowed(copilot::TEXT_EMBEDDING_3_SMALL))
+    first_env_value(&["GITHUB_COPILOT_EMBEDDING_MODEL", "COPILOT_EMBEDDING_MODEL"]).map_or_else(
+        || Cow::Borrowed(copilot::TEXT_EMBEDDING_3_SMALL),
+        Cow::Owned,
+    )
 }
 
 fn env_base_url() -> Option<String> {
@@ -102,7 +112,13 @@ pub(crate) fn live_client() -> copilot::Client {
 
 async fn copilot_cassette(spec: impl Into<CassetteSpec>) -> (ProviderCassette, copilot::Client) {
     let cassette_base_url = cassette_base_url();
-    let cassette = ProviderCassette::start("copilot", spec, &cassette_base_url).await;
+    let cassette = ProviderCassette::start(
+        &crate::cassettes::cassette_root(),
+        "copilot",
+        spec,
+        &cassette_base_url,
+    )
+    .await;
     let client = copilot::Client::builder()
         .api_key(cassette.api_key("GITHUB_COPILOT_API_KEY"))
         .base_url(cassette.base_url())
@@ -116,7 +132,13 @@ async fn copilot_noninteractive_oauth_cassette(
     spec: impl Into<CassetteSpec>,
 ) -> (ProviderCassette, copilot::Client, TempDir) {
     let cassette_base_url = cassette_base_url();
-    let cassette = ProviderCassette::start("copilot", spec, &cassette_base_url).await;
+    let cassette = ProviderCassette::start(
+        &crate::cassettes::cassette_root(),
+        "copilot",
+        spec,
+        &cassette_base_url,
+    )
+    .await;
     let temp = TempDir::new().expect("temp token directory should be created");
     let api_key_record = serde_json::json!({
         "token": cassette.api_key("GITHUB_COPILOT_API_KEY"),

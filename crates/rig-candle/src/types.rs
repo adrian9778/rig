@@ -4,11 +4,10 @@ use rig_core::completion::{CompletionError, Usage};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::profile::ModelFamily;
+use crate::profile::ConversationProtocol;
 
 /// Why a local Candle completion failed.
 #[derive(Debug, Error, Clone)]
-#[non_exhaustive]
 pub enum CandleError {
     /// A required artifact buffer was empty.
     #[error("the {artifact} buffer is empty")]
@@ -34,9 +33,9 @@ pub enum CandleError {
     #[error("selected model family {selected:?} does not match detected family {detected:?}")]
     ModelFamilyMismatch {
         /// Family requested by the caller.
-        selected: ModelFamily,
+        selected: ConversationProtocol,
         /// Family detected from the tokenizer.
-        detected: ModelFamily,
+        detected: ConversationProtocol,
     },
     /// Independently supplied model artifacts disagree with one another.
     #[error("{artifact} does not match the selected model artifacts: {reason}")]

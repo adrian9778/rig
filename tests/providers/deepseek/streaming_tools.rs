@@ -3,7 +3,6 @@ use rig::completion::CompletionModel;
 use rig::message::{AssistantContent, Message, ToolChoice, ToolResultContent, UserContent};
 use rig::prelude::*;
 use rig::providers::deepseek::DEEPSEEK_V4_FLASH;
-use rig::streaming::StreamingChat;
 
 use super::support::with_deepseek_cassette;
 use crate::support::{
@@ -41,7 +40,7 @@ async fn streaming_chat_with_tools() {
                 .build();
 
             let history: &[Message] = &[];
-            let mut stream = agent.stream_chat("Calculate 2 - 5", history).await;
+            let mut stream = agent.prompt("Calculate 2 - 5").history(history).stream();
             let response = collect_stream_final_response(&mut stream)
                 .await
                 .expect("streaming chat should succeed");
@@ -156,9 +155,10 @@ async fn streaming_chat_surfaces_two_distinct_tool_calls_before_final_answer() {
 
             let history: &[Message] = &[];
             let mut stream = agent
-                .stream_chat(TWO_TOOL_STREAM_PROMPT, history)
+                .prompt(TWO_TOOL_STREAM_PROMPT)
+                .history(history)
                 .max_turns(8)
-                .await;
+                .stream();
             let observation = collect_stream_observation(&mut stream).await;
 
             assert_two_tool_roundtrip_contract(
@@ -185,9 +185,10 @@ async fn streaming_chat_emits_tool_call_before_later_text() {
 
             let history: &[Message] = &[];
             let mut stream = agent
-                .stream_chat(ORDERED_TOOL_STREAM_PROMPT, history)
+                .prompt(ORDERED_TOOL_STREAM_PROMPT)
+                .history(history)
                 .max_turns(5)
-                .await;
+                .stream();
             let observation = collect_stream_observation(&mut stream).await;
 
             assert_tool_call_precedes_later_text(

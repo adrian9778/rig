@@ -43,6 +43,7 @@
 //! use rig_neo4j::{vector_index::*, Neo4jClient};
 //! use neo4rs::ConfigBuilder;
 //! use rig_core::{providers::openai::*, vector_store::VectorStoreIndex};
+//! use rig_reqwest::prelude::*;
 //! use serde::Deserialize;
 //! use std::env;
 //!
@@ -81,7 +82,7 @@
 //!         plot: String,
 //!     }
 //!     let results = index.top_n::<Movie>("Batman", 3).await.unwrap();
-//!     println!("{:#?}", results);
+//!     println!("{results:#?}");
 //! }
 //! ```
 pub mod vector_index;
@@ -137,15 +138,15 @@ impl Neo4jSearchFilter {
         Self(format!("NOT ({})", self.0))
     }
 
-    pub fn gte(key: String, value: <Self as SearchFilter>::Value) -> Self {
+    pub fn gte(key: &str, value: <Self as SearchFilter>::Value) -> Self {
         Self(format!("n.{key} >= {}", serialize_cypher(value)))
     }
 
-    pub fn lte(key: String, value: <Self as SearchFilter>::Value) -> Self {
+    pub fn lte(key: &str, value: <Self as SearchFilter>::Value) -> Self {
         Self(format!("n.{key} <= {}", serialize_cypher(value)))
     }
 
-    pub fn member(key: String, values: Vec<<Self as SearchFilter>::Value>) -> Self {
+    pub fn member(key: &str, values: Vec<<Self as SearchFilter>::Value>) -> Self {
         Self(format!(
             "n.{key} IN {}",
             serialize_cypher(serde_json::Value::Array(values))
@@ -155,7 +156,7 @@ impl Neo4jSearchFilter {
     // String matching
 
     /// Tests whether the value at `key` contains the pattern
-    pub fn contains<S>(key: String, pattern: S) -> Self
+    pub fn contains<S>(key: &str, pattern: S) -> Self
     where
         S: AsRef<str>,
     {
@@ -166,7 +167,7 @@ impl Neo4jSearchFilter {
     }
 
     /// Tests whether the value at `key` starts with the pattern
-    pub fn starts_with<S>(key: String, pattern: S) -> Self
+    pub fn starts_with<S>(key: &str, pattern: S) -> Self
     where
         S: AsRef<str>,
     {
@@ -177,7 +178,7 @@ impl Neo4jSearchFilter {
     }
 
     /// Tests whether the value at `key` ends with the pattern
-    pub fn ends_with<S>(key: String, pattern: S) -> Self
+    pub fn ends_with<S>(key: &str, pattern: S) -> Self
     where
         S: AsRef<str>,
     {
@@ -187,7 +188,7 @@ impl Neo4jSearchFilter {
         ))
     }
 
-    pub fn matches<S>(key: String, pattern: S) -> Self
+    pub fn matches<S>(key: &str, pattern: S) -> Self
     where
         S: AsRef<str>,
     {
@@ -252,7 +253,7 @@ where
                 serde_json::Value::String(s) => BoltType::String(BoltString::new(&s)),
                 serde_json::Value::Array(arr) => BoltType::List(
                     arr.iter()
-                        .map(|v| v.to_bolt_type())
+                        .map(ToBoltType::to_bolt_type)
                         .collect::<Vec<BoltType>>()
                         .into(),
                 ),

@@ -37,17 +37,16 @@ fn parse_api<T: DeserializeOwned>(text: &str, what: &str) -> Result<T, Vectorize
     let api_response: ApiResponse<T> = serde_json::from_str(text)?;
 
     if !api_response.success {
-        let error = api_response
-            .errors
-            .first()
-            .map(|e| VectorizeError::ApiError {
-                code: e.code,
-                message: e.message.clone(),
-            })
-            .unwrap_or_else(|| VectorizeError::ApiError {
+        let error = api_response.errors.first().map_or_else(
+            || VectorizeError::ApiError {
                 code: 0,
                 message: "Unknown error".to_string(),
-            });
+            },
+            |e| VectorizeError::ApiError {
+                code: e.code,
+                message: e.message.clone(),
+            },
+        );
         return Err(error);
     }
 
@@ -173,10 +172,10 @@ impl VectorizeClient {
 
         let mut query_params = Vec::new();
         if let Some(limit) = limit {
-            query_params.push(format!("count={}", limit));
+            query_params.push(format!("count={limit}"));
         }
         if let Some(cursor) = cursor {
-            query_params.push(format!("cursor={}", cursor));
+            query_params.push(format!("cursor={cursor}"));
         }
         if !query_params.is_empty() {
             url = format!("{}?{}", url, query_params.join("&"));
@@ -195,40 +194,4 @@ impl VectorizeClient {
 
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::panic)]
-mod tests {
-    use super::{VectorizeError, parse_api};
-
-    #[test]
-    fn parse_api_unwraps_successful_envelope() {
-        let body = r#"{"success": true, "result": 42, "errors": [], "messages": []}"#;
-        let n: u32 = parse_api(body, "query").expect("successful envelope");
-        assert_eq!(n, 42);
-    }
-
-    #[test]
-    fn parse_api_surfaces_envelope_errors() {
-        let body = r#"{
-            "success": false,
-            "result": null,
-            "errors": [{"code": 7, "message": "index not found"}],
-            "messages": []
-        }"#;
-        match parse_api::<u32>(body, "query") {
-            Err(VectorizeError::ApiError { code: 7, message }) => {
-                assert_eq!(message, "index not found");
-            }
-            other => panic!("expected ApiError, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn parse_api_errors_on_missing_result() {
-        let body = r#"{"success": true, "result": null, "errors": [], "messages": []}"#;
-        match parse_api::<u32>(body, "upsert") {
-            Err(VectorizeError::ApiError { code: 0, message }) => {
-                assert_eq!(message, "No result in successful upsert response");
-            }
-            other => panic!("expected ApiError, got {other:?}"),
-        }
-    }
-}
+mod tests;

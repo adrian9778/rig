@@ -76,7 +76,7 @@ impl Loadable for Vec<u8> {
 ///         .collect();
 ///
 ///     for content in contents {
-///         println!("{}", content);
+///         println!("{content}");
 ///     }
 ///
 ///     Ok(())
@@ -105,8 +105,8 @@ impl<'a, T: Loadable + 'a> PdfFileLoader<'a, T> {
     /// let content = PdfFileLoader::with_glob("tests/data/*.pdf")?.load().into_iter();
     /// for result in content {
     ///     match result {
-    ///         Ok(doc) => println!("{:?}", doc),
-    ///         Err(e) => eprintln!("Error reading pdf: {}", e),
+    ///         Ok(doc) => println!("{doc:?}"),
+    ///         Err(e) => eprintln!("Error reading pdf: {e}"),
     ///     }
     /// }
     /// # Ok(())
@@ -114,7 +114,7 @@ impl<'a, T: Loadable + 'a> PdfFileLoader<'a, T> {
     /// ```
     pub fn load(self) -> PdfFileLoader<'a, Result<Document, PdfLoaderError>> {
         PdfFileLoader {
-            iterator: Box::new(self.iterator.map(|res| res.load())),
+            iterator: Box::new(self.iterator.map(Loadable::load)),
         }
     }
 
@@ -131,8 +131,8 @@ impl<'a, T: Loadable + 'a> PdfFileLoader<'a, T> {
     /// let content = PdfFileLoader::with_glob("tests/data/*.pdf")?.load_with_path().into_iter();
     /// for result in content {
     ///     match result {
-    ///         Ok((path, doc)) => println!("{:?} {:?}", path, doc),
-    ///         Err(e) => eprintln!("Error reading pdf: {}", e),
+    ///         Ok((path, doc)) => println!("{path:?} {doc:?}"),
+    ///         Err(e) => eprintln!("Error reading pdf: {e}"),
     ///     }
     /// }
     /// # Ok(())
@@ -140,7 +140,7 @@ impl<'a, T: Loadable + 'a> PdfFileLoader<'a, T> {
     /// ```
     pub fn load_with_path(self) -> PdfFileLoader<'a, Result<(PathBuf, Document), PdfLoaderError>> {
         PdfFileLoader {
-            iterator: Box::new(self.iterator.map(|res| res.load_with_path())),
+            iterator: Box::new(self.iterator.map(Loadable::load_with_path)),
         }
     }
 }
@@ -178,8 +178,8 @@ impl<'a, T: Loadable + 'a> PdfFileLoader<'a, T> {
     /// let content = PdfFileLoader::with_glob("tests/data/*.pdf")?.read().into_iter();
     /// for result in content {
     ///     match result {
-    ///         Ok(content) => println!("{}", content),
-    ///         Err(e) => eprintln!("Error reading pdf: {}", e),
+    ///         Ok(content) => println!("{content}"),
+    ///         Err(e) => eprintln!("Error reading pdf: {e}"),
     ///     }
     /// }
     /// # Ok(())
@@ -204,8 +204,8 @@ impl<'a, T: Loadable + 'a> PdfFileLoader<'a, T> {
     /// let content = PdfFileLoader::with_glob("tests/data/*.pdf")?.read_with_path().into_iter();
     /// for result in content {
     ///     match result {
-    ///         Ok((path, content)) => println!("{:?} {}", path, content),
-    ///         Err(e) => eprintln!("Error reading pdf: {}", e),
+    ///         Ok((path, content)) => println!("{path:?} {content}"),
+    ///         Err(e) => eprintln!("Error reading pdf: {e}"),
     ///     }
     /// }
     /// # Ok(())
@@ -238,8 +238,8 @@ impl<'a> PdfFileLoader<'a, Document> {
     ///     .into_iter();
     /// for result in content {
     ///     match result {
-    ///         Ok(page) => println!("{}", page),
-    ///         Err(e) => eprintln!("Error reading pdf: {}", e),
+    ///         Ok(page) => println!("{page}"),
+    ///         Err(e) => eprintln!("Error reading pdf: {e}"),
     ///     }
     /// }
     /// # Ok(())
@@ -276,8 +276,8 @@ impl<'a> PdfFileLoader<'a, (PathBuf, Document)> {
     ///     println!("{}", path.display());
     ///     for (pageno, result) in pages {
     ///         match result {
-    ///             Ok(content) => println!("Page {}: {}", pageno, content),
-    ///             Err(e) => eprintln!("Error reading page: {}", e),
+    ///             Ok(content) => println!("Page {pageno}: {content}"),
+    ///             Err(e) => eprintln!("Error reading page: {e}"),
     ///         }
     ///     }
     /// }
@@ -329,129 +329,4 @@ loader_scaffold!(PdfFileLoader, PdfLoaderError, dir: all_entries);
 loader_from_bytes!(PdfFileLoader);
 
 #[cfg(test)]
-mod tests {
-    use crate::loaders::test_fixtures::{fixture_glob, fixture_path};
-
-    use super::PdfFileLoader;
-
-    #[test]
-    fn test_pdf_loader() {
-        let glob = fixture_glob("*.pdf");
-        let loader = PdfFileLoader::with_glob(&glob).unwrap();
-        let actual = loader
-            .load_with_path()
-            .ignore_errors()
-            .by_page()
-            .ignore_errors()
-            .into_iter()
-            .collect::<Vec<_>>();
-
-        let mut actual = actual
-            .into_iter()
-            .map(|result| {
-                let (path, pages) = result;
-                pages.iter().for_each(|(page_no, content)| {
-                    println!("{path:?} Page {page_no}: {content:?}");
-                });
-                (path, pages)
-            })
-            .collect::<Vec<_>>();
-
-        let mut expected = vec![
-            (
-                fixture_path("dummy.pdf"),
-                vec![(0, "Test\nPDF\nDocument\n".to_string())],
-            ),
-            (
-                fixture_path("file-id-verifiers.pdf"),
-                vec![
-                    (0, "rig-file-id-page-one-verifier-3a91\n".to_string()),
-                    (1, "rig-file-id-page-two-verifier-8c27\n".to_string()),
-                    (2, "rig-file-id-page-three-verifier-f54e\n".to_string()),
-                ],
-            ),
-            (
-                fixture_path("pages.pdf"),
-                vec![
-                    (0, "Page\n1\n".to_string()),
-                    (1, "Page\n2\n".to_string()),
-                    (2, "Page\n3\n".to_string()),
-                ],
-            ),
-        ];
-
-        actual.sort();
-        expected.sort();
-
-        assert!(!actual.is_empty());
-        assert!(expected == actual)
-    }
-
-    #[test]
-    fn test_pdf_loader_bytes() {
-        // this should never fail!
-        let bytes = std::fs::read(fixture_path("dummy.pdf")).unwrap();
-
-        let loader = PdfFileLoader::from_bytes(bytes);
-
-        let actual = loader
-            .load()
-            .ignore_errors()
-            .by_page()
-            .ignore_errors()
-            .into_iter()
-            .collect::<Vec<_>>();
-
-        assert_eq!(actual.len(), 1);
-        assert_eq!(actual, vec!["Test\nPDF\nDocument\n".to_string()]);
-
-        // this should never fail!
-        let bytes = std::fs::read(fixture_path("pages.pdf")).unwrap();
-
-        let loader = PdfFileLoader::from_bytes(bytes);
-
-        let actual = loader
-            .load()
-            .ignore_errors()
-            .by_page()
-            .ignore_errors()
-            .into_iter()
-            .collect::<Vec<_>>();
-
-        assert_eq!(actual.len(), 3);
-        assert_eq!(
-            actual,
-            vec![
-                "Page\n1\n".to_string(),
-                "Page\n2\n".to_string(),
-                "Page\n3\n".to_string(),
-            ]
-        );
-    }
-
-    #[test]
-    fn test_pdf_loader_bytes_multi() {
-        let dummy = std::fs::read(fixture_path("dummy.pdf")).unwrap();
-        let pages = std::fs::read(fixture_path("pages.pdf")).unwrap();
-
-        let loader = PdfFileLoader::from_bytes_multi(vec![dummy, pages]);
-
-        let actual = loader
-            .load()
-            .ignore_errors()
-            .by_page()
-            .ignore_errors()
-            .into_iter()
-            .collect::<Vec<_>>();
-
-        assert_eq!(
-            actual,
-            vec![
-                "Test\nPDF\nDocument\n".to_string(),
-                "Page\n1\n".to_string(),
-                "Page\n2\n".to_string(),
-                "Page\n3\n".to_string(),
-            ]
-        );
-    }
-}
+mod tests;

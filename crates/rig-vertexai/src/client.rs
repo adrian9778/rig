@@ -80,8 +80,8 @@ impl ClientBuilder {
     /// Set the Google Cloud project ID explicitly.
     ///
     /// If not set, will fall back to `GOOGLE_CLOUD_PROJECT` environment variable.
-    pub fn with_project(mut self, project: &str) -> Self {
-        self.project = Some(project.to_string());
+    pub fn with_project(mut self, project: impl Into<String>) -> Self {
+        self.project = Some(project.into());
         self
     }
 
@@ -89,8 +89,8 @@ impl ClientBuilder {
     ///
     /// If not set, will fall back to `GOOGLE_CLOUD_LOCATION` environment variable,
     /// or default to "global" if the env var is also not set.
-    pub fn with_location(mut self, location: &str) -> Self {
-        self.location = Some(location.to_string());
+    pub fn with_location(mut self, location: impl Into<String>) -> Self {
+        self.location = Some(location.into());
         self
     }
 
@@ -105,7 +105,7 @@ impl ClientBuilder {
 
     /// Build the client with the configured values, falling back to environment variables where not set.
     ///
-    /// The Vertex AI client is built lazily on first use via `get_inner()`.
+    /// The Vertex AI client is built lazily on first use via `inner()`.
     pub fn build(self) -> Result<Client, VertexAiClientError> {
         let project = self
             .project
@@ -186,13 +186,18 @@ impl Client {
 
     /// Create a client using environment variables for project, location, and credentials.
     ///
-    /// This is a convenience method that calls the `ProviderClient::from_env()` trait method.
     /// Reads from:
     /// - `GOOGLE_CLOUD_PROJECT` (required)
     /// - `GOOGLE_CLOUD_LOCATION` (optional, defaults to "global")
     /// - `GOOGLE_CLOUD_SERVICE_ACCOUNT` (optional, for service account impersonation)
     pub fn from_env() -> Result<Self, VertexAiClientError> {
-        <Self as ProviderClient>::from_env()
+        Client::new()
+    }
+
+    /// Vertex AI takes no explicit input: use [`Client::from_env`] or
+    /// [`ClientBuilder`].
+    pub fn from_val(_: Nothing) -> Result<Self, VertexAiClientError> {
+        Err(VertexAiClientError::InvalidInput)
     }
 
     pub fn project(&self) -> &str {
@@ -203,9 +208,7 @@ impl Client {
         &self.location
     }
 
-    pub async fn get_inner(
-        &self,
-    ) -> Result<&vertexai::client::PredictionService, VertexAiClientError> {
+    pub async fn inner(&self) -> Result<&vertexai::client::PredictionService, VertexAiClientError> {
         let credentials = self.credentials.clone();
         self.vertex_client
             .get_or_init(|| async {
@@ -219,25 +222,6 @@ impl Client {
             .await
             .as_ref()
             .map_err(Clone::clone)
-    }
-}
-
-impl ProviderClient for Client {
-    type Input = Nothing;
-    type Error = VertexAiClientError;
-
-    fn from_env() -> Result<Self, Self::Error>
-    where
-        Self: Sized,
-    {
-        Client::new()
-    }
-
-    fn from_val(_: Self::Input) -> Result<Self, Self::Error>
-    where
-        Self: Sized,
-    {
-        Err(VertexAiClientError::InvalidInput)
     }
 }
 

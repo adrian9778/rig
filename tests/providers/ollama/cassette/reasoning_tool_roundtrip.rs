@@ -12,10 +12,9 @@
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 
-use rig::completion::{Chat, Message};
+use rig::completion::Message;
 use rig::message::AssistantContent;
 use rig::prelude::*;
-use rig::streaming::StreamingChat;
 
 use super::super::support::with_ollama_cassette;
 use crate::reasoning::{self, WeatherTool};
@@ -46,13 +45,13 @@ async fn nonstreaming() {
                 .await
                 .expect("[ollama] non-streaming chat failed");
 
-            reasoning::assert_nonstreaming_universal(&result, &call_count, "ollama");
+            reasoning::assert_nonstreaming_universal(&result.output, &call_count, "ollama");
             // #1926: the tool-call turn's `thinking` must survive into history as
             // an AssistantContent::Reasoning. Pre-fix, the non-streaming choice
             // contained only the ToolCall and this assertion failed.
             reasoning::assert_chat_history_preserves_reasoning_tool_roundtrip(
                 &chat_history,
-                &result,
+                &result.output,
                 "ollama",
             );
             assert!(
@@ -80,9 +79,10 @@ async fn streaming() {
             .build();
 
         let stream = agent
-            .stream_chat(reasoning::TOOL_USER_PROMPT, Vec::<Message>::new())
+            .prompt(reasoning::TOOL_USER_PROMPT)
+            .history(Vec::<Message>::new())
             .max_turns(3)
-            .await;
+            .stream();
 
         let stats = reasoning::collect_stream_stats(stream, "ollama").await;
         reasoning::assert_universal(&stats, &call_count, "ollama");

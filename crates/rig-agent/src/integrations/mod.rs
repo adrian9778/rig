@@ -1,5 +1,3 @@
+//! Ready-made ways to put an agent in front of a user: the CLI chatbot.
+/// A terminal chat loop over an agent.
 pub mod cli_chatbot;
-
-#[cfg(feature = "discord-bot")]
-#[cfg_attr(docsrs, doc(cfg(feature = "discord-bot")))]
-pub mod discord_bot;

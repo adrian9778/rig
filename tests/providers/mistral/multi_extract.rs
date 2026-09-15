@@ -1,5 +1,7 @@
 //! Mistral live coverage for batch multi-extract pipelines.
 
+use std::future::IntoFuture;
+
 use anyhow::Result;
 use futures::stream::{StreamExt, TryStreamExt};
 use rig::prelude::*;
@@ -76,17 +78,17 @@ async fn batch_multi_extract_chain() -> Result<()> {
     let client = mistral::Client::from_env().expect("client should build");
     let names_extractor = client
         .extractor::<Names>(DEFAULT_MODEL)
-        .preamble("Extract names from the given text.")
+        .append_preamble("Extract names from the given text.")
         .retries(2)
         .build();
     let topics_extractor = client
         .extractor::<Topics>(DEFAULT_MODEL)
-        .preamble("Extract topics from the given text.")
+        .append_preamble("Extract topics from the given text.")
         .retries(2)
         .build();
     let sentiment_extractor = client
         .extractor::<Sentiment>(DEFAULT_MODEL)
-        .preamble(
+        .append_preamble(
             "Extract sentiment and confidence from the given text. \
              Return sentiment normalized to the range [-1.0, 1.0] and confidence normalized to [0.0, 1.0].",
         )
@@ -105,15 +107,15 @@ async fn batch_multi_extract_chain() -> Result<()> {
             let sentiment_extractor = &sentiment_extractor;
             async move {
                 let (names, topics, sentiment) = futures::try_join!(
-                    names_extractor.extract(text),
-                    topics_extractor.extract(text),
-                    sentiment_extractor.extract(text),
+                    names_extractor.extract(text).into_future(),
+                    topics_extractor.extract(text).into_future(),
+                    sentiment_extractor.extract(text).into_future(),
                 )?;
                 anyhow::Ok(CombinedExtract {
-                    names: names.names,
-                    topics: topics.topics,
-                    sentiment: sentiment.sentiment,
-                    confidence: sentiment.confidence,
+                    names: names.output.names,
+                    topics: topics.output.topics,
+                    sentiment: sentiment.output.sentiment,
+                    confidence: sentiment.output.confidence,
                 })
             }
         })

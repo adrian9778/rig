@@ -1,6 +1,5 @@
 //! Hugging Face context smoke test.
 
-use rig::completion::Prompt;
 use rig::prelude::*;
 use rig::providers::huggingface;
 
@@ -15,7 +14,7 @@ async fn context_smoke() {
         .copied()
         .fold(
             client.agent("deepseek-ai/DeepSeek-R1-Distill-Qwen-32B"),
-            |builder, doc| builder.context(doc),
+            rig::AgentBuilder::context,
         )
         .build();
 
@@ -25,7 +24,7 @@ async fn context_smoke() {
         .expect("context prompt should succeed");
 
     assert_contains_any_case_insensitive(
-        &response,
+        &response.output,
         &[
             "ancient tool",
             "farming tool",

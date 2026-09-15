@@ -1,4 +1,10 @@
-use crate::client::{self, BearerAuth, DebugExt, Provider};
+#[cfg(feature = "audio")]
+use crate::client::HasAudioGeneration;
+use crate::client::{
+    self, BearerAuth, HasCompletion, HasEmbeddings, HasModelListing, HasTranscription,
+    ModelTransport, Provider, ProviderClientResult,
+};
+use crate::http_client::{self, HttpClientExt};
 use http::HeaderValue;
 use serde::{Deserialize, Serialize};
 use std::fmt::Debug;
@@ -9,46 +15,100 @@ use std::fmt::Debug;
 const OPENROUTER_API_BASE_URL: &str = "https://openrouter.ai/api/v1";
 
 #[derive(Debug, Default, Clone, Copy)]
-pub struct OpenRouterExt;
-#[derive(Debug, Default, Clone, Copy)]
-pub struct OpenRouterExtBuilder;
-
+pub struct OpenRouter;
 type OpenRouterApiKey = BearerAuth;
 
-pub type Client<H = reqwest::Client> = client::Client<OpenRouterExt, H>;
-pub type ClientBuilder<H = crate::markers::Missing> =
-    client::ClientBuilder<OpenRouterExtBuilder, OpenRouterApiKey, H>;
+pub type Client<H = crate::http_client::BoxedHttpClient> = client::Client<OpenRouter, H>;
+pub type ClientBuilder<H = crate::markers::Missing> = client::ClientBuilder<OpenRouter, H>;
 
-impl Provider for OpenRouterExt {
-    type Builder = OpenRouterExtBuilder;
-
+impl Provider for OpenRouter {
+    const NAME: &'static str = "openrouter";
+    const BASE_URL: &'static str = OPENROUTER_API_BASE_URL;
     const VERIFY_PATH: &'static str = "/key";
+    type ApiKey = OpenRouterApiKey;
+    type Config = ();
+    type EnvInput = OpenRouterApiKey;
+
+    fn build(_: (), _: &OpenRouterApiKey) -> http_client::Result<Self> {
+        Ok(OpenRouter)
+    }
+
+    fn from_env<H: HttpClientExt>(http: H) -> ProviderClientResult<Client<H>> {
+        Client::from_env_api_key("OPENROUTER_API_KEY", None, http)
+    }
+
+    fn from_val<H: HttpClientExt>(
+        input: OpenRouterApiKey,
+        http: H,
+    ) -> ProviderClientResult<Client<H>> {
+        Client::new_with(input, http)
+    }
 }
 
-client::impl_capabilities!(
-    OpenRouterExt,
-    completion = super::CompletionModel<H>,
-    embeddings = super::EmbeddingModel<H>,
-    transcription = super::transcription::TranscriptionModel<H>,
-    model_listing = super::OpenRouterModelLister<H>,
-    audio_generation = super::audio_generation::AudioGenerationModel<H>,
-);
+impl HasCompletion for OpenRouter {
+    type Model<H>
+        = super::CompletionModel<H>
+    where
+        H: ModelTransport;
 
-impl DebugExt for OpenRouterExt {}
+    fn completion_model<H: ModelTransport>(client: &Client<H>, model: String) -> Self::Model<H> {
+        super::CompletionModel::new(client.clone(), model)
+    }
+}
 
-client::impl_default_provider_builder!(
-    OpenRouterExtBuilder => OpenRouterExt,
-    api_key = OpenRouterApiKey,
-    base_url = OPENROUTER_API_BASE_URL,
-);
+impl HasEmbeddings for OpenRouter {
+    type Model<H>
+        = super::EmbeddingModel<H>
+    where
+        H: ModelTransport;
 
-client::impl_provider_client!(
-    Client,
-    input = OpenRouterApiKey,
-    api_key_env = "OPENROUTER_API_KEY",
-);
+    fn embedding_model<H: ModelTransport>(
+        client: &Client<H>,
+        model: String,
+        ndims: Option<usize>,
+    ) -> Self::Model<H> {
+        super::EmbeddingModel::make(client, model, ndims)
+    }
+}
 
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+impl HasTranscription for OpenRouter {
+    type Model<H>
+        = super::transcription::TranscriptionModel<H>
+    where
+        H: ModelTransport;
+
+    fn transcription_model<H: ModelTransport>(client: &Client<H>, model: String) -> Self::Model<H> {
+        super::transcription::TranscriptionModel::new(client.clone(), model)
+    }
+}
+
+impl HasModelListing for OpenRouter {
+    type Lister<H>
+        = super::OpenRouterModelLister<H>
+    where
+        H: ModelTransport;
+
+    fn model_lister<H: ModelTransport>(client: &Client<H>) -> Self::Lister<H> {
+        super::OpenRouterModelLister::new(client.clone())
+    }
+}
+
+#[cfg(feature = "audio")]
+impl HasAudioGeneration for OpenRouter {
+    type Model<H>
+        = super::audio_generation::AudioGenerationModel<H>
+    where
+        H: ModelTransport;
+
+    fn audio_generation_model<H: ModelTransport>(
+        client: &Client<H>,
+        model: String,
+    ) -> Self::Model<H> {
+        super::audio_generation::AudioGenerationModel::new(client.clone(), model)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize)]
 pub struct Usage {
     pub prompt_tokens: usize,
     #[serde(default)]
@@ -61,12 +121,17 @@ pub struct Usage {
     /// with server-side automatic caching).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt_tokens_details: Option<PromptTokensDetails>,
+    /// OpenAI-compatible completion-token breakdown. OpenRouter includes full
+    /// usage accounting on every response, so a reasoning-capable route
+    /// reports here how much of `completion_tokens` went to hidden reasoning.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completion_tokens_details: Option<CompletionTokensDetails>,
 }
 
 /// Prompt-token breakdown reported by OpenRouter for cached requests.
 // `usize` matches the parent `Usage` struct in this module; the streaming counterpart
 // in `streaming.rs` uses `u32` to match its own parent.
-#[derive(Clone, Debug, Deserialize, Serialize, Default)]
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, Default)]
 pub struct PromptTokensDetails {
     /// Tokens served from cache (cache hit).
     #[serde(default)]
@@ -74,6 +139,19 @@ pub struct PromptTokensDetails {
     /// Tokens written to cache on this call (cache miss that populated the cache).
     #[serde(default)]
     pub cache_write_tokens: usize,
+}
+
+/// Completion-token breakdown reported by OpenRouter.
+///
+/// Only the reasoning share is modeled: it is the one entry rig's normalized
+/// [`crate::completion::Usage`] has a slot for, and OpenRouter documents usage
+/// accounting as always present (on the final SSE message when streaming).
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, Default)]
+pub struct CompletionTokensDetails {
+    /// Tokens the upstream spent on hidden reasoning, counted inside
+    /// `completion_tokens`.
+    #[serde(default)]
+    pub reasoning_tokens: usize,
 }
 
 impl std::fmt::Display for Usage {
@@ -88,11 +166,10 @@ impl std::fmt::Display for Usage {
 
 impl From<&Usage> for crate::completion::Usage {
     fn from(value: &Usage) -> crate::completion::Usage {
-        let (cached_input, cache_creation) = value
-            .prompt_tokens_details
-            .as_ref()
-            .map(|d| (d.cached_tokens as u64, d.cache_write_tokens as u64))
-            .unwrap_or((0, 0));
+        let (cached_input, cache_creation) =
+            value.prompt_tokens_details.as_ref().map_or((0, 0), |d| {
+                (d.cached_tokens as u64, d.cache_write_tokens as u64)
+            });
         crate::completion::Usage {
             input_tokens: value.prompt_tokens as u64,
             // Reported completion tokens, falling back to saturating
@@ -107,7 +184,10 @@ impl From<&Usage> for crate::completion::Usage {
             cached_input_tokens: cached_input,
             cache_creation_input_tokens: cache_creation,
             tool_use_prompt_tokens: 0,
-            reasoning_tokens: 0,
+            reasoning_tokens: value
+                .completion_tokens_details
+                .as_ref()
+                .map_or(0, |d| d.reasoning_tokens as u64),
         }
     }
 }
@@ -117,7 +197,7 @@ impl From<Usage> for crate::completion::Usage {
         crate::completion::Usage::from(&value)
     }
 }
-impl<ApiKey, H> client::ClientBuilder<OpenRouterExtBuilder, ApiKey, H> {
+impl<H> client::ClientBuilder<OpenRouter, H> {
     /// Attach OpenRouter app-identification headers (`X-OpenRouter-Title` and `HTTP-Referer`)
     /// to every request made by this client. `title` appears in the dashboard activity feed
     /// and rankings page; `url` is the primary app identifier required to create an app page
@@ -148,7 +228,7 @@ impl<ApiKey, H> client::ClientBuilder<OpenRouterExtBuilder, ApiKey, H> {
         let joined = categories
             .iter()
             .take(2)
-            .map(|c| c.as_ref())
+            .map(std::convert::AsRef::as_ref)
             .collect::<Vec<_>>()
             .join(",");
         if !joined.is_empty()
@@ -164,103 +244,4 @@ impl<ApiKey, H> client::ClientBuilder<OpenRouterExtBuilder, ApiKey, H> {
 }
 
 #[cfg(test)]
-mod tests {
-    #[test]
-    fn test_client_initialization() {
-        let _client =
-            crate::providers::openrouter::Client::new("dummy-key").expect("Client::new() failed");
-        let _client_from_builder = crate::providers::openrouter::Client::builder()
-            .api_key("dummy-key")
-            .build()
-            .expect("Client::builder() failed");
-    }
-
-    #[test]
-    fn test_with_app_identity_sets_headers() {
-        let client = crate::providers::openrouter::Client::builder()
-            .with_app_identity("My App", "https://myapp.example.com")
-            .api_key("dummy-key")
-            .build()
-            .expect("Client::builder() failed");
-
-        let headers = client.headers();
-        assert_eq!(
-            headers
-                .get("x-openrouter-title")
-                .and_then(|v| v.to_str().ok()),
-            Some("My App"),
-        );
-        assert_eq!(
-            headers.get("http-referer").and_then(|v| v.to_str().ok()),
-            Some("https://myapp.example.com"),
-        );
-    }
-
-    #[test]
-    fn test_without_app_identity_no_extra_headers() {
-        let client = crate::providers::openrouter::Client::builder()
-            .api_key("dummy-key")
-            .build()
-            .expect("Client::builder() failed");
-
-        let headers = client.headers();
-        assert!(headers.get("x-openrouter-title").is_none());
-        assert!(headers.get("http-referer").is_none());
-    }
-
-    #[test]
-    fn test_with_app_categories_sets_header() {
-        let client = crate::providers::openrouter::Client::builder()
-            .with_app_categories(&["cli-agent", "ide-extension"])
-            .api_key("dummy-key")
-            .build()
-            .expect("Client::builder() failed");
-
-        assert_eq!(
-            client
-                .headers()
-                .get("x-openrouter-categories")
-                .and_then(|v| v.to_str().ok()),
-            Some("cli-agent,ide-extension"),
-        );
-    }
-
-    #[test]
-    fn test_with_app_categories_sends_at_most_two_categories() {
-        let client = crate::providers::openrouter::Client::builder()
-            .with_app_categories(&["cli-agent", "ide-extension", "chat"])
-            .api_key("dummy-key")
-            .build()
-            .expect("Client::builder() failed");
-
-        assert_eq!(
-            client
-                .headers()
-                .get("x-openrouter-categories")
-                .and_then(|v| v.to_str().ok()),
-            Some("cli-agent,ide-extension"),
-        );
-    }
-
-    #[test]
-    fn test_with_app_categories_empty_list_no_header() {
-        let empty: [&str; 0] = [];
-        let client = crate::providers::openrouter::Client::builder()
-            .with_app_categories(&empty)
-            .api_key("dummy-key")
-            .build()
-            .expect("Client::builder() failed");
-
-        assert!(client.headers().get("x-openrouter-categories").is_none());
-    }
-
-    #[test]
-    fn test_without_app_categories_no_header() {
-        let client = crate::providers::openrouter::Client::builder()
-            .api_key("dummy-key")
-            .build()
-            .expect("Client::builder() failed");
-
-        assert!(client.headers().get("x-openrouter-categories").is_none());
-    }
-}
+mod tests;

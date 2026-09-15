@@ -1,11 +1,9 @@
 //! Migrated from `examples/openai_agent_completions_api.rs`.
 use rig::completion::CompletionModel;
 use rig::completion::NormalizeCompletionResponse;
-use rig::completion::Prompt;
 use rig::message::{AssistantContent, Message, ToolChoice, ToolResultContent, UserContent};
 use rig::prelude::*;
 use rig::providers::openai;
-use rig::streaming::StreamingPrompt;
 use rig::telemetry::ProviderResponseExt;
 
 use super::super::support::with_openai_completions_cassette;
@@ -35,7 +33,8 @@ async fn completions_api_agent_prompt() {
             let response = agent
                 .prompt("Hello world!")
                 .await
-                .expect("completions api prompt should succeed");
+                .expect("completions api prompt should succeed")
+                .output;
 
             assert_nonempty_response(&response);
         },
@@ -62,7 +61,7 @@ async fn completions_api_raw_response_text_matches_normalized_choice_text() {
                 .await
                 .expect("raw completions api request should succeed");
             let raw_text = raw
-                .get_text_response()
+                .text_response()
                 .expect("raw completions api response should contain assistant text");
 
             let response: rig::completion::CompletionResponse = raw
@@ -92,10 +91,7 @@ async fn completions_api_streams_two_tool_calls_before_final_answer() {
                 .tool(BetaSignal)
                 .build();
 
-            let mut stream = agent
-                .stream_prompt(TWO_TOOL_STREAM_PROMPT)
-                .max_turns(8)
-                .await;
+            let mut stream = agent.prompt(TWO_TOOL_STREAM_PROMPT).max_turns(8).stream();
             let observation = collect_stream_observation(&mut stream).await;
 
             assert_two_tool_roundtrip_contract(
@@ -198,9 +194,9 @@ async fn completions_api_stream_emits_tool_call_before_later_text() {
                 .build();
 
             let mut stream = agent
-                .stream_prompt(ORDERED_TOOL_STREAM_PROMPT)
+                .prompt(ORDERED_TOOL_STREAM_PROMPT)
                 .max_turns(5)
-                .await;
+                .stream();
             let observation = collect_stream_observation(&mut stream).await;
 
             assert_tool_call_precedes_later_text(

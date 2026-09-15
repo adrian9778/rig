@@ -77,7 +77,7 @@ impl Client {
         }
     }
 
-    pub async fn get_inner(&self) -> &aws_sdk_bedrockruntime::Client {
+    pub async fn inner(&self) -> &aws_sdk_bedrockruntime::Client {
         self.aws_client
             .get_or_init(|| async {
                 let config = if let Some(profile_name) = &self.profile_name {
@@ -94,21 +94,20 @@ impl Client {
     }
 }
 
-impl ProviderClient for Client {
-    type Input = Nothing;
-    type Error = rig_core::client::ProviderClientError;
-
-    fn from_env() -> Result<Self, Self::Error>
-    where
-        Self: Sized,
-    {
+impl Client {
+    /// Create an AWS Bedrock client whose SDK configuration is loaded from the
+    /// process environment on first use.
+    ///
+    /// Bedrock talks through the AWS SDK rather than an HTTP transport, so
+    /// this client is not a `rig_core::client::Client`; construction is
+    /// inherent.
+    pub fn from_env() -> Result<Self, rig_core::client::ProviderClientError> {
         Ok(Client::new())
     }
 
-    fn from_val(_: Nothing) -> Result<Self, Self::Error>
-    where
-        Self: Sized,
-    {
+    /// Bedrock takes no explicit input: use [`Client::from_env`] or
+    /// [`Client::with_profile_name`].
+    pub fn from_val(_: Nothing) -> Result<Self, rig_core::client::ProviderClientError> {
         Err(rig_core::client::ProviderClientError::InvalidConfiguration(
             "use `Client::from_env()` or `Client::with_profile_name(\"aws_profile\")` instead",
         ))

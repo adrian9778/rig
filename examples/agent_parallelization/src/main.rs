@@ -1,7 +1,8 @@
 use rig::prelude::*;
+use std::future::IntoFuture;
 
 use rig::providers::openai;
-use rig::providers::openai::client::Client;
+use rig::providers::openai::Client;
 
 use schemars::JsonSchema;
 
@@ -17,7 +18,7 @@ async fn main() -> Result<(), anyhow::Error> {
 
     let manipulation_agent = openai_client
         .extractor::<DocumentScore>(openai::GPT_4)
-        .preamble(
+        .append_preamble(
             "
             Your role is to score a user's statement on how manipulative it sounds between 0 and 1.
         ",
@@ -26,7 +27,7 @@ async fn main() -> Result<(), anyhow::Error> {
 
     let depression_agent = openai_client
         .extractor::<DocumentScore>(openai::GPT_4)
-        .preamble(
+        .append_preamble(
             "
             Your role is to score a user's statement on how depressive it sounds between 0 and 1.
         ",
@@ -35,7 +36,7 @@ async fn main() -> Result<(), anyhow::Error> {
 
     let intelligent_agent = openai_client
         .extractor::<DocumentScore>(openai::GPT_4)
-        .preamble(
+        .append_preamble(
             "
             Your role is to score a user's statement on how intelligent it sounds between 0 and 1.
         ",
@@ -48,9 +49,9 @@ async fn main() -> Result<(), anyhow::Error> {
     // `parallel!` op provided.
     let statement = "I hate swimming. The water always gets in my eyes.";
     let (manip_score, dep_score, int_score) = futures::join!(
-        manipulation_agent.extract(statement),
-        depression_agent.extract(statement),
-        intelligent_agent.extract(statement),
+        manipulation_agent.extract(statement).into_future(),
+        depression_agent.extract(statement).into_future(),
+        intelligent_agent.extract(statement).into_future(),
     );
 
     let response = match (manip_score, dep_score, int_score) {
@@ -61,7 +62,7 @@ async fn main() -> Result<(), anyhow::Error> {
                     Depression sentiment score: {}
                     Intelligence sentiment score: {}
                     ",
-            manip_score.score, dep_score.score, int_score.score
+            manip_score.output.score, dep_score.output.score, int_score.output.score
         ),
         (manip_score, dep_score, int_score) => format!(
             "

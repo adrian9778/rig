@@ -1,13 +1,14 @@
 use fixture::{Word, as_record_batch, words};
 use lancedb::index::vector::IvfPqIndexBuilder;
-use rig_agent::{client::AgentModelExt, completion::Prompt};
-use rig_core::client::{CompletionClient, EmbeddingsClient, ProviderClient};
+use rig_agent::client::AgentModelExt;
+use rig_core::client::{CompletionClient, EmbeddingsClient};
 use rig_core::providers::openai;
 use rig_core::{
     embeddings::{EmbeddingModel, EmbeddingsBuilder},
     providers::openai::Client,
 };
 use rig_lancedb::{LanceDbVectorIndex, SearchParams};
+use rig_reqwest::prelude::*;
 
 #[path = "./fixtures/lib.rs"]
 mod fixture;
@@ -83,9 +84,9 @@ async fn main() -> Result<(), anyhow::Error> {
 
     let query = "My boss says I zindle too much, what does that mean?";
 
-    let response = agent.prompt(query).await?;
+    let response = agent.prompt(query).await?.output;
 
-    println!("Response: {}", response);
+    println!("Response: {response}");
 
     Ok(())
 }

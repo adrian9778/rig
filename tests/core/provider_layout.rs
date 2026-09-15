@@ -12,7 +12,7 @@ fn provider_dirs() -> Vec<PathBuf> {
     let tests_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/providers");
     let mut dirs = fs::read_dir(tests_dir)
         .expect("tests directory should exist")
-        .filter_map(|entry| entry.ok())
+        .filter_map(std::result::Result::ok)
         .map(|entry| entry.path())
         .filter(|path| path.is_dir())
         .filter(|path| {
@@ -36,7 +36,7 @@ fn provider_local_tests_do_not_use_legacy_prefixes() {
 
         for entry in fs::read_dir(&dir)
             .expect("provider directory should be readable")
-            .filter_map(|entry| entry.ok())
+            .filter_map(std::result::Result::ok)
         {
             let path = entry.path();
             if path.extension().and_then(|ext| ext.to_str()) != Some("rs") {
@@ -53,13 +53,11 @@ fn provider_local_tests_do_not_use_legacy_prefixes() {
 
             assert!(
                 !stem.starts_with(&format!("{provider}_")),
-                "provider-local test file {:?} still uses a provider prefix",
-                path
+                "provider-local test file {path:?} still uses a provider prefix"
             );
             assert!(
                 !stem.starts_with("agent_with_"),
-                "provider-local test file {:?} still uses an agent_with_* name",
-                path
+                "provider-local test file {path:?} still uses an agent_with_* name"
             );
         }
     }
@@ -147,7 +145,7 @@ const PROVIDER_WIRES: &[(&str, WireCoverage)] = &[
     ("groq", Exempt(OPENAI_CHAT_GATEWAY)),
     ("huggingface", Exempt(OPENAI_CHAT_GATEWAY)),
     ("hyperbolic", Exempt(OPENAI_CHAT_GATEWAY)),
-    ("llamafile", Exempt(OPENAI_CHAT_GATEWAY)),
+    ("llamacpp", Exempt(OPENAI_CHAT_GATEWAY)),
     ("minimax", Exempt(OPENAI_CHAT_GATEWAY)),
     ("mira", Exempt(OPENAI_CHAT_GATEWAY)),
     ("mistral", Exempt(OPENAI_CHAT_GATEWAY)),
@@ -175,6 +173,33 @@ const PROVIDER_WIRES: &[(&str, WireCoverage)] = &[
         Exempt("embeddings-only provider — no completion model, so no streaming wire"),
     ),
     // --- workspace packages -------------------------------------------------
+    // The bundled transport crates: neither owns a wire. The OpenAI Responses
+    // websocket suite rig-tungstenite hosts is the out-of-binary
+    // `openai_responses_websocket` family in streaming_conformance_registry.rs;
+    // the wire itself belongs to the `openai` provider above, where the session
+    // lives.
+    // MCP tool support (rmcp SDK): a tool-source crate, not a provider; no
+    // wire family. Its in-process rmcp suites run in `cargo test -p rig-rmcp`.
+    (
+        "rig-rmcp",
+        Exempt(
+            "MCP tool adapter crate (rmcp client handler, McpTool); no provider wire of its own",
+        ),
+    ),
+    (
+        "rig-tungstenite",
+        Exempt(
+            "websocket backend crate (tungstenite WebSocketClientExt impl, default-backend \
+             traits); the protocol it carries is the `openai` provider's own \
+             `openai_responses_websocket` wire, whose end-to-end suite this crate hosts",
+        ),
+    ),
+    (
+        "rig-reqwest",
+        Exempt(
+            "transport crate (reqwest HttpClientExt impl, default-transport traits); no provider wire of its own",
+        ),
+    ),
     ("rig-bedrock", Families(&["bedrock"])),
     ("rig-candle", Families(&["candle"])),
     ("rig-gemini-grpc", Families(&["gemini_grpc"])),
@@ -194,6 +219,28 @@ const PROVIDER_WIRES: &[(&str, WireCoverage)] = &[
         Exempt("consumer-side agent runtime — reads the canonical grammar, never decodes a wire"),
     ),
     ("rig-derive", Exempt("proc-macro crate — no runtime wire")),
+    (
+        "rig-cassette",
+        Exempt("test transport recording, replay and scrubbing — no completion model provider"),
+    ),
+    (
+        "rig-effect-log",
+        Exempt(
+            "record and replay over the bus — the effect log, recorder, replayer; no provider, no wire",
+        ),
+    ),
+    (
+        "rig-ecs",
+        Exempt(
+            "the bus in a Bevy World — effects, handlers and the driver as entities and systems; no provider, no wire",
+        ),
+    ),
+    (
+        "rig-verify",
+        Exempt(
+            "the bus's behavioural verification suite — tests over rig-core and rig-agent's public API, no provider, no wire",
+        ),
+    ),
     (
         "rig-fastembed",
         Exempt("local embedding models only — no completion model, no streaming wire"),

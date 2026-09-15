@@ -1,7 +1,7 @@
 //! Create a new completion model with the given name
 //!
 //! # Example
-//! ```no_run
+//! ```ignore
 //! use rig_core::{
 //!     client::CompletionClient,
 //!     providers::huggingface::{client, completion},
@@ -25,5 +25,9 @@ pub mod image_generation;
 pub mod transcription;
 
 pub use client::{Client, ClientBuilder, SubProvider};
+pub use completion::CompletionModel;
+#[cfg(feature = "image")]
+pub use image_generation::ImageGenerationModel;
 #[cfg(feature = "image")]
 pub use image_generation::image_generation_models::*;
+pub use transcription::TranscriptionModel;

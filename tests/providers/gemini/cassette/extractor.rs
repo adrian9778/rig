@@ -12,10 +12,10 @@ use serde::{Deserialize, Serialize};
 use crate::support::{EXTRACTOR_TEXT, SmokePerson, assert_nonempty_response};
 
 #[derive(Debug, Deserialize, JsonSchema, Serialize)]
-struct Person {
-    first_name: Option<String>,
-    last_name: Option<String>,
-    job: Option<String>,
+pub(super) struct Person {
+    pub(super) first_name: Option<String>,
+    pub(super) last_name: Option<String>,
+    pub(super) job: Option<String>,
 }
 
 #[tokio::test]
@@ -33,30 +33,34 @@ async fn extractor_smoke() {
             .build();
 
         let response = extractor
-            .extract_with_usage(EXTRACTOR_TEXT)
+            .extract(EXTRACTOR_TEXT)
             .await
             .expect("extractor request should succeed");
 
         validate_extraction_fields(
             "gemini_extractor_smoke",
-            response.data.first_name.as_deref(),
-            response.data.last_name.as_deref(),
-            response.data.job.as_deref(),
+            response.output.first_name.as_deref(),
+            response.output.last_name.as_deref(),
+            response.output.job.as_deref(),
             response.usage,
         )
         .expect("portable extraction contract should hold");
 
         let first_name = response
-            .data
+            .output
             .first_name
             .as_deref()
             .expect("first_name should be present");
         let last_name = response
-            .data
+            .output
             .last_name
             .as_deref()
             .expect("last_name should be present");
-        let job = response.data.job.as_deref().expect("job should be present");
+        let job = response
+            .output
+            .job
+            .as_deref()
+            .expect("job should be present");
 
         assert_nonempty_response(first_name);
         assert_nonempty_response(last_name);
@@ -79,7 +83,8 @@ async fn extractor_with_additional_params() {
             let person = extractor
                 .extract("Hello my name is John Doe! I am a software engineer.")
                 .await
-                .expect("extract should succeed");
+                .expect("extract should succeed")
+                .output;
 
             assert_eq!(person.first_name.as_deref(), Some("John"));
             assert_eq!(person.last_name.as_deref(), Some("Doe"));

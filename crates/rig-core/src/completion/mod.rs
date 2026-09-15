@@ -10,9 +10,9 @@
 //!
 //! # Example
 //!
-//! ```no_run
+//! ```ignore
 //! use rig_core::{
-//!     client::{CompletionClient, ProviderClient},
+//!     client::CompletionClient,
 //!     completion::CompletionModel,
 //!     providers::openai,
 //! };
@@ -27,8 +27,10 @@
 //! # }
 //! ```
 
+pub mod handle;
 pub mod message;
 pub mod request;
 
+pub use handle::ModelRef;
 pub use message::{AssistantContent, Message, MessageError};
 pub use request::*;

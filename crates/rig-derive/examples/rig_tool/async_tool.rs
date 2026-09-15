@@ -1,9 +1,8 @@
-use rig_agent::completion::Prompt;
 use rig_agent::prelude::*;
-use rig_core::client::ProviderClient;
 use rig_core::providers;
 use rig_core::tool::ToolExecutionError;
 use rig_derive::rig_tool;
+use rig_reqwest::prelude::*;
 use std::time::Duration;
 
 /// A tool that simulates an async operation
@@ -48,7 +47,7 @@ async fn main() -> Result<(), anyhow::Error> {
         "Process the text 'error handling' with a delay of 'not a number'",
     ] {
         println!("User: {prompt}");
-        println!("Agent: {}", async_agent.prompt(prompt).await?);
+        println!("Agent: {}", async_agent.prompt(prompt).await?.output);
     }
 
     Ok(())

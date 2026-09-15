@@ -9,11 +9,10 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
 use rig::completion::NormalizeCompletionResponse;
-use rig::completion::{Chat, CompletionModel, Message};
+use rig::completion::{CompletionModel, Message};
 use rig::message::{AssistantContent, ToolChoice, UserContent};
 use rig::prelude::*;
 use rig::providers::deepseek;
-use rig::streaming::{StreamingChat, StreamingPrompt};
 use rig::tool::Tool;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -27,11 +26,11 @@ use crate::support::{
 
 use super::support::with_deepseek_cassette_result;
 
-const SESSION_MODEL: &str = deepseek::DEEPSEEK_V4_FLASH;
+pub(super) const SESSION_MODEL: &str = deepseek::DEEPSEEK_V4_FLASH;
 const CHAT_ALIAS_MODEL: &str = "deepseek-chat";
 const REASONER_ALIAS_MODEL: &str = "deepseek-reasoner";
 
-fn non_thinking_params() -> serde_json::Value {
+pub(super) fn non_thinking_params() -> serde_json::Value {
     json!({
         "thinking": { "type": "disabled" }
     })
@@ -43,7 +42,7 @@ fn thinking_params() -> serde_json::Value {
     })
 }
 
-const COMPLEX_SESSION_PREAMBLE: &str = "\
+pub(super) const COMPLEX_SESSION_PREAMBLE: &str = "\
 You are a deterministic DeepSeek tool orchestration test harness. Use the tools instead of inventing values. \
 For the production-readiness scenario, call exactly one tool at a time in this order: \
 1. ping_empty with an empty JSON object. \
@@ -52,12 +51,12 @@ For the production-readiness scenario, call exactly one tool at a time in this o
 4. escape_echo with the exact escaped text from the user. \
 After all tool results are available, answer in one short sentence that includes EMPTY-OK, MANIFEST-OK, LABELS-OK, and ESCAPE-OK.";
 
-const COMPLEX_SESSION_PROMPT: &str = "\
+pub(super) const COMPLEX_SESSION_PROMPT: &str = "\
 Run the production-readiness scenario. The manifest note is `line one; line two says \"hello\" and path C:\\rig\\deepseek`. \
 The escaped text is `Line 1\nLine \"2\" with backslash \\ and unicode snowman ☃`.";
 
 #[derive(Clone, Debug, PartialEq)]
-struct ToolInvocation {
+pub(super) struct ToolInvocation {
     name: &'static str,
     args: serde_json::Value,
 }
@@ -74,30 +73,30 @@ fn push_invocation<T: Serialize>(log: &InvocationLog, name: &'static str, args: 
 }
 
 #[derive(Clone)]
-struct PingEmpty {
+pub(super) struct PingEmpty {
     log: InvocationLog,
 }
 
 #[derive(Clone)]
-struct InspectManifest {
+pub(super) struct InspectManifest {
     log: InvocationLog,
 }
 
 #[derive(Clone)]
-struct JoinLabels {
+pub(super) struct JoinLabels {
     log: InvocationLog,
 }
 
 #[derive(Clone)]
-struct EscapeEcho {
+pub(super) struct EscapeEcho {
     log: InvocationLog,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
-struct EmptyArgs {}
+pub(super) struct EmptyArgs {}
 
 #[derive(Debug, Deserialize, Serialize)]
-struct ManifestArgs {
+pub(super) struct ManifestArgs {
     project: String,
     flags: ManifestFlags,
     steps: Vec<ManifestStep>,
@@ -105,31 +104,31 @@ struct ManifestArgs {
 }
 
 #[derive(Debug, Deserialize, Serialize)]
-struct ManifestFlags {
+pub(super) struct ManifestFlags {
     critical: bool,
     retries: u8,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
-struct ManifestStep {
-    name: String,
+pub(super) struct ManifestStep {
+    pub(super) name: String,
     weight: i32,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
-struct JoinArgs {
+pub(super) struct JoinArgs {
     labels: Vec<String>,
     separator: String,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
-struct EchoArgs {
+pub(super) struct EchoArgs {
     text: String,
 }
 
 #[derive(Debug, thiserror::Error)]
 #[error("session tool error")]
-struct SessionToolError;
+pub(super) struct SessionToolError;
 
 impl Tool for PingEmpty {
     const NAME: &'static str = "ping_empty";
@@ -278,7 +277,9 @@ impl Tool for EscapeEcho {
     }
 }
 
-fn complex_tools(log: &InvocationLog) -> (PingEmpty, InspectManifest, JoinLabels, EscapeEcho) {
+pub(super) fn complex_tools(
+    log: &InvocationLog,
+) -> (PingEmpty, InspectManifest, JoinLabels, EscapeEcho) {
     (
         PingEmpty { log: log.clone() },
         InspectManifest { log: log.clone() },
@@ -287,7 +288,7 @@ fn complex_tools(log: &InvocationLog) -> (PingEmpty, InspectManifest, JoinLabels
     )
 }
 
-fn assert_complex_invocations(log: &InvocationLog) {
+pub(super) fn assert_complex_invocations(log: &InvocationLog) {
     let invocations = log
         .lock()
         .expect("tool invocation log lock should not be poisoned")
@@ -331,12 +332,12 @@ fn assert_complex_invocations(log: &InvocationLog) {
     );
 }
 
-struct ToolEvent {
-    message_index: usize,
-    name: String,
+pub(super) struct ToolEvent {
+    pub(super) message_index: usize,
+    pub(super) name: String,
 }
 
-fn history_tool_calls(history: &[Message]) -> Vec<ToolEvent> {
+pub(super) fn history_tool_calls(history: &[Message]) -> Vec<ToolEvent> {
     let mut calls = Vec::new();
     for (message_index, message) in history.iter().enumerate() {
         if let Message::Assistant { content, .. } = message {
@@ -353,7 +354,7 @@ fn history_tool_calls(history: &[Message]) -> Vec<ToolEvent> {
     calls
 }
 
-fn history_tool_results(history: &[Message]) -> Vec<ToolEvent> {
+pub(super) fn history_tool_results(history: &[Message]) -> Vec<ToolEvent> {
     let mut results = Vec::new();
     for (message_index, message) in history.iter().enumerate() {
         if let Message::User { content } = message {
@@ -370,7 +371,10 @@ fn history_tool_results(history: &[Message]) -> Vec<ToolEvent> {
     results
 }
 
-fn assert_history_records_sequential_tool_roundtrips(history: &[Message], expected_tools: &[&str]) {
+pub(super) fn assert_history_records_sequential_tool_roundtrips(
+    history: &[Message],
+    expected_tools: &[&str],
+) {
     let calls = history_tool_calls(history);
     let results = history_tool_results(history);
 
@@ -474,7 +478,7 @@ async fn sequential_complex_tool_calls_nonstreaming() -> Result<()> {
             let response = agent.chat(COMPLEX_SESSION_PROMPT, &mut history).await?;
 
             assert_contains_all_case_insensitive(
-                &response,
+                &response.output,
                 &["EMPTY-OK", "MANIFEST-OK", "LABELS-OK", "ESCAPE-OK"],
             );
             assert_complex_invocations(&log);
@@ -515,9 +519,10 @@ async fn sequential_complex_tool_calls_streaming() -> Result<()> {
                 .build();
 
             let mut stream = agent
-                .stream_chat(COMPLEX_SESSION_PROMPT, Vec::<Message>::new())
+                .prompt(COMPLEX_SESSION_PROMPT)
+                .history(Vec::<Message>::new())
                 .max_turns(10)
-                .await;
+                .stream();
             let observation = collect_stream_observation(&mut stream).await;
 
             anyhow::ensure!(
@@ -578,7 +583,7 @@ async fn parallel_tool_calls_single_turn_nonstreaming() -> Result<()> {
             let response = agent.chat(TWO_TOOL_STREAM_PROMPT, &mut history).await?;
 
             assert_contains_all_case_insensitive(
-                &response,
+                &response.output,
                 &[ALPHA_SIGNAL_OUTPUT, BETA_SIGNAL_OUTPUT],
             );
             let calls = history_tool_calls(&history);
@@ -590,8 +595,7 @@ async fn parallel_tool_calls_single_turn_nonstreaming() -> Result<()> {
                 calls.len() == 2
                     && call_names.contains(&AlphaSignal::NAME)
                     && call_names.contains(&BetaSignal::NAME),
-                "expected both zero-argument tools, saw {:?}",
-                call_names
+                "expected both zero-argument tools, saw {call_names:?}"
             );
             anyhow::ensure!(
                 calls[0].message_index == calls[1].message_index,
@@ -624,10 +628,7 @@ async fn parallel_tool_calls_single_turn_streaming() -> Result<()> {
                 ))
                 .build();
 
-            let mut stream = agent
-                .stream_prompt(TWO_TOOL_STREAM_PROMPT)
-                .max_turns(5)
-                .await;
+            let mut stream = agent.prompt(TWO_TOOL_STREAM_PROMPT).max_turns(5).stream();
             let observation = collect_stream_observation(&mut stream).await;
 
             assert_two_tool_roundtrip_contract(
@@ -788,8 +789,7 @@ async fn tool_choice_required_specific_and_none() -> Result<()> {
                 .collect::<Vec<_>>();
             anyhow::ensure!(
                 specific_calls == vec![BetaSignal::NAME],
-                "specific tool choice should force only lookup_orchard_label, saw {:?}",
-                specific_calls
+                "specific tool choice should force only lookup_orchard_label, saw {specific_calls:?}"
             );
 
             let none = model
@@ -975,7 +975,10 @@ async fn json_object_response_format_roundtrip() -> Result<()> {
     .await
 }
 
-fn json_utils_merge(left: serde_json::Value, right: serde_json::Value) -> serde_json::Value {
+pub(super) fn json_utils_merge(
+    left: serde_json::Value,
+    right: serde_json::Value,
+) -> serde_json::Value {
     let mut left = left;
     let Some(left_obj) = left.as_object_mut() else {
         return right;

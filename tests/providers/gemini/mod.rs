@@ -10,9 +10,52 @@ mod cassette {
     mod agent_run_stepping;
     mod agent_run_streamed;
     mod agent_tools_e2e;
+    mod cached_content_matrix;
     mod chat_history;
+    mod code_execution_matrix;
+    mod corpus_breadth;
+    mod corpus_delta;
+    mod corpus_faults;
+    mod corpus_matrix;
+    mod corpus_matrix_checkpoint;
+    mod corpus_matrix_image;
+    mod corpus_matrix_long_loop;
+    mod corpus_retrieval;
+    mod corpus_serving;
     mod document_ordering;
     mod dynamic_tools;
+    mod ecs_agent_run_streamed;
+    mod ecs_code_execution;
+    mod ecs_extractor;
+    mod ecs_faults;
+    mod ecs_lifecycle;
+    mod ecs_matrix;
+    mod ecs_matrix_checkpoint;
+    mod ecs_matrix_extra;
+    mod ecs_matrix_image;
+    mod ecs_matrix_long_loop;
+    mod ecs_ordering;
+    mod ecs_parity;
+    mod ecs_prompt_caching;
+    mod ecs_stream_faults;
+    mod ecs_stress_context;
+    mod ecs_stress_main;
+    #[path = "ecs_stress/main_golden.rs"]
+    mod ecs_stress_main_golden;
+    #[path = "ecs_stress/main.rs"]
+    mod ecs_stress_main_runtime;
+    mod ecs_stress_patch;
+    #[path = "ecs_stress/runtime.rs"]
+    mod ecs_stress_runtime;
+    mod ecs_stress_streaming;
+    #[path = "ecs_stress/streaming.rs"]
+    mod ecs_stress_streaming_runtime;
+    mod ecs_stress_tools;
+    #[path = "ecs_stress/tools.rs"]
+    mod ecs_stress_tools_runtime;
+    mod ecs_termination;
+    mod ecs_tools_e2e;
+    mod embedding_matrix;
     mod embeddings;
     mod error_envelope;
     mod extractor;
@@ -28,22 +71,34 @@ mod cassette {
     #[cfg(feature = "image")]
     mod image_generation;
     mod interactions_api;
+    mod interactions_raw_capture_matrix;
+    mod interactions_raw_stream_capture_matrix;
+    mod lifecycle_matrix;
     mod models;
     mod multi_turn_streaming;
+    mod prompt_caching;
+    mod raw_capture_agent_matrix;
+    mod raw_capture_matrix;
+    mod raw_completion_parity_matrix;
+    mod raw_stream_capture_matrix;
     mod reasoning_roundtrip;
     mod reasoning_tool_roundtrip;
     mod regression_suite;
     mod response_identity;
+    mod stream_faults;
+    mod stream_terminal_matrix;
     mod streaming;
     mod streaming_grammar;
     mod streaming_multimodal_tool_results;
     mod streaming_tools;
     mod structured_output;
+    mod thought_text_matrix;
     mod tool_choice;
     mod tool_definitions;
     mod tool_hooks;
     mod tool_server;
     mod transcription;
+    mod turn_termination_matrix;
 }
 
 mod live {

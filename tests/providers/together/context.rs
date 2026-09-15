@@ -1,6 +1,5 @@
 //! Together context smoke test.
 
-use rig::completion::Prompt;
 use rig::prelude::*;
 use rig::providers::together;
 
@@ -15,7 +14,7 @@ async fn context_smoke() {
         .copied()
         .fold(
             client.agent(together::MIXTRAL_8X7B_INSTRUCT_V0_1),
-            |builder, doc| builder.context(doc),
+            rig::AgentBuilder::context,
         )
         .build();
 
@@ -25,7 +24,7 @@ async fn context_smoke() {
         .expect("context prompt should succeed");
 
     assert_contains_any_case_insensitive(
-        &response,
+        &response.output,
         &[
             "ancient tool",
             "farming tool",

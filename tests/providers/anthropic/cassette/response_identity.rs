@@ -5,11 +5,11 @@
 use std::sync::{Arc, Mutex};
 
 use futures::StreamExt;
-use rig::agent::{AgentHook, HookContext, ObservationAction, StreamResponseFinish};
+use rig::agent::{AgentHook, HookContext, OutcomeAction, OutcomeEvent};
 use rig::completion::{CompletionModel, Message};
 use rig::prelude::*;
 use rig::providers::anthropic::completion::CLAUDE_SONNET_4_6;
-use rig::streaming::StreamedAssistantContent;
+use rig::streaming::StreamEvent;
 use rig::tool::Tool;
 
 use super::super::support::with_anthropic_cassette;
@@ -65,8 +65,7 @@ async fn streaming_terminal_carries_identity() {
 
             let mut terminal = None;
             while let Some(item) = stream.next().await {
-                if let StreamedAssistantContent::Final(final_record) =
-                    item.expect("stream item should succeed")
+                if let StreamEvent::Final(final_record) = item.expect("stream item should succeed")
                 {
                     terminal = Some(final_record);
                 }
@@ -94,35 +93,33 @@ async fn streaming_terminal_carries_identity() {
 
 type IdentityPair = (Option<String>, Option<String>);
 
+/// Captures `(message_id, provider_request_id)` from every
+/// `CompletionResponse` event, together with which driver fired it.
 #[derive(Clone, Default)]
 struct IdentityCapture {
-    blocking: Arc<Mutex<Vec<IdentityPair>>>,
-    streaming: Arc<Mutex<Vec<IdentityPair>>>,
+    seen: Arc<Mutex<Vec<(bool, IdentityPair)>>>,
+}
+
+impl IdentityCapture {
+    /// Every observation, in fire order, with the driver that made it.
+    fn seen(&self) -> Vec<(bool, IdentityPair)> {
+        self.seen.lock().expect("snapshots").clone()
+    }
 }
 
 impl AgentHook for IdentityCapture {
-    async fn on_completion_response(
-        &self,
-        _ctx: &HookContext,
-        event: rig::agent::CompletionResponseEvent<'_>,
-    ) -> ObservationAction {
-        self.blocking.lock().expect("snapshots").push((
-            event.message_id.map(str::to_owned),
-            event.identity.provider_request_id.clone(),
+    async fn on_outcome(&self, ctx: &HookContext, event: OutcomeEvent<'_>) -> OutcomeAction {
+        let Some(response) = event.completion() else {
+            return OutcomeAction::proceed();
+        };
+        self.seen.lock().expect("snapshots").push((
+            ctx.is_streaming(),
+            (
+                response.message_id.clone(),
+                response.provider_request_id.clone(),
+            ),
         ));
-        ObservationAction::continue_run()
-    }
-
-    async fn on_stream_response_finish(
-        &self,
-        _ctx: &HookContext,
-        event: StreamResponseFinish<'_>,
-    ) -> ObservationAction {
-        self.streaming.lock().expect("snapshots").push((
-            event.message_id.map(str::to_owned),
-            event.identity.provider_request_id.clone(),
-        ));
-        ObservationAction::continue_run()
+        OutcomeAction::proceed()
     }
 }
 
@@ -146,7 +143,6 @@ async fn agent_run_records_per_attempt_identity() {
             let response = agent
                 .prompt("What is 2 + 3? Use the tool, then state the result.")
                 .max_turns(3)
-                .extended_details()
                 .await
                 .expect("agent run should succeed");
 
@@ -172,9 +168,13 @@ async fn agent_run_records_per_attempt_identity() {
                 "each attempt reports its own request id"
             );
 
-            let seen = hook.blocking.lock().expect("snapshots").clone();
+            let seen = hook.seen();
             assert_eq!(seen.len(), calls.len(), "one observation per model call");
-            for (index, (message_id, request_id)) in seen.iter().enumerate() {
+            for (index, (streaming, (message_id, request_id))) in seen.iter().enumerate() {
+                assert!(
+                    !streaming,
+                    "the blocking driver reports is_streaming() == false"
+                );
                 assert_eq!(
                     message_id.as_deref(),
                     calls[index].message_id.as_deref(),
@@ -191,8 +191,9 @@ async fn agent_run_records_per_attempt_identity() {
     .await;
 }
 
-/// Streaming agent-run parity: the stream response-finish hook observes the
-/// same identity metadata the blocking hook does.
+/// Streaming agent-run parity: the same `CompletionResponse` hook fires on
+/// the streaming driver once the stream is assembled, and observes the same
+/// identity metadata it does on the blocking driver.
 #[tokio::test]
 async fn streamed_agent_run_hook_observes_identity() {
     with_anthropic_cassette(
@@ -206,25 +207,29 @@ async fn streamed_agent_run_hook_observes_identity() {
                 .add_hook(hook.clone())
                 .build();
 
-            let mut stream = rig::streaming::StreamingPrompt::stream_prompt(
-                &agent,
-                Message::user("Reply with exactly: streamed hook identity probe"),
-            )
-            .await;
+            let mut stream = agent
+                .prompt(Message::user(
+                    "Reply with exactly: streamed hook identity probe",
+                ))
+                .stream();
             while let Some(item) = stream.next().await {
                 item.expect("stream item should succeed");
             }
 
-            let seen = hook.streaming.lock().expect("snapshots").clone();
-            assert_eq!(seen.len(), 1, "one stream response-finish observation");
-            let (message_id, request_id) = &seen[0];
+            let seen = hook.seen();
+            assert_eq!(seen.len(), 1, "one CompletionResponse observation");
+            let (streaming, (message_id, request_id)) = &seen[0];
+            assert!(
+                streaming,
+                "the streaming driver reports is_streaming() == true"
+            );
             assert!(
                 message_id
                     .as_deref()
                     .is_some_and(|id| id.starts_with("msg")),
                 "streamed hook sees message_id, got {message_id:?}"
             );
-            assert_request_id(request_id.as_deref(), "stream response-finish hook");
+            assert_request_id(request_id.as_deref(), "streamed CompletionResponse hook");
         },
     )
     .await;
@@ -237,10 +242,10 @@ fn _tool_trait_in_scope() -> &'static str {
     Adder::NAME
 }
 
-/// Live proof of the #2313 hook-coverage fix: a *streamed* tool run's
-/// tool-only turn fires no `StreamResponseFinish`, yet its
-/// `ModelTurnFinished` carries the attempt's full identity — and each of the
-/// run's attempts reports its own request id.
+/// A *streamed* tool run: every accepted turn — the tool-only turn included
+/// — fires both `CompletionResponse` and `ModelTurnFinished`, each carrying
+/// the attempt's full identity, and each of the run's attempts reports its
+/// own request id.
 #[tokio::test]
 async fn streamed_agent_tool_run_reports_per_attempt_identity() {
     use crate::support::IdentityProbe;
@@ -258,12 +263,11 @@ async fn streamed_agent_tool_run_reports_per_attempt_identity() {
                 .build();
 
             let mut stream = agent
-                .runner(Message::user(
+                .prompt(Message::user(
                     "What is 2 + 3? Use the tool, then state the result.",
                 ))
                 .max_turns(3)
-                .stream()
-                .await;
+                .stream();
             let mut completion_calls = Vec::new();
             while let Some(item) = stream.next().await {
                 if let rig::agent::MultiTurnStreamItem::CompletionCall(call) =
@@ -290,13 +294,13 @@ async fn streamed_agent_tool_run_reports_per_attempt_identity() {
                 "each streamed attempt reports its own request id"
             );
 
-            // The tool-only turn fires no StreamResponseFinish; only the
-            // final text turn does, and it agrees with that turn's identity.
-            let finishes = probe.stream_finish_identities();
-            assert_eq!(finishes.len(), 1, "one text turn, one finish event");
+            // CompletionResponse fires once per accepted turn on the
+            // streaming driver too — the tool-only turn included — and each
+            // firing agrees with its turn's identity.
+            let responses = probe.response_identities();
             assert_eq!(
-                finishes[0].provider_request_id,
-                turns.last().expect("turns").provider_request_id
+                responses, turns,
+                "one CompletionResponse per accepted turn, tool-only turn included"
             );
 
             // The per-call records the stream emitted agree with the hooks.

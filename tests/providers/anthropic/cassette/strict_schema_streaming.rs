@@ -33,7 +33,7 @@ async fn assert_streaming_strict_tool_call(
 }
 
 async fn assert_model_streaming_tool_call(
-    model: anthropic::completion::CompletionModel,
+    model: anthropic::CompletionModel,
     tool_name: &str,
     prompt: &str,
     parameters: Value,
@@ -51,7 +51,7 @@ async fn assert_model_streaming_tool_call(
             description: "Record the requested values in a streaming strict tool call.".to_string(),
             parameters,
         })
-        .output_schema_opt(output_schema)
+        .output_schema(output_schema)
         .build();
 
     let observation = collect_raw_stream_observation(

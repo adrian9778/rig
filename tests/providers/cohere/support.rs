@@ -1,4 +1,5 @@
 use futures::FutureExt;
+use rig::client::DefaultTransportBuilder as _;
 use rig::providers::cohere;
 use rig::tool::Tool;
 use serde::{Deserialize, Serialize};
@@ -11,7 +12,13 @@ use crate::support::{MathError, OperationArgs};
 const COHERE_BASE_URL: &str = "https://api.cohere.ai";
 
 async fn cohere_cassette(spec: impl Into<CassetteSpec>) -> (ProviderCassette, cohere::Client) {
-    let cassette = ProviderCassette::start("cohere", spec, COHERE_BASE_URL).await;
+    let cassette = ProviderCassette::start(
+        &crate::cassettes::cassette_root(),
+        "cohere",
+        spec,
+        COHERE_BASE_URL,
+    )
+    .await;
     let client = cohere::Client::builder()
         .api_key(cassette.api_key("COHERE_API_KEY"))
         .base_url(cassette.base_url())
@@ -100,4 +107,21 @@ impl Tool for IntegerSubtract {
     ) -> Result<Self::Output, Self::Error> {
         Ok(args.x - args.y)
     }
+}
+
+/// Cassette wrapper for the cohere prompt-caching matrix
+/// (`tests/cassettes/cohere/prompt_caching/`).
+///
+/// Delegates to [`with_cohere_cassette`] — the behavior is identical, and deliberately shared
+/// so the two cannot drift apart when the base wrapper gains policy. What the
+/// separate name buys is a per-suite entry in the cassette-safety registry, so
+/// the cache fixtures are auditable as one concern's evidence.
+pub(super) async fn with_cohere_prompt_caching_cassette<F, Fut>(
+    spec: impl Into<CassetteSpec>,
+    test_body: F,
+) where
+    F: FnOnce(cohere::Client) -> Fut,
+    Fut: Future<Output = ()>,
+{
+    with_cohere_cassette(spec, test_body).await;
 }

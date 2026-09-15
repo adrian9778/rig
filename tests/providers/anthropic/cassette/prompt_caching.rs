@@ -9,7 +9,7 @@ use rig::message::ToolChoice;
 use rig::prelude::*;
 use rig::providers::anthropic;
 use rig::providers::anthropic::completion::CacheTtl;
-use rig::streaming::StreamedAssistantContent;
+use rig::streaming::{Delta, StreamEvent};
 use rig::telemetry::ProviderResponseExt;
 use serde_json::json;
 
@@ -170,7 +170,7 @@ fn matrix_model(
     client: &anthropic::Client,
     mode: CachingMode,
     prefix_ttl: Option<CacheTtl>,
-) -> anthropic::completion::CompletionModel {
+) -> anthropic::CompletionModel {
     let mut model = client.completion_model(anthropic::completion::CLAUDE_SONNET_4_6);
     if mode.manual() {
         model = model.with_prompt_caching();
@@ -289,7 +289,7 @@ fn unreachable_anthropic_client() -> anthropic::Client {
 }
 
 async fn send_matrix_raw_probe(
-    model: &anthropic::completion::CompletionModel,
+    model: &anthropic::CompletionModel,
     preamble: String,
     tools: Option<Vec<ToolDefinition>>,
 ) -> anthropic::completion::CompletionResponse {
@@ -313,13 +313,13 @@ fn assert_matrix_raw_response(
     prefix_ttl: Option<&CacheTtl>,
     context: &str,
 ) {
-    let text = response.get_text_response().unwrap_or_default();
+    let text = response.text_response().unwrap_or_default();
     assert_text_contains_cache_probe(&text, CACHE_PROBE_RESPONSE);
     assert_cache_creation_split(&response.usage, mode, prefix_ttl, context);
 }
 
 async fn send_matrix_streaming_probe(
-    model: &anthropic::completion::CompletionModel,
+    model: &anthropic::CompletionModel,
     preamble: String,
     tools: Option<Vec<ToolDefinition>>,
 ) -> StreamingCacheProbeResponse {
@@ -342,8 +342,11 @@ async fn send_matrix_streaming_probe(
 
     while let Some(item) = stream.next().await {
         match item.expect("streaming matrix Anthropic item should succeed") {
-            StreamedAssistantContent::Text(delta) => text.push_str(&delta.text),
-            StreamedAssistantContent::Final(response) => {
+            StreamEvent::BlockDelta {
+                delta: Delta::Text { text: delta },
+                ..
+            } => text.push_str(&delta),
+            StreamEvent::Final(response) => {
                 usage = Some(response.usage);
             }
             _ => {}
@@ -385,7 +388,7 @@ async fn manual_prefix_unset_no_tools_nonstreaming() {
                 false,
                 false,
             )
-            .await
+            .await;
         },
     )
     .await;
@@ -404,7 +407,7 @@ async fn manual_prefix_unset_no_tools_streaming() {
                 false,
                 true,
             )
-            .await
+            .await;
         },
     )
     .await;
@@ -423,7 +426,7 @@ async fn manual_prefix_5m_tools_nonstreaming() {
                 true,
                 false,
             )
-            .await
+            .await;
         },
     )
     .await;
@@ -442,7 +445,7 @@ async fn manual_prefix_5m_tools_streaming() {
                 true,
                 true,
             )
-            .await
+            .await;
         },
     )
     .await;
@@ -461,7 +464,7 @@ async fn manual_prefix_5m_no_tools_nonstreaming() {
                 false,
                 false,
             )
-            .await
+            .await;
         },
     )
     .await;
@@ -480,7 +483,7 @@ async fn manual_prefix_5m_no_tools_streaming() {
                 false,
                 true,
             )
-            .await
+            .await;
         },
     )
     .await;
@@ -499,7 +502,7 @@ async fn manual_prefix_1h_tools_nonstreaming() {
                 true,
                 false,
             )
-            .await
+            .await;
         },
     )
     .await;
@@ -518,7 +521,7 @@ async fn manual_prefix_1h_tools_streaming() {
                 true,
                 true,
             )
-            .await
+            .await;
         },
     )
     .await;
@@ -537,7 +540,7 @@ async fn manual_prefix_1h_no_tools_nonstreaming() {
                 false,
                 false,
             )
-            .await
+            .await;
         },
     )
     .await;
@@ -556,7 +559,7 @@ async fn manual_prefix_1h_no_tools_streaming() {
                 false,
                 true,
             )
-            .await
+            .await;
         },
     )
     .await;
@@ -575,7 +578,7 @@ async fn automatic_prefix_unset_tools_nonstreaming() {
                 true,
                 false,
             )
-            .await
+            .await;
         },
     )
     .await;
@@ -594,7 +597,7 @@ async fn automatic_prefix_unset_tools_streaming() {
                 true,
                 true,
             )
-            .await
+            .await;
         },
     )
     .await;
@@ -613,7 +616,7 @@ async fn automatic_prefix_unset_no_tools_nonstreaming() {
                 false,
                 false,
             )
-            .await
+            .await;
         },
     )
     .await;
@@ -632,7 +635,7 @@ async fn automatic_prefix_unset_no_tools_streaming() {
                 false,
                 true,
             )
-            .await
+            .await;
         },
     )
     .await;
@@ -651,7 +654,7 @@ async fn automatic_prefix_5m_tools_nonstreaming() {
                 true,
                 false,
             )
-            .await
+            .await;
         },
     )
     .await;
@@ -670,7 +673,7 @@ async fn automatic_prefix_5m_tools_streaming() {
                 true,
                 true,
             )
-            .await
+            .await;
         },
     )
     .await;
@@ -689,7 +692,7 @@ async fn automatic_prefix_5m_no_tools_nonstreaming() {
                 false,
                 false,
             )
-            .await
+            .await;
         },
     )
     .await;
@@ -708,7 +711,7 @@ async fn automatic_prefix_5m_no_tools_streaming() {
                 false,
                 true,
             )
-            .await
+            .await;
         },
     )
     .await;
@@ -727,7 +730,7 @@ async fn automatic_prefix_1h_tools_nonstreaming() {
                 true,
                 false,
             )
-            .await
+            .await;
         },
     )
     .await;
@@ -746,7 +749,7 @@ async fn automatic_prefix_1h_tools_streaming() {
                 true,
                 true,
             )
-            .await
+            .await;
         },
     )
     .await;
@@ -765,7 +768,7 @@ async fn automatic_prefix_1h_no_tools_nonstreaming() {
                 false,
                 false,
             )
-            .await
+            .await;
         },
     )
     .await;
@@ -784,7 +787,7 @@ async fn automatic_prefix_1h_no_tools_streaming() {
                 false,
                 true,
             )
-            .await
+            .await;
         },
     )
     .await;
@@ -803,7 +806,7 @@ async fn automatic_1h_prefix_unset_tools_nonstreaming() {
                 true,
                 false,
             )
-            .await
+            .await;
         },
     )
     .await;
@@ -822,7 +825,7 @@ async fn automatic_1h_prefix_unset_tools_streaming() {
                 true,
                 true,
             )
-            .await
+            .await;
         },
     )
     .await;
@@ -841,7 +844,7 @@ async fn automatic_1h_prefix_unset_no_tools_nonstreaming() {
                 false,
                 false,
             )
-            .await
+            .await;
         },
     )
     .await;
@@ -860,7 +863,7 @@ async fn automatic_1h_prefix_unset_no_tools_streaming() {
                 false,
                 true,
             )
-            .await
+            .await;
         },
     )
     .await;
@@ -879,7 +882,7 @@ async fn automatic_1h_prefix_1h_tools_nonstreaming() {
                 true,
                 false,
             )
-            .await
+            .await;
         },
     )
     .await;
@@ -898,7 +901,7 @@ async fn automatic_1h_prefix_1h_tools_streaming() {
                 true,
                 true,
             )
-            .await
+            .await;
         },
     )
     .await;
@@ -917,7 +920,7 @@ async fn automatic_1h_prefix_1h_no_tools_nonstreaming() {
                 false,
                 false,
             )
-            .await
+            .await;
         },
     )
     .await;
@@ -936,7 +939,7 @@ async fn automatic_1h_prefix_1h_no_tools_streaming() {
                 false,
                 true,
             )
-            .await
+            .await;
         },
     )
     .await;
@@ -955,7 +958,7 @@ async fn manual_automatic_prefix_unset_tools_streaming() {
                 true,
                 true,
             )
-            .await
+            .await;
         },
     )
     .await;
@@ -974,7 +977,7 @@ async fn manual_automatic_prefix_unset_no_tools_nonstreaming() {
                 false,
                 false,
             )
-            .await
+            .await;
         },
     )
     .await;
@@ -993,7 +996,7 @@ async fn manual_automatic_prefix_unset_no_tools_streaming() {
                 false,
                 true,
             )
-            .await
+            .await;
         },
     )
     .await;
@@ -1012,7 +1015,7 @@ async fn manual_automatic_prefix_5m_tools_nonstreaming() {
                 true,
                 false,
             )
-            .await
+            .await;
         },
     )
     .await;
@@ -1031,7 +1034,7 @@ async fn manual_automatic_prefix_5m_tools_streaming() {
                 true,
                 true,
             )
-            .await
+            .await;
         },
     )
     .await;
@@ -1050,7 +1053,7 @@ async fn manual_automatic_prefix_5m_no_tools_nonstreaming() {
                 false,
                 false,
             )
-            .await
+            .await;
         },
     )
     .await;
@@ -1069,7 +1072,7 @@ async fn manual_automatic_prefix_5m_no_tools_streaming() {
                 false,
                 true,
             )
-            .await
+            .await;
         },
     )
     .await;
@@ -1088,7 +1091,7 @@ async fn manual_automatic_prefix_1h_tools_nonstreaming() {
                 true,
                 false,
             )
-            .await
+            .await;
         },
     )
     .await;
@@ -1107,7 +1110,7 @@ async fn manual_automatic_prefix_1h_tools_streaming() {
                 true,
                 true,
             )
-            .await
+            .await;
         },
     )
     .await;
@@ -1126,7 +1129,7 @@ async fn manual_automatic_prefix_1h_no_tools_nonstreaming() {
                 false,
                 false,
             )
-            .await
+            .await;
         },
     )
     .await;
@@ -1145,7 +1148,7 @@ async fn manual_automatic_prefix_1h_no_tools_streaming() {
                 false,
                 true,
             )
-            .await
+            .await;
         },
     )
     .await;
@@ -1164,7 +1167,7 @@ async fn manual_automatic_1h_prefix_unset_tools_nonstreaming() {
                 true,
                 false,
             )
-            .await
+            .await;
         },
     )
     .await;
@@ -1183,7 +1186,7 @@ async fn manual_automatic_1h_prefix_unset_tools_streaming() {
                 true,
                 true,
             )
-            .await
+            .await;
         },
     )
     .await;
@@ -1202,7 +1205,7 @@ async fn manual_automatic_1h_prefix_unset_no_tools_nonstreaming() {
                 false,
                 false,
             )
-            .await
+            .await;
         },
     )
     .await;
@@ -1221,7 +1224,7 @@ async fn manual_automatic_1h_prefix_unset_no_tools_streaming() {
                 false,
                 true,
             )
-            .await
+            .await;
         },
     )
     .await;
@@ -1343,7 +1346,7 @@ async fn static_prefix_with_excess_explicit_tool_markers_errors_client_side() {
 }
 
 async fn send_cache_probe(
-    model: anthropic::completion::CompletionModel,
+    model: anthropic::CompletionModel,
     prompt: &'static str,
     preamble: String,
     tools: Vec<ToolDefinition>,
@@ -1366,7 +1369,7 @@ struct StreamingCacheProbeResponse {
 }
 
 async fn send_streaming_cache_probe(
-    model: anthropic::completion::CompletionModel,
+    model: anthropic::CompletionModel,
     prompt: &'static str,
     preamble: String,
     tools: Vec<ToolDefinition>,
@@ -1388,8 +1391,11 @@ async fn send_streaming_cache_probe(
 
     while let Some(item) = stream.next().await {
         match item.expect("streaming prompt-cached Anthropic item should succeed") {
-            StreamedAssistantContent::Text(delta) => text.push_str(&delta.text),
-            StreamedAssistantContent::Final(response) => {
+            StreamEvent::BlockDelta {
+                delta: Delta::Text { text: delta },
+                ..
+            } => text.push_str(&delta),
+            StreamEvent::Final(response) => {
                 usage = Some(response.usage);
             }
             _ => {}
@@ -1532,4 +1538,143 @@ fn cache_padding(repetitions: usize) -> String {
     std::iter::repeat_n(CACHE_PADDING_SENTENCE, repetitions)
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+// ---------------------------------------------------------------------------
+// Cross-provider cache conformance
+// ---------------------------------------------------------------------------
+//
+// The cells above are Anthropic's own cache matrix: manual/automatic/TTL knob
+// combinations, marker budgets, per-TTL write buckets. What they do not do —
+// what nothing in the tree did before the shared harness — is ask *how much* of
+// the prefix was actually served from cache. Every one of them asserts
+// `cached_input_tokens > 0`, which passes just as happily when 200 of 40,000
+// prefix tokens are cached as when 39,800 are.
+//
+// These cells add that question, through the same provider-generic harness the
+// other eleven providers use, so Anthropic's numbers are read the same way as
+// everyone else's and the denominator is written down rather than assumed.
+//
+// Anthropic is the one provider in the matrix that reports cache tokens
+// *alongside* `input_tokens` instead of inside it, and the one that needs
+// explicit `cache_control` breakpoints — both of which the descriptor states.
+
+use crate::cache_conformance::{
+    AGENT_CACHE_PROMPT, CacheAccounting, CacheProbe, CacheProbeLookupTool, CacheSupport,
+    assert_agent_growth_still_hits, assert_breakpoints_match_support, assert_cache_conformance,
+    assert_prefix_stable, observation_from_completion_calls, run_cache_probe,
+    run_cache_probe_streaming,
+};
+
+/// See [`CacheAccounting::Alongside`]: `anthropic_usage_totals` computes
+/// `total = input + cached + cache_creation + output`, so turn 1's billed prompt
+/// is the sum of the three input counters, not `input_tokens` on its own.
+/// Dividing by `input_tokens` alone would make the ratio look enormous on a warm
+/// turn (where `input_tokens` is only the uncached tail) and the assertion
+/// vacuous.
+pub(super) const ANTHROPIC_CACHE_SUPPORT: CacheSupport = CacheSupport {
+    provider: "anthropic",
+    accounting: CacheAccounting::Alongside,
+    explicit_breakpoints: true,
+    reports_writes: true,
+    // Anthropic's documented minimum is 1,024 tokens for Sonnet- and Opus-class
+    // models (2,048 for Haiku-class). This suite runs on Sonnet.
+    min_cacheable_tokens: 1024,
+    cache_key_field: None,
+    hit_ratio_floor: 0.80,
+};
+
+pub(super) fn conformance_probe() -> CacheProbe {
+    CacheProbe::new("anthropic cache conformance")
+}
+
+#[tokio::test]
+async fn conformance_blocking_probe_serves_most_of_the_prefix_from_cache() {
+    const SCENARIO: &str = "prompt_caching/conformance_blocking_probe";
+
+    with_anthropic_cassette(
+        "prompt_caching/conformance_blocking_probe",
+        |client| async move {
+            let model = client
+                .completion_model(anthropic::completion::CLAUDE_SONNET_4_6)
+                .with_prompt_caching();
+            let observation = run_cache_probe(&model, &conformance_probe()).await;
+            assert_cache_conformance(
+                &observation,
+                &ANTHROPIC_CACHE_SUPPORT,
+                "conformance blocking probe",
+            );
+        },
+    )
+    .await;
+
+    assert_prefix_stable("anthropic", SCENARIO);
+    assert_breakpoints_match_support("anthropic", SCENARIO, &ANTHROPIC_CACHE_SUPPORT);
+}
+
+#[tokio::test]
+async fn conformance_streaming_probe_serves_most_of_the_prefix_from_cache() {
+    const SCENARIO: &str = "prompt_caching/conformance_streaming_probe";
+
+    with_anthropic_cassette(
+        "prompt_caching/conformance_streaming_probe",
+        |client| async move {
+            let model = client
+                .completion_model(anthropic::completion::CLAUDE_SONNET_4_6)
+                .with_prompt_caching();
+            let observation = run_cache_probe_streaming(&model, &conformance_probe()).await;
+            assert_cache_conformance(
+                &observation,
+                &ANTHROPIC_CACHE_SUPPORT,
+                "conformance streaming probe",
+            );
+        },
+    )
+    .await;
+
+    assert_prefix_stable("anthropic", SCENARIO);
+    assert_breakpoints_match_support("anthropic", SCENARIO, &ANTHROPIC_CACHE_SUPPORT);
+}
+
+/// A real agent loop with a tool round-trip.
+///
+/// The cell the three-turn probe cannot replace: the probe builds its own
+/// history, so it proves the *provider* caches a growing prefix, while only a
+/// real run proves rig's agent driver does not disturb that prefix between
+/// iterations — including that it keeps placing `cache_control` markers in the
+/// same place as the conversation grows.
+#[tokio::test]
+async fn conformance_agent_loop_keeps_hitting_across_tool_turns() {
+    const SCENARIO: &str = "prompt_caching/conformance_agent_loop";
+
+    with_anthropic_cassette(
+        "prompt_caching/conformance_agent_loop",
+        |client| async move {
+            // Built from a model that has prompt caching *enabled*.
+            // `client.agent(name)` constructs a default model, which places no
+            // `cache_control` markers at all — a first recording made exactly
+            // that mistake and produced a convincing-looking "the agent loop
+            // busts the cache" result (zero cached tokens on every turn) that
+            // was really just caching switched off.
+            let model = client
+                .completion_model(anthropic::completion::CLAUDE_SONNET_4_6)
+                .with_prompt_caching();
+            let response = rig::agent::AgentBuilder::new(model)
+                .preamble(&conformance_probe().preamble)
+                .tool(CacheProbeLookupTool)
+                .temperature(0.0)
+                .build()
+                .prompt(AGENT_CACHE_PROMPT)
+                .max_turns(6)
+                .await
+                .expect("anthropic agent cache probe should complete");
+
+            let observation = observation_from_completion_calls(response.completion_calls());
+            assert_agent_growth_still_hits(&observation, &ANTHROPIC_CACHE_SUPPORT, "agent loop");
+        },
+    )
+    .await;
+
+    assert_prefix_stable("anthropic", SCENARIO);
+    assert_breakpoints_match_support("anthropic", SCENARIO, &ANTHROPIC_CACHE_SUPPORT);
 }

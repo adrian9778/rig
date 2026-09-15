@@ -6,6 +6,7 @@
     clippy::unreachable
 )]
 
+use rig::client::DefaultTransportBuilder as _;
 use serde_json::json;
 
 use fixture::{Word, as_record_batch, words};
@@ -13,7 +14,6 @@ use lancedb::index::vector::IvfPqIndexBuilder;
 use rig::lancedb::{LanceDbVectorIndex, SearchParams};
 use rig::{
     client::{AgentModelExt, EmbeddingsClient},
-    completion::Prompt,
     embeddings::{EmbeddingModel, EmbeddingsBuilder},
     prelude::*,
     providers::openai,
@@ -123,7 +123,8 @@ async fn vector_search_test() {
     let model = openai_client.embedding_model(openai::TEXT_EMBEDDING_ADA_002);
 
     // Initialize LanceDB locally.
-    let db = lancedb::connect("data/lancedb-store")
+    let store = assert_fs::TempDir::new().unwrap();
+    let db = lancedb::connect(store.path().to_str().unwrap())
         .execute()
         .await
         .unwrap();
@@ -335,7 +336,8 @@ async fn agent_with_dynamic_context_test() {
     let model = openai_client.embedding_model(openai::TEXT_EMBEDDING_ADA_002);
 
     // Initialize LanceDB locally.
-    let db = lancedb::connect("data/lancedb-store")
+    let store = assert_fs::TempDir::new().unwrap();
+    let db = lancedb::connect(store.path().to_str().unwrap())
         .execute()
         .await
         .unwrap();
@@ -403,7 +405,7 @@ async fn agent_with_dynamic_context_test() {
 
     let query = "My boss says I zindle too much, what does that mean?";
 
-    let response = agent.prompt(query).await.unwrap();
+    let response = agent.prompt(query).await.unwrap().output;
 
     assert!(response.contains("zindle") || response.contains("pretend to be working"));
     assert!(response.contains("important") || response.contains("unproductive"));

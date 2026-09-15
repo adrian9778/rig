@@ -5,7 +5,11 @@ use rig_core::{
     message::{AssistantContent, Message, UserContent},
 };
 
-use super::{assistant_content::RigAssistantContent, user_content::RigUserContent};
+use super::{
+    assistant_content::RigAssistantContent,
+    converse_output::{ConversationRole, Message as ConverseMessage},
+    user_content::RigUserContent,
+};
 
 pub struct RigMessage(pub Message);
 
@@ -53,30 +57,31 @@ impl TryFrom<RigMessage> for aws_bedrock::Message {
     }
 }
 
-impl TryFrom<aws_bedrock::Message> for RigMessage {
+impl TryFrom<ConverseMessage> for RigMessage {
     type Error = CompletionError;
 
-    fn try_from(message: aws_bedrock::Message) -> Result<Self, Self::Error> {
+    fn try_from(message: ConverseMessage) -> Result<Self, Self::Error> {
         match message.role {
-            aws_bedrock::ConversationRole::Assistant => {
-                let assistant_content = message
+            ConversationRole::Assistant => {
+                let mut assistant_content = message
                     .content
                     .into_iter()
-                    .map(|c| c.try_into())
+                    .map(std::convert::TryInto::try_into)
                     .collect::<Result<Vec<RigAssistantContent>, _>>()?
                     .into_iter()
                     .map(|rig_assistant_content| rig_assistant_content.0)
                     .collect::<Vec<AssistantContent>>();
 
+                rig_core::message::normalize_missing_tool_call_ids(&mut assistant_content);
                 let content = rig_core::message::require_non_empty_response(assistant_content)?;
 
                 Ok(RigMessage(Message::Assistant { content, id: None }))
             }
-            aws_bedrock::ConversationRole::User => {
+            ConversationRole::User => {
                 let user_content = message
                     .content
                     .into_iter()
-                    .map(|c| c.try_into())
+                    .map(std::convert::TryInto::try_into)
                     .collect::<Result<Vec<RigUserContent>, _>>()?
                     .into_iter()
                     .map(|user_content| user_content.0)
@@ -96,35 +101,5 @@ impl TryFrom<aws_bedrock::Message> for RigMessage {
     }
 }
 
-impl TryFrom<super::converse_output::Message> for RigMessage {
-    type Error = CompletionError;
-
-    fn try_from(message: super::converse_output::Message) -> Result<Self, Self::Error> {
-        let message = aws_bedrock::Message::try_from(message)
-            .map_err(|x| CompletionError::ProviderError(format!("Type conversion error: {x}")))?;
-
-        Self::try_from(message)
-    }
-}
-
 #[cfg(test)]
-mod tests {
-    use crate::types::message::RigMessage;
-    use aws_sdk_bedrockruntime::types as aws_bedrock;
-    use rig_core::message::{Message, UserContent};
-
-    #[test]
-    fn message_to_aws_message() {
-        let message = Message::User {
-            content: vec![UserContent::Text("text".into())],
-        };
-        let aws_message: Result<aws_bedrock::Message, _> = RigMessage(message).try_into();
-        assert!(aws_message.is_ok());
-        let aws_message = aws_message.unwrap();
-        assert_eq!(aws_message.role, aws_bedrock::ConversationRole::User);
-        assert_eq!(
-            aws_message.content,
-            vec![aws_bedrock::ContentBlock::Text("text".into())]
-        );
-    }
-}
+mod tests;

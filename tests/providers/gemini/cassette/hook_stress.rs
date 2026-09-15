@@ -4,8 +4,8 @@
 //! drive rich multi-turn workflows and assert *structural invariants* of the
 //! merged hook system: `HookContext` identity/turn/streaming, a shared
 //! `Scratchpad` threaded across hooks and turns, `RequestPatch` context
-//! injection + `active_tools` narrowing, chained `ToolCallAction::Rewrite` -> observe ->
-//! `ToolResultAction::Rewrite` redaction, and streaming lifecycle ordering / blocking-vs-
+//! injection + `active_tools` narrowing, chained `DispatchAction::Patch` -> observe ->
+//! `OutcomeAction::Replace` redaction, and streaming lifecycle ordering / blocking-vs-
 //! streaming parity.
 //!
 //! ## On loose assertions
@@ -24,14 +24,14 @@ use std::sync::Mutex;
 
 use futures::StreamExt;
 use rig::agent::{
-    AgentHook, CompletionCallAction, CompletionCallEvent, CompletionResponseEvent, HookContext,
-    ModelTurnAction, ModelTurnFinished, MultiTurnStreamItem, ObservationAction, RequestPatch,
-    StreamingError, ToolCall as ToolCallEvent, ToolCallAction, ToolResultAction, ToolResultEvent,
+    AgentHook, CompletionCallAction, CompletionCallEvent, DispatchAction, DispatchEvent,
+    HookContext, ModelTurnAction, ModelTurnFinished, MultiTurnStreamItem, OutcomeAction,
+    OutcomeEvent, RequestPatch, StreamingError,
 };
-use rig::completion::{Document, Prompt};
+use rig::completion::Document;
 use rig::prelude::*;
 use rig::providers::gemini;
-use rig::streaming::{StreamedAssistantContent, StreamedUserContent, StreamingPrompt};
+use rig::streaming::{Delta, StreamEvent, StreamedUserContent};
 use rig::tool::Tool;
 
 use super::super::support::with_gemini_cassette;
@@ -100,7 +100,7 @@ impl LifecycleRecorder {
         self.run_ids
             .lock()
             .expect("run_ids")
-            .insert(ctx.run_id().as_str().to_string());
+            .insert(ctx.run_id().to_string());
         *self.streaming.lock().expect("streaming") = Some(ctx.is_streaming());
         *self.agent_name.lock().expect("agent_name") = ctx.agent_name().map(str::to_string);
         self.breadcrumbs
@@ -121,14 +121,6 @@ impl AgentHook for LifecycleRecorder {
         self.record(ctx, "CompletionCall");
         CompletionCallAction::continue_run()
     }
-    async fn on_completion_response(
-        &self,
-        ctx: &HookContext,
-        _event: CompletionResponseEvent<'_>,
-    ) -> ObservationAction {
-        self.record(ctx, "CompletionResponse");
-        ObservationAction::continue_run()
-    }
     async fn on_model_turn_finished(
         &self,
         ctx: &HookContext,
@@ -137,19 +129,22 @@ impl AgentHook for LifecycleRecorder {
         self.record(ctx, "ModelTurnFinished");
         ModelTurnAction::continue_run()
     }
-    async fn on_tool_call(&self, ctx: &HookContext, _event: ToolCallEvent<'_>) -> ToolCallAction {
+    async fn on_dispatch(&self, ctx: &HookContext, event: DispatchEvent<'_>) -> DispatchAction {
+        if event.tool_name().is_none() {
+            return DispatchAction::proceed();
+        }
         self.record(ctx, "ToolCall");
         ctx.scratchpad()
             .update(|tally: &mut ToolCallTally| tally.0 += 1);
-        ToolCallAction::run()
+        DispatchAction::proceed()
     }
-    async fn on_tool_result(
-        &self,
-        ctx: &HookContext,
-        _event: ToolResultEvent<'_>,
-    ) -> ToolResultAction {
-        self.record(ctx, "ToolResult");
-        ToolResultAction::keep()
+    async fn on_outcome(&self, ctx: &HookContext, event: OutcomeEvent<'_>) -> OutcomeAction {
+        if event.completion().is_some() {
+            self.record(ctx, "CompletionResponse");
+        } else if event.tool_name().is_some() {
+            self.record(ctx, "ToolResult");
+        }
+        OutcomeAction::proceed()
     }
 }
 
@@ -174,11 +169,7 @@ impl AgentHook for ScratchpadReader {
         ctx: &HookContext,
         _event: ModelTurnFinished<'_>,
     ) -> ModelTurnAction {
-        let tally = ctx
-            .scratchpad()
-            .get::<ToolCallTally>()
-            .map(|t| t.0)
-            .unwrap_or(0);
+        let tally = ctx.scratchpad().get::<ToolCallTally>().map_or(0, |t| t.0);
         self.tallies.lock().expect("tallies").push(tally);
         ModelTurnAction::continue_run()
     }
@@ -222,11 +213,11 @@ struct ForceArgs {
 }
 
 impl AgentHook for ForceArgs {
-    async fn on_tool_call(&self, _ctx: &HookContext, event: ToolCallEvent<'_>) -> ToolCallAction {
-        if event.tool_name == self.tool_name {
-            ToolCallAction::rewrite(self.args.clone())
+    async fn on_dispatch(&self, _ctx: &HookContext, event: DispatchEvent<'_>) -> DispatchAction {
+        if event.tool_name() == Some(self.tool_name) {
+            DispatchAction::rewrite_tool_args(event.kind, self.args.clone())
         } else {
-            ToolCallAction::run()
+            DispatchAction::proceed()
         }
     }
 }
@@ -239,15 +230,11 @@ struct RedactResult {
 }
 
 impl AgentHook for RedactResult {
-    async fn on_tool_result(
-        &self,
-        _ctx: &HookContext,
-        event: ToolResultEvent<'_>,
-    ) -> ToolResultAction {
-        if event.tool_name == self.tool_name {
-            ToolResultAction::rewrite(self.marker)
+    async fn on_outcome(&self, _ctx: &HookContext, event: OutcomeEvent<'_>) -> OutcomeAction {
+        if event.tool_name() == Some(self.tool_name) {
+            OutcomeAction::rewrite_tool_result(&event, self.marker)
         } else {
-            ToolResultAction::keep()
+            OutcomeAction::proceed()
         }
     }
 }
@@ -290,7 +277,7 @@ async fn lifecycle_and_scratchpad_thread_across_multi_turn_blocking() {
                 .await
                 .expect("dependent multi-turn tool run should succeed");
 
-            assert_nonempty_response(&response);
+            assert_nonempty_response(&response.output);
 
             // --- HookContext identity is stable and correct across the run ---
             assert_eq!(
@@ -421,7 +408,7 @@ async fn request_patch_injects_context_and_narrows_active_tools_blocking() {
             // extra_context injection reached the model: the answer uses the fact
             // that appears only in the injected document (no model input).
             assert!(
-                response.contains(VAULT_CODE),
+                response.output.contains(VAULT_CODE),
                 "the extra_context fact must reach the model; answer: {response:?}"
             );
             // active_tools narrowing is proven by the downstream negative: the
@@ -441,7 +428,7 @@ async fn request_patch_injects_context_and_narrows_active_tools_blocking() {
 }
 
 // ---------------------------------------------------------------------------
-// 3. Chained tool lifecycle: ToolCallAction::Rewrite -> observe -> ToolResultAction::Rewrite.
+// 3. Chained tool lifecycle: DispatchAction::Patch -> observe -> OutcomeAction::Replace.
 // ---------------------------------------------------------------------------
 
 const REDACTION_MARKER: &str = "REDACTED-SUM-ZK7";
@@ -507,11 +494,11 @@ async fn chained_arg_rewrite_then_result_redaction_blocking() {
             // Paired positive + negative: the redacted marker reached the model,
             // and the raw executed result (15) did not.
             assert!(
-                response.contains(REDACTION_MARKER),
+                response.output.contains(REDACTION_MARKER),
                 "the redaction marker must reach the model; answer: {response:?}"
             );
             assert!(
-                !response.contains("15"),
+                !response.output.contains("15"),
                 "the raw tool result must not reach the model; answer: {response:?}"
             );
         },
@@ -545,13 +532,13 @@ async fn streaming_lifecycle_ordering_and_context_streaming_flag() {
                 .build();
 
             let mut stream = agent
-                .stream_prompt(
+                .prompt(
                     "First add 20 and 5 with the add tool. Then subtract 4 from that sum with the \
                      subtract tool. Report the final number.",
                 )
                 .add_hook(recorder)
                 .max_turns(6)
-                .await;
+                .stream();
 
             // Ordered stream-item taxonomy tags, so we can assert lifecycle order.
             let mut events: Vec<&'static str> = Vec::new();
@@ -560,15 +547,21 @@ async fn streaming_lifecycle_ordering_and_context_streaming_flag() {
             while let Some(item) = stream.next().await {
                 match item {
                     Ok(MultiTurnStreamItem::StreamAssistantItem(content)) => match content {
-                        StreamedAssistantContent::Text(_) => events.push("text"),
-                        StreamedAssistantContent::ToolCall { .. } => events.push("tool_call"),
-                        StreamedAssistantContent::ToolCallDelta { .. } => {
-                            events.push("tool_call_delta")
+                        StreamEvent::BlockDelta {
+                            delta: Delta::Text { text: _ },
+                            ..
+                        } => events.push("text"),
+                        StreamEvent::BlockDelta {
+                            delta: Delta::ToolName { .. } | Delta::ToolArguments { .. },
+                            ..
+                        } => {
+                            events.push("tool_call_delta");
                         }
                         _ => {}
                     },
+                    Ok(MultiTurnStreamItem::ToolCall { .. }) => events.push("tool_call"),
                     Ok(MultiTurnStreamItem::ToolExecutionCommitted { .. }) => {
-                        events.push("tool_execution_committed")
+                        events.push("tool_execution_committed");
                     }
                     Ok(MultiTurnStreamItem::StreamUserItem(StreamedUserContent::ToolResult {
                         ..
@@ -673,7 +666,7 @@ async fn multi_tool_workflow_pairs_calls_and_results_per_turn_blocking() {
                 .await
                 .expect("independent multi-tool run should succeed");
 
-            assert_nonempty_response(&response);
+            assert_nonempty_response(&response.output);
             assert!(
                 add_calls.count() >= 1 && subtract_calls.count() >= 1,
                 "both independent tools should run"
@@ -753,7 +746,7 @@ async fn skip_in_multi_tool_workflow_leaves_tool_unexecuted_blocking() {
                 .await
                 .expect("a skipped tool must not fail the run");
 
-            assert_nonempty_response(&response);
+            assert_nonempty_response(&response.output);
             // Zero-execution invariant: the skipped tool's body never ran.
             assert_eq!(
                 subtract_calls.count(),
@@ -789,4 +782,63 @@ fn assert_hook_impls() {
         tool_name: "add",
         marker: "",
     });
+}
+
+/// Golden `gemini_tool_call_turns`: two tool turns on a wire that carries
+/// no tool-call ids. Every id in the log is minted from the block that
+/// assembled the call, so the record is the same on every run — the proof
+/// that nothing the engine mints is random.
+#[tokio::test]
+async fn tool_call_turns_effect_log_is_the_golden_fixture() {
+    let add = CountingAdd::default();
+    let subtract = CountingSubtract::default();
+    with_gemini_cassette(
+        "hook_stress/streaming_lifecycle_ordering_and_context_streaming_flag",
+        |client| async move {
+            let agent = client
+                .agent(gemini::completion::GEMINI_2_5_FLASH)
+                .name("stress-agent")
+                .preamble(CHAIN_PREAMBLE)
+                .temperature(0.0)
+                .tool(add)
+                .tool(subtract)
+                .record_effects()
+                .build();
+            let mut stream = agent
+                .prompt(
+                    "First add 20 and 5 with the add tool. Then subtract 4 from that sum with the \
+                     subtract tool. Report the final number.",
+                )
+                .max_turns(6)
+                .stream();
+            let mut saw_final = false;
+            while let Some(item) = stream.next().await {
+                if let Ok(MultiTurnStreamItem::FinalResponse(_)) = item {
+                    saw_final = true;
+                }
+            }
+            assert!(saw_final, "the stream must yield a FinalResponse");
+            let log = agent.take_effect_log().expect("recording");
+            let tool_ids: Vec<&rig::message::ToolCallId> = log
+                .records
+                .iter()
+                .filter_map(|record| match &record.outcome {
+                    Ok(rig::effect::Outcome::Completion(response)) => Some(response),
+                    _ => None,
+                })
+                .flat_map(|response| response.choice.iter())
+                .filter_map(|content| match content {
+                    rig::message::AssistantContent::ToolCall(call) => Some(&call.id),
+                    _ => None,
+                })
+                .collect();
+            assert!(!tool_ids.is_empty(), "the program calls tools");
+            assert!(
+                tool_ids.iter().all(|id| id.is_generated()),
+                "every id-less wire call is named by its block: {tool_ids:?}"
+            );
+            crate::goldens::golden_effects("gemini_tool_call_turns", &log);
+        },
+    )
+    .await;
 }

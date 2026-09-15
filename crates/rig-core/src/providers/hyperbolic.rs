@@ -1,7 +1,7 @@
 //! Hyperbolic Inference API client and Rig integration
 //!
 //! # Example
-//! ```no_run
+//! ```ignore
 //! use rig_core::{client::CompletionClient, providers::hyperbolic};
 //!
 //! # fn run() -> Result<(), Box<dyn std::error::Error>> {
@@ -13,7 +13,12 @@
 //! ```
 
 use crate::client::BearerAuth;
-use crate::client::{self, DebugExt, Provider};
+#[cfg(feature = "audio")]
+use crate::client::HasAudioGeneration;
+#[cfg(feature = "image")]
+use crate::client::HasImageGeneration;
+use crate::client::{self, HasCompletion, ModelTransport, Provider, ProviderClientResult};
+use crate::http_client::{self, HttpClientExt};
 
 // ================================================================
 // Main Hyperbolic Client
@@ -21,28 +26,75 @@ use crate::client::{self, DebugExt, Provider};
 const HYPERBOLIC_API_BASE_URL: &str = "https://api.hyperbolic.xyz";
 
 #[derive(Debug, Default, Clone, Copy)]
-pub struct HyperbolicExt;
-#[derive(Debug, Default, Clone, Copy)]
-pub struct HyperbolicBuilder;
-
+pub struct Hyperbolic;
 type HyperbolicApiKey = BearerAuth;
 
-impl Provider for HyperbolicExt {
-    type Builder = HyperbolicBuilder;
-
+impl Provider for Hyperbolic {
+    const NAME: &'static str = "hyperbolic";
+    const BASE_URL: &'static str = HYPERBOLIC_API_BASE_URL;
     const VERIFY_PATH: &'static str = "/models";
+    type ApiKey = HyperbolicApiKey;
+    type Config = ();
+    type EnvInput = HyperbolicApiKey;
+
+    fn build(_: (), _: &HyperbolicApiKey) -> http_client::Result<Self> {
+        Ok(Hyperbolic)
+    }
+
+    fn from_env<H: HttpClientExt>(http: H) -> ProviderClientResult<Client<H>> {
+        Client::from_env_api_key("HYPERBOLIC_API_KEY", None, http)
+    }
+
+    fn from_val<H: HttpClientExt>(
+        input: HyperbolicApiKey,
+        http: H,
+    ) -> ProviderClientResult<Client<H>> {
+        Client::new_with(input, http)
+    }
 }
 
-client::impl_capabilities!(
-    HyperbolicExt,
-    completion = CompletionModel<H>,
-    image_generation = ImageGenerationModel<H>,
-    audio_generation = AudioGenerationModel<H>,
-);
+impl HasCompletion for Hyperbolic {
+    type Model<H>
+        = CompletionModel<H>
+    where
+        H: ModelTransport;
 
-impl DebugExt for HyperbolicExt {}
+    fn completion_model<H: ModelTransport>(client: &Client<H>, model: String) -> Self::Model<H> {
+        CompletionModel::new(client.clone(), model)
+    }
+}
 
-impl crate::providers::openai::completion::OpenAICompatibleProvider for HyperbolicExt {
+#[cfg(feature = "image")]
+impl HasImageGeneration for Hyperbolic {
+    type Model<H>
+        = ImageGenerationModel<H>
+    where
+        H: ModelTransport;
+
+    fn image_generation_model<H: ModelTransport>(
+        client: &Client<H>,
+        model: String,
+    ) -> Self::Model<H> {
+        ImageGenerationModel::new(client.clone(), model)
+    }
+}
+
+#[cfg(feature = "audio")]
+impl HasAudioGeneration for Hyperbolic {
+    type Model<H>
+        = AudioGenerationModel<H>
+    where
+        H: ModelTransport;
+
+    fn audio_generation_model<H: ModelTransport>(
+        client: &Client<H>,
+        model: String,
+    ) -> Self::Model<H> {
+        AudioGenerationModel::new(client.clone(), model)
+    }
+}
+
+impl crate::providers::openai::completion::OpenAICompatibleProvider for Hyperbolic {
     const PROVIDER_NAME: &'static str = "hyperbolic";
 
     // Hyperbolic's structured-output support is unverified; keep the
@@ -82,23 +134,10 @@ impl crate::providers::openai::completion::OpenAICompatibleProvider for Hyperbol
     }
 }
 
-client::impl_default_provider_builder!(
-    HyperbolicBuilder => HyperbolicExt,
-    api_key = HyperbolicApiKey,
-    base_url = HYPERBOLIC_API_BASE_URL,
-);
+pub type Client<H = crate::http_client::BoxedHttpClient> = client::Client<Hyperbolic, H>;
+pub type ClientBuilder<H = crate::markers::Missing> = client::ClientBuilder<Hyperbolic, H>;
 
-pub type Client<H = reqwest::Client> = client::Client<HyperbolicExt, H>;
-pub type ClientBuilder<H = crate::markers::Missing> =
-    client::ClientBuilder<HyperbolicBuilder, HyperbolicApiKey, H>;
-
-client::impl_provider_client!(
-    Client,
-    input = HyperbolicApiKey,
-    api_key_env = "HYPERBOLIC_API_KEY",
-);
-
-#[cfg(any(feature = "image", feature = "audio"))]
+#[cfg(feature = "audio")]
 use crate::providers::openai::client::ApiResponse;
 
 // ================================================================
@@ -131,8 +170,8 @@ pub const DEEPSEEK_R1_ZERO: &str = "deepseek-ai/DeepSeek-R1-Zero";
 pub const DEEPSEEK_R1: &str = "deepseek-ai/DeepSeek-R1";
 
 /// Hyperbolic completion model, driven by the shared OpenAI Chat Completions path.
-pub type CompletionModel<H = reqwest::Client> =
-    crate::providers::openai::completion::GenericCompletionModel<HyperbolicExt, H>;
+pub type CompletionModel<H = crate::http_client::BoxedHttpClient> =
+    crate::providers::openai::completion::GenericCompletionModel<Hyperbolic, H>;
 
 /// Raw completion payload, shared with the OpenAI Chat Completions path.
 pub type CompletionResponse = crate::providers::openai::CompletionResponse;
@@ -147,14 +186,16 @@ pub use image_generation::*;
 #[cfg(feature = "image")]
 #[cfg_attr(docsrs, doc(cfg(feature = "image")))]
 mod image_generation {
-    use super::{ApiResponse, Client};
-    use crate::http_client::HttpClientExt;
+    use super::Hyperbolic;
     use crate::image_generation;
-    use crate::image_generation::{ImageGenerationError, ImageGenerationRequest};
+    use crate::image_generation::{
+        ImageGenerationError, ImageGenerationRequest, NormalizeImageGenerationResponse,
+    };
     use crate::json_utils::merge_inplace;
-    use base64::Engine;
-    use base64::prelude::BASE64_STANDARD;
-    use serde::Deserialize;
+    use crate::providers::internal::image_generation::{
+        GenericImageGenerationModel, JsonImageGenerationProvider, decode_base64_image,
+    };
+    use serde::{Deserialize, Serialize};
     use serde_json::json;
 
     pub const SDXL1_0_BASE: &str = "SDXL1.0-base";
@@ -165,78 +206,48 @@ mod image_generation {
     pub const SDXL_CONTROLNET: &str = "SDXL-ControlNet";
     pub const SD1_5_CONTROLNET: &str = "SD1.5-ControlNet";
 
-    #[derive(Clone)]
-    pub struct ImageGenerationModel<T> {
-        client: Client<T>,
-        pub model: String,
-    }
+    /// Hyperbolic image generation model.
+    pub type ImageGenerationModel<T = crate::http_client::BoxedHttpClient> =
+        GenericImageGenerationModel<Hyperbolic, T>;
 
-    impl<T> ImageGenerationModel<T> {
-        pub(crate) fn new(client: Client<T>, model: impl Into<String>) -> Self {
-            Self {
-                client,
-                model: model.into(),
-            }
-        }
-
-        pub fn with_model(client: Client<T>, model: &str) -> Self {
-            Self {
-                client,
-                model: model.into(),
-            }
-        }
-    }
-
-    #[derive(Clone, Deserialize)]
+    #[derive(Debug, Clone, Serialize, Deserialize)]
     pub struct Image {
-        image: String,
+        pub image: String,
     }
 
-    #[derive(Clone, Deserialize)]
+    #[derive(Debug, Clone, Serialize, Deserialize)]
     pub struct ImageGenerationResponse {
-        images: Vec<Image>,
+        pub images: Vec<Image>,
     }
 
-    impl TryFrom<ImageGenerationResponse>
-        for image_generation::ImageGenerationResponse<ImageGenerationResponse>
-    {
-        type Error = ImageGenerationError;
-
-        fn try_from(value: ImageGenerationResponse) -> Result<Self, Self::Error> {
-            let image = value
-                .images
-                .first()
-                .ok_or_else(|| ImageGenerationError::ResponseError("missing image data".into()))?;
-            let data = BASE64_STANDARD
-                .decode(&image.image)
-                .map_err(|err| ImageGenerationError::ResponseError(err.to_string()))?;
-
-            Ok(Self {
-                image: data,
-                response: value,
-            })
+    impl NormalizeImageGenerationResponse for ImageGenerationResponse {
+        fn normalize(
+            self,
+            provider: &str,
+        ) -> Result<image_generation::ImageGenerationResponse, ImageGenerationError> {
+            let image = decode_base64_image(
+                &self,
+                |response| response.images.first().map(|image| image.image.as_str()),
+                "missing image data",
+                None,
+            )?;
+            Ok(image_generation::ImageGenerationResponse::new(
+                image, provider,
+            ))
         }
     }
 
-    impl<T> image_generation::ImageGenerationModel for ImageGenerationModel<T>
-    where
-        T: HttpClientExt + Clone + Default + std::fmt::Debug + Send + 'static,
-    {
+    impl JsonImageGenerationProvider for Hyperbolic {
+        const IMAGE_GENERATION_PATH: &'static str = "/v1/image/generation";
+        const PROVIDER_NAME: &'static str = "hyperbolic";
         type Response = ImageGenerationResponse;
 
-        type Client = Client<T>;
-
-        fn make(client: &Self::Client, model: impl Into<String>) -> Self {
-            Self::new(client.clone(), model)
-        }
-
-        async fn image_generation(
-            &self,
+        fn image_generation_request_body(
+            model: &str,
             generation_request: ImageGenerationRequest,
-        ) -> Result<image_generation::ImageGenerationResponse<Self::Response>, ImageGenerationError>
-        {
+        ) -> Result<serde_json::Value, ImageGenerationError> {
             let mut request = json!({
-                "model_name": self.model,
+                "model_name": model,
                 "prompt": generation_request.prompt,
                 "height": generation_request.height,
                 "width": generation_request.width,
@@ -246,18 +257,7 @@ mod image_generation {
                 merge_inplace(&mut request, params);
             }
 
-            // The explicit Content-Type header the hand-rolled request set is
-            // supplied by `Client::send` for every JSON request, so the wire
-            // shape is unchanged.
-            crate::providers::internal::image_generation::send_image_generation::<
-                _,
-                ApiResponse<ImageGenerationResponse>,
-            >(
-                &self.client,
-                self.client.post("/v1/image/generation")?,
-                request,
-            )
-            .await
+            Ok(request)
         }
     }
 }
@@ -273,61 +273,66 @@ pub use audio_generation::*;
 mod audio_generation {
     use super::{ApiResponse, Client};
     use crate::audio_generation;
-    use crate::audio_generation::{AudioGenerationError, AudioGenerationRequest};
+    use crate::audio_generation::{
+        AudioGenerationError, AudioGenerationRequest, NormalizeAudioGenerationResponse,
+    };
     use crate::http_client::{self, HttpClientExt};
     use base64::Engine;
     use base64::prelude::BASE64_STANDARD;
     use bytes::Bytes;
-    use serde::Deserialize;
+    use serde::{Deserialize, Serialize};
     use serde_json::json;
 
     #[derive(Clone)]
-    pub struct AudioGenerationModel<T> {
+    pub struct AudioGenerationModel<T = crate::http_client::BoxedHttpClient> {
         client: Client<T>,
         pub language: String,
     }
 
-    #[derive(Clone, Deserialize)]
-    pub struct AudioGenerationResponse {
-        audio: String,
-    }
-
-    impl TryFrom<AudioGenerationResponse>
-        for audio_generation::AudioGenerationResponse<AudioGenerationResponse>
-    {
-        type Error = AudioGenerationError;
-
-        fn try_from(value: AudioGenerationResponse) -> Result<Self, Self::Error> {
-            let data = BASE64_STANDARD
-                .decode(&value.audio)
-                .map_err(|err| AudioGenerationError::ResponseError(err.to_string()))?;
-
-            Ok(Self {
-                audio: data,
-                response: value,
-            })
-        }
-    }
-
-    impl<T> audio_generation::AudioGenerationModel for AudioGenerationModel<T>
-    where
-        T: HttpClientExt + Clone + Default + std::fmt::Debug + Send + 'static,
-    {
-        type Response = AudioGenerationResponse;
-        type Client = Client<T>;
-
-        fn make(client: &Self::Client, language: impl Into<String>) -> Self {
+    impl<T> AudioGenerationModel<T> {
+        /// Hyperbolic addresses its TTS endpoint by language rather than by
+        /// model, so the "model" identifier a client is asked for is the language.
+        pub fn new(client: Client<T>, language: impl Into<String>) -> Self {
             Self {
-                client: client.clone(),
+                client,
                 language: language.into(),
             }
         }
+    }
 
-        async fn audio_generation(
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct AudioGenerationResponse {
+        pub audio: String,
+    }
+
+    impl NormalizeAudioGenerationResponse for AudioGenerationResponse {
+        fn normalize(
+            self,
+            provider: &str,
+        ) -> Result<audio_generation::AudioGenerationResponse, AudioGenerationError> {
+            let data = BASE64_STANDARD
+                .decode(&self.audio)
+                .map_err(|err| AudioGenerationError::ResponseError(err.to_string()))?;
+
+            Ok(audio_generation::AudioGenerationResponse::new(
+                data, provider,
+            ))
+        }
+    }
+
+    impl<T> AudioGenerationModel<T>
+    where
+        T: HttpClientExt + Clone + crate::wasm_compat::WasmCompatSend + 'static,
+    {
+        /// Perform the generation and return Hyperbolic's native response
+        /// (base64 audio) instead of the normalized
+        /// [`audio_generation::AudioGenerationResponse`]. Same request,
+        /// transport, parser, and error path as
+        /// [`audio_generation::AudioGenerationModel::audio_generation`].
+        pub async fn raw_audio_generation(
             &self,
             request: AudioGenerationRequest,
-        ) -> Result<audio_generation::AudioGenerationResponse<Self::Response>, AudioGenerationError>
-        {
+        ) -> Result<AudioGenerationResponse, AudioGenerationError> {
             let request = json!({
                 "language": self.language,
                 "speaker": request.voice,
@@ -344,297 +349,55 @@ mod audio_generation {
                 .map_err(http_client::Error::from)?;
 
             let response = self.client.send::<_, Bytes>(req).await?;
-            let status = response.status();
-            let response_body = response.into_body().into_future().await?.to_vec();
+            let (parts, body) = response.into_parts();
+            let status = parts.status;
+            let headers = Box::new(parts.headers);
+            let response_body = body.into_future().await?.to_vec();
 
             if !status.is_success() {
                 return Err(AudioGenerationError::from_http_response(
                     status,
                     String::from_utf8_lossy(&response_body),
-                ));
+                )
+                .with_response_headers(Some(headers)));
             }
 
             match serde_json::from_slice::<ApiResponse<AudioGenerationResponse>>(&response_body)? {
-                ApiResponse::Ok(response) => response.try_into(),
+                ApiResponse::Ok(response) => Ok(response),
                 ApiResponse::Err(err) => {
                     tracing::warn!(message = %err.message, "provider returned an error response");
                     Err(AudioGenerationError::from_http_response(
                         status,
                         String::from_utf8_lossy(&response_body),
-                    ))
+                    )
+                    .with_response_headers(Some(headers)))
                 }
             }
+        }
+    }
+
+    impl<T> audio_generation::AudioGenerationModel for AudioGenerationModel<T>
+    where
+        T: HttpClientExt + Clone + crate::wasm_compat::WasmCompatSend + 'static,
+    {
+        async fn audio_generation(
+            &self,
+            request: AudioGenerationRequest,
+        ) -> Result<audio_generation::AudioGenerationResponse, AudioGenerationError> {
+            crate::telemetry::instrument_modality(
+                "hyperbolic",
+                &self.language,
+                crate::telemetry::ModalityOperation::AudioGeneration,
+                async {
+                    let response = self.raw_audio_generation(request).await?;
+                    let captured = serde_json::to_value(&response)?;
+                    Ok(response.normalize("hyperbolic")?.with_raw(captured))
+                },
+            )
+            .await
         }
     }
 }
 
 #[cfg(test)]
-mod tests {
-    #[test]
-    fn hyperbolic_prepare_request_drops_tools_and_tool_choice() {
-        use crate::providers::openai::completion::{
-            CompletionRequest as OpenAICompletionRequest, OpenAICompatibleProvider,
-            OpenAIRequestParams,
-        };
-
-        let request = crate::completion::CompletionRequestBuilder::new(
-            crate::test_utils::MockCompletionModel::default(),
-            "hello",
-        )
-        .tool(crate::completion::ToolDefinition {
-            name: "lookup".to_string(),
-            description: "Lookup".to_string(),
-            parameters: serde_json::json!({"type":"object","properties":{},"required":[]}),
-        })
-        .tool_choice(crate::message::ToolChoice::Required)
-        .output_schema(schemars::schema_for!(serde_json::Value))
-        .build();
-
-        let mut request = OpenAICompletionRequest::try_from(OpenAIRequestParams {
-            model: "meta-llama/Meta-Llama-3.1-8B-Instruct".to_string(),
-            request,
-            strict_tools: false,
-            tool_result_array_content: false,
-            supports_response_format: super::HyperbolicExt::SUPPORTS_RESPONSE_FORMAT,
-            supports_tools: false,
-        })
-        .expect("request should convert");
-        super::HyperbolicExt
-            .prepare_request(&mut request)
-            .expect("prepare_request should succeed");
-
-        let body = serde_json::to_value(request).expect("request should serialize");
-        assert!(body.get("tools").is_none());
-        assert!(body.get("tool_choice").is_none());
-        assert!(body.get("response_format").is_none());
-    }
-
-    #[test]
-    fn test_client_initialization() {
-        let _client =
-            crate::providers::hyperbolic::Client::new("dummy-key").expect("Client::new() failed");
-        let builder: crate::providers::hyperbolic::ClientBuilder =
-            crate::providers::hyperbolic::Client::builder().api_key("dummy-key");
-        let _client_from_builder = builder.build().expect("Client::builder() failed");
-    }
-
-    #[tokio::test]
-    async fn completion_non_success_preserves_status_and_body() {
-        use crate::client::CompletionClient;
-        use crate::completion::{CompletionError, CompletionModel};
-        use crate::test_utils::RecordingHttpClient;
-
-        let body = r#"{"error":{"message":"boom"}}"#;
-        let http_client =
-            RecordingHttpClient::with_error_response(http::StatusCode::SERVICE_UNAVAILABLE, body);
-        let client = super::Client::builder()
-            .api_key("test-key")
-            .http_client(http_client)
-            .build()
-            .expect("build client");
-        let model = client.completion_model(super::LLAMA_3_1_8B);
-        let request = model.completion_request("hello").build();
-
-        let error = model
-            .completion(request)
-            .await
-            .expect_err("completion should fail with non-success status");
-
-        assert!(matches!(error, CompletionError::HttpError(_)));
-        assert_eq!(
-            error.provider_response_status(),
-            Some(http::StatusCode::SERVICE_UNAVAILABLE)
-        );
-        assert_eq!(error.provider_response_body(), Some(body));
-    }
-
-    #[tokio::test]
-    async fn completion_2xx_error_envelope_preserves_status_and_body() {
-        use crate::client::CompletionClient;
-        use crate::completion::{CompletionError, CompletionModel};
-        use crate::test_utils::RecordingHttpClient;
-
-        let body = r#"{"message":"boom"}"#;
-        let http_client = RecordingHttpClient::new(body); // 200 OK
-        let client = super::Client::builder()
-            .api_key("test-key")
-            .http_client(http_client)
-            .build()
-            .expect("build client");
-        let model = client.completion_model(super::LLAMA_3_1_8B);
-        let request = model.completion_request("hello").build();
-
-        let error = model
-            .completion(request)
-            .await
-            .expect_err("completion should fail with provider error envelope");
-
-        match &error {
-            CompletionError::ProviderResponse(stored) => {
-                assert_eq!(stored.body, body);
-                assert_eq!(stored.status, Some(http::StatusCode::OK));
-            }
-            other => panic!("expected ProviderResponse, got {other:?}"),
-        }
-    }
-
-    #[cfg(feature = "image")]
-    #[tokio::test]
-    async fn image_generation_non_success_preserves_status_and_body() {
-        use crate::client::image_generation::ImageGenerationClient;
-        use crate::image_generation::{
-            ImageGenerationError, ImageGenerationModel as _, ImageGenerationRequest,
-        };
-        use crate::test_utils::RecordingHttpClient;
-
-        let body = r#"{"error":{"message":"boom"}}"#;
-        let http_client =
-            RecordingHttpClient::with_error_response(http::StatusCode::SERVICE_UNAVAILABLE, body);
-        let client = super::Client::builder()
-            .api_key("test-key")
-            .http_client(http_client)
-            .build()
-            .expect("build client");
-        let model = client.image_generation_model(super::SDXL1_0_BASE);
-
-        let request = ImageGenerationRequest {
-            prompt: "draw a cat".to_string(),
-            width: 256,
-            height: 256,
-            additional_params: None,
-        };
-
-        let error = model
-            .image_generation(request)
-            .await
-            .err()
-            .expect("image generation should fail with non-success status");
-
-        assert!(matches!(error, ImageGenerationError::HttpError(_)));
-        assert_eq!(
-            error.provider_response_status(),
-            Some(http::StatusCode::SERVICE_UNAVAILABLE)
-        );
-        assert_eq!(error.provider_response_body(), Some(body));
-    }
-
-    #[cfg(feature = "image")]
-    #[tokio::test]
-    async fn image_generation_2xx_error_envelope_preserves_status_and_body() {
-        use crate::client::image_generation::ImageGenerationClient;
-        use crate::image_generation::{
-            ImageGenerationError, ImageGenerationModel as _, ImageGenerationRequest,
-        };
-        use crate::test_utils::RecordingHttpClient;
-
-        let body = r#"{"message":"boom"}"#;
-        let http_client = RecordingHttpClient::new(body); // 200 OK
-        let client = super::Client::builder()
-            .api_key("test-key")
-            .http_client(http_client)
-            .build()
-            .expect("build client");
-        let model = client.image_generation_model(super::SDXL1_0_BASE);
-
-        let request = ImageGenerationRequest {
-            prompt: "draw a cat".to_string(),
-            width: 256,
-            height: 256,
-            additional_params: None,
-        };
-
-        let error = model
-            .image_generation(request)
-            .await
-            .err()
-            .expect("image generation should fail with provider error envelope");
-
-        match &error {
-            ImageGenerationError::ProviderResponse(stored) => {
-                assert_eq!(stored.body, body);
-                assert_eq!(stored.status, Some(http::StatusCode::OK));
-            }
-            other => panic!("expected ProviderResponse, got {other:?}"),
-        }
-    }
-
-    #[cfg(feature = "audio")]
-    #[tokio::test]
-    async fn audio_generation_non_success_preserves_status_and_body() {
-        use crate::audio_generation::{
-            AudioGenerationError, AudioGenerationModel as _, AudioGenerationRequest,
-        };
-        use crate::client::audio_generation::AudioGenerationClient;
-        use crate::test_utils::RecordingHttpClient;
-
-        let body = r#"{"error":{"message":"boom"}}"#;
-        let http_client =
-            RecordingHttpClient::with_error_response(http::StatusCode::SERVICE_UNAVAILABLE, body);
-        let client = super::Client::builder()
-            .api_key("test-key")
-            .http_client(http_client)
-            .build()
-            .expect("build client");
-        let model = client.audio_generation_model("EN");
-
-        let request = AudioGenerationRequest {
-            text: "hello".to_string(),
-            voice: "default".to_string(),
-            speed: 1.0,
-            additional_params: None,
-        };
-
-        let error = model
-            .audio_generation(request)
-            .await
-            .err()
-            .expect("audio generation should fail with non-success status");
-
-        assert!(matches!(error, AudioGenerationError::HttpError(_)));
-        assert_eq!(
-            error.provider_response_status(),
-            Some(http::StatusCode::SERVICE_UNAVAILABLE)
-        );
-        assert_eq!(error.provider_response_body(), Some(body));
-    }
-
-    #[cfg(feature = "audio")]
-    #[tokio::test]
-    async fn audio_generation_2xx_error_envelope_preserves_status_and_body() {
-        use crate::audio_generation::{
-            AudioGenerationError, AudioGenerationModel as _, AudioGenerationRequest,
-        };
-        use crate::client::audio_generation::AudioGenerationClient;
-        use crate::test_utils::RecordingHttpClient;
-
-        let body = r#"{"message":"boom"}"#;
-        let http_client = RecordingHttpClient::new(body); // 200 OK
-        let client = super::Client::builder()
-            .api_key("test-key")
-            .http_client(http_client)
-            .build()
-            .expect("build client");
-        let model = client.audio_generation_model("EN");
-
-        let request = AudioGenerationRequest {
-            text: "hello".to_string(),
-            voice: "default".to_string(),
-            speed: 1.0,
-            additional_params: None,
-        };
-
-        let error = model
-            .audio_generation(request)
-            .await
-            .err()
-            .expect("audio generation should fail with provider error envelope");
-
-        match &error {
-            AudioGenerationError::ProviderResponse(stored) => {
-                assert_eq!(stored.body, body);
-                assert_eq!(stored.status, Some(http::StatusCode::OK));
-            }
-            other => panic!("expected ProviderResponse, got {other:?}"),
-        }
-    }
-}
+mod tests;

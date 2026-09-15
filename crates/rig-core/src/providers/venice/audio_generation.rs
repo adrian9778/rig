@@ -1,14 +1,13 @@
 //! Venice text-to-speech (`POST /audio/speech`).
 
-use bytes::Bytes;
 use serde_json::json;
 
-use super::client::Client;
-use crate::audio_generation::{
-    self, AudioGenerationError, AudioGenerationRequest, AudioGenerationResponse,
-};
-use crate::http_client::HttpClientExt;
+use crate::audio_generation::{AudioGenerationError, AudioGenerationRequest};
 use crate::json_utils::merge_inplace;
+use crate::providers::internal::audio_generation::{
+    GenericAudioGenerationModel, RawAudioGenerationProvider,
+};
+use crate::providers::venice::Venice;
 
 // ================================================================
 // Venice TTS API
@@ -26,38 +25,17 @@ pub const TTS_INWORLD_1_5_MAX: &str = "tts-inworld-1-5-max";
 const DEFAULT_VOICE: &str = "af_sky";
 
 /// Venice audio generation model.
-#[derive(Clone)]
-pub struct AudioGenerationModel<T = reqwest::Client> {
-    client: Client<T>,
-    /// Name of the model (e.g.: `tts-kokoro`).
-    pub model: String,
-}
+pub type AudioGenerationModel<T = crate::http_client::BoxedHttpClient> =
+    GenericAudioGenerationModel<Venice, T>;
 
-impl<T> AudioGenerationModel<T> {
-    pub(crate) fn new(client: Client<T>, model: impl Into<String>) -> Self {
-        Self {
-            client,
-            model: model.into(),
-        }
-    }
-}
+impl RawAudioGenerationProvider for Venice {
+    const AUDIO_GENERATION_PATH: &'static str = "/audio/speech";
+    const PROVIDER_NAME: &'static str = "venice";
 
-impl<T> audio_generation::AudioGenerationModel for AudioGenerationModel<T>
-where
-    T: HttpClientExt + Clone + std::fmt::Debug + Default + 'static,
-{
-    type Response = Bytes;
-
-    type Client = Client<T>;
-
-    fn make(client: &Self::Client, model: impl Into<String>) -> Self {
-        Self::new(client.clone(), model)
-    }
-
-    async fn audio_generation(
-        &self,
+    fn audio_generation_request_body(
+        model: &str,
         request: AudioGenerationRequest,
-    ) -> Result<AudioGenerationResponse<Self::Response>, AudioGenerationError> {
+    ) -> Result<serde_json::Value, AudioGenerationError> {
         // Venice validates `voice` against the model's own voice list and
         // rejects an empty string, so an unset voice falls back to the
         // documented default rather than being sent blank.
@@ -68,7 +46,7 @@ where
         };
 
         let mut body = json!({
-            "model": self.model,
+            "model": model,
             "input": request.text,
             "voice": voice,
             "speed": request.speed,
@@ -78,82 +56,9 @@ where
             merge_inplace(&mut body, additional_params);
         }
 
-        crate::providers::internal::audio_generation::send_audio_generation(
-            &self.client,
-            self.client.post("/audio/speech")?,
-            body,
-        )
-        .await
+        Ok(body)
     }
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::audio_generation::AudioGenerationModel as _;
-    use crate::client::audio_generation::AudioGenerationClient;
-    use crate::test_utils::RecordingHttpClient;
-
-    #[tokio::test]
-    async fn audio_generation_non_success_preserves_status_and_body() {
-        let body = r#"{"error":"Insufficient USD or DIEM balance"}"#;
-        let http_client =
-            RecordingHttpClient::with_error_response(http::StatusCode::PAYMENT_REQUIRED, body);
-        let client = crate::providers::venice::Client::builder()
-            .api_key("test-key")
-            .http_client(http_client)
-            .build()
-            .expect("build client");
-        let model = client.audio_generation_model(TTS_KOKORO);
-
-        let request = model
-            .audio_generation_request()
-            .text("hello")
-            .voice("af_sky")
-            .build();
-
-        let error = model
-            .audio_generation(request)
-            .await
-            .err()
-            .expect("should fail with non-success status");
-
-        assert!(matches!(error, AudioGenerationError::HttpError(_)));
-        assert_eq!(
-            error.provider_response_status(),
-            Some(http::StatusCode::PAYMENT_REQUIRED)
-        );
-        assert_eq!(error.provider_response_body(), Some(body));
-    }
-
-    /// An unset voice must not reach Venice as `""`, which it rejects.
-    #[tokio::test]
-    async fn empty_voice_falls_back_to_the_model_default() {
-        let http_client = RecordingHttpClient::new("audio-bytes");
-        let client = crate::providers::venice::Client::builder()
-            .api_key("test-key")
-            .http_client(http_client.clone())
-            .build()
-            .expect("build client");
-        let model = client.audio_generation_model(TTS_KOKORO);
-
-        let request = model
-            .audio_generation_request()
-            .text("hello")
-            .voice("")
-            .build();
-        model
-            .audio_generation(request)
-            .await
-            .expect("audio generation should succeed");
-
-        let requests = http_client.requests();
-        let recorded = requests.first().expect("one request");
-        assert!(recorded.uri.ends_with("/audio/speech"));
-        let body: serde_json::Value =
-            serde_json::from_slice(&recorded.body).expect("body should be JSON");
-        assert_eq!(body["voice"], DEFAULT_VOICE);
-        assert_eq!(body["model"], TTS_KOKORO);
-        assert_eq!(body["input"], "hello");
-    }
-}
+mod tests;

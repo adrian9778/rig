@@ -1,7 +1,7 @@
 //! Anthropic API client and Rig integration
 //!
 //! # Example
-//! ```no_run
+//! ```ignore
 //! use rig_core::{client::CompletionClient, providers::anthropic};
 //!
 //! # fn run() -> Result<(), Box<dyn std::error::Error>> {
@@ -15,6 +15,9 @@
 pub mod client;
 pub mod completion;
 pub mod model_listing;
+mod observation;
 pub mod streaming;
 
 pub use client::{Client, ClientBuilder};
+pub use completion::CompletionModel;
+pub use model_listing::AnthropicModelLister;

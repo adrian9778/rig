@@ -41,7 +41,7 @@ mod utils;
 /// # Example
 /// ```ignore
 /// use rig_lancedb::{LanceDbVectorIndex, SearchParams};
-/// use rig_core::client::ProviderClient;
+/// use rig_reqwest::prelude::*;
 /// use rig_core::providers::openai::{Client, TEXT_EMBEDDING_ADA_002, EmbeddingModel};
 ///
 /// let openai_client = Client::from_env()?;
@@ -50,7 +50,11 @@ mod utils;
 /// let model: EmbeddingModel = openai_client.embedding_model(TEXT_EMBEDDING_ADA_002); // <-- Replace with your embedding model here.
 /// let vector_store_index = LanceDbVectorIndex::new(table, model, "id", SearchParams::default()).await?;
 /// ```
-pub struct LanceDbVectorIndex<M: EmbeddingModel> {
+///
+/// The store is generic over its embedding model `M`, which is fixed for the
+/// store's lifetime: an index populated under one model is only meaningful under
+/// that same model.
+pub struct LanceDbVectorIndex<M> {
     /// Defines which model is used to generate embeddings for the vector store.
     model: M,
     /// LanceDB table containing embeddings.
@@ -61,10 +65,7 @@ pub struct LanceDbVectorIndex<M: EmbeddingModel> {
     search_params: SearchParams,
 }
 
-impl<M> LanceDbVectorIndex<M>
-where
-    M: EmbeddingModel,
-{
+impl<M: EmbeddingModel> LanceDbVectorIndex<M> {
     /// Create an instance of `LanceDbVectorIndex` with an existing table and model.
     /// Define the id field name of the table.
     /// Define search parameters that will be used to perform vector searches on the table.
@@ -116,7 +117,7 @@ where
         }
 
         if let Some(column) = column {
-            query = query.column(column.as_str())
+            query = query.column(column.as_str());
         }
 
         query
@@ -222,7 +223,7 @@ impl LanceDBFilter {
     }
 
     /// IN operator
-    pub fn in_values(key: String, values: Vec<<Self as SearchFilter>::Value>) -> Self {
+    pub fn in_values(key: &str, values: Vec<<Self as SearchFilter>::Value>) -> Self {
         Self(
             values
                 .into_iter()
@@ -234,7 +235,7 @@ impl LanceDBFilter {
     }
 
     /// LIKE operator (string pattern matching)
-    pub fn like<S>(key: String, pattern: S) -> Self
+    pub fn like<S>(key: &str, pattern: S) -> Self
     where
         S: AsRef<str>,
     {
@@ -245,7 +246,7 @@ impl LanceDBFilter {
     }
 
     /// ILIKE operator (case-insensitive pattern matching)
-    pub fn ilike<S>(key: String, pattern: S) -> Self
+    pub fn ilike<S>(key: &str, pattern: S) -> Self
     where
         S: AsRef<str>,
     {
@@ -256,17 +257,17 @@ impl LanceDBFilter {
     }
 
     /// IS NULL check
-    pub fn is_null(key: String) -> Self {
+    pub fn is_null(key: &str) -> Self {
         Self(Ok(format!("{key} IS NULL")))
     }
 
     /// IS NOT NULL check
-    pub fn is_not_null(key: String) -> Self {
+    pub fn is_not_null(key: &str) -> Self {
         Self(Ok(format!("{key} IS NOT NULL")))
     }
 
     /// Array has any (for LIST columns with scalar index)
-    pub fn array_has_any(key: String, values: Vec<<Self as SearchFilter>::Value>) -> Self {
+    pub fn array_has_any(key: &str, values: Vec<<Self as SearchFilter>::Value>) -> Self {
         Self(
             values
                 .into_iter()
@@ -278,7 +279,7 @@ impl LanceDBFilter {
     }
 
     /// Array has all (for LIST columns with scalar index)
-    pub fn array_has_all(key: String, values: Vec<<Self as SearchFilter>::Value>) -> Self {
+    pub fn array_has_all(key: &str, values: Vec<<Self as SearchFilter>::Value>) -> Self {
         Self(
             values
                 .into_iter()
@@ -290,12 +291,12 @@ impl LanceDBFilter {
     }
 
     /// Array length comparison
-    pub fn array_length(key: String, length: i32) -> Self {
+    pub fn array_length(key: &str, length: i32) -> Self {
         Self(Ok(format!("array_length({key}) = {length}")))
     }
 
     /// BETWEEN operator
-    pub fn between<T>(key: String, Range { start, end }: Range<T>) -> Self
+    pub fn between<T>(key: &str, Range { start, end }: Range<T>) -> Self
     where
         T: PartialOrd + std::fmt::Display + Into<serde_json::Number>,
     {
@@ -362,23 +363,20 @@ impl SearchParams {
     /// Sets the column of the search params.
     /// Only set this value if there is more than one column that contains lists of floats.
     /// If there is only one column of list of floats, this column will be chosen for the vector search automatically.
-    pub fn column(mut self, column: &str) -> Self {
-        self.column = Some(column.to_string());
+    pub fn column(mut self, column: impl Into<String>) -> Self {
+        self.column = Some(column.into());
         self
     }
 }
 
-impl<M> VectorStoreIndex for LanceDbVectorIndex<M>
-where
-    M: EmbeddingModel + Sync + Send,
-{
+impl<M: EmbeddingModel> VectorStoreIndex for LanceDbVectorIndex<M> {
     type Filter = LanceDBFilter;
 
     /// Implement the `top_n` method of the `VectorStoreIndex` trait for `LanceDbVectorIndex`.
     /// # Example
     /// ```ignore
     /// use rig_lancedb::{LanceDbVectorIndex, SearchParams};
-    /// use rig_core::client::ProviderClient;
+    /// use rig_reqwest::prelude::*;
     /// use rig_core::providers::openai::{EmbeddingModel, Client, TEXT_EMBEDDING_ADA_002};
     ///
     /// let openai_client = Client::from_env()?;
@@ -413,7 +411,7 @@ where
             ));
 
         if let Some(filter) = req.filter() {
-            query = query.only_if(filter.clone().into_inner()?)
+            query = query.only_if(filter.clone().into_inner()?);
         }
 
         self.build_query(query)
@@ -427,8 +425,8 @@ where
                         Some(Value::Number(distance)) => distance.as_f64().unwrap_or_default(),
                         _ => 0.0,
                     },
-                    match value.get(self.id_field.clone()) {
-                        Some(Value::String(id)) => id.to_string(),
+                    match value.get(self.id_field.as_str()) {
+                        Some(Value::String(id)) => id.clone(),
                         _ => format!("unknown{i}"),
                     },
                     serde_json::from_value(value).map_err(VectorStoreError::JsonError)?,
@@ -441,7 +439,7 @@ where
     /// # Example
     /// ```ignore
     /// use rig_lancedb::{LanceDbVectorIndex, SearchParams};
-    /// use rig_core::client::ProviderClient;
+    /// use rig_reqwest::prelude::*;
     /// use rig_core::providers::openai::{Client, TEXT_EMBEDDING_ADA_002, EmbeddingModel};
     ///
     /// let openai_client = Client::from_env()?;
@@ -471,7 +469,7 @@ where
             .limit(req.samples() as usize);
 
         if let Some(filter) = req.filter() {
-            query = query.only_if(filter.clone().into_inner()?)
+            query = query.only_if(filter.clone().into_inner()?);
         }
 
         self.build_query(query)
@@ -484,8 +482,8 @@ where
                         Some(Value::Number(distance)) => distance.as_f64().unwrap_or_default(),
                         _ => 0.0,
                     },
-                    match value.get(self.id_field.clone()) {
-                        Some(Value::String(id)) => id.to_string(),
+                    match value.get(self.id_field.as_str()) {
+                        Some(Value::String(id)) => id.clone(),
                         _ => "".to_string(),
                     },
                 ))

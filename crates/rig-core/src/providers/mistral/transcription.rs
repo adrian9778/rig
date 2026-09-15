@@ -1,11 +1,12 @@
 //! Implements Mistral (basic) transcription API
 use bytes::Bytes;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
+use crate::completion::Usage;
 use crate::http_client::HttpClientExt;
+use crate::providers::internal::request_id_from_headers;
 use crate::providers::internal::transcription::{TranscriptionFields, transcription_form};
-use crate::providers::mistral::Client;
-use crate::transcription::{self, TranscriptionError};
+use crate::transcription::{self, NormalizeTranscriptionResponse, TranscriptionError};
 use crate::wasm_compat::WasmCompatSend;
 
 // ================================================================
@@ -18,7 +19,7 @@ pub const VOXTRAL_MINI: &str = "voxtral-mini-latest";
 pub const VOXTRAL_SMALL: &str = "voxtral-small-latest";
 
 /// Request usage statistics
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TranscriptionUsage {
     pub prompt_audio_seconds: Option<i32>,
     pub prompt_tokens: i32,
@@ -34,7 +35,7 @@ impl std::fmt::Display for TranscriptionUsage {
         writeln!(f, "  completion_tokens: {}", self.completion_tokens)?;
         writeln!(f, "  total_tokens:      {}", self.total_tokens)?;
         if let Some(details) = &self.prompt_tokens_details {
-            writeln!(f, "  prompt_token_details: {:?}", details)?;
+            writeln!(f, "  prompt_token_details: {details:?}")?;
         } else {
             writeln!(f, "  prompt_token_details: N/A")?;
         }
@@ -48,7 +49,7 @@ impl std::fmt::Display for TranscriptionUsage {
 }
 
 /// Diarization information, tells when each speaker started and ended talking plus what they said.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SegmentChunk {
     /// Start time in seconds
     pub start: f32,
@@ -63,7 +64,7 @@ pub struct SegmentChunk {
     pub segment_type: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MistralTranscriptionResponse {
     /// Audio language
     pub language: Option<String>,
@@ -77,40 +78,54 @@ pub struct MistralTranscriptionResponse {
     pub usage: TranscriptionUsage,
 }
 
-impl TryFrom<MistralTranscriptionResponse>
-    for transcription::TranscriptionResponse<MistralTranscriptionResponse>
-{
-    type Error = TranscriptionError;
-
-    fn try_from(value: MistralTranscriptionResponse) -> Result<Self, Self::Error> {
-        Ok(transcription::TranscriptionResponse {
-            text: value.text.clone(),
-            response: value,
-        })
+impl NormalizeTranscriptionResponse for MistralTranscriptionResponse {
+    fn normalize(
+        self,
+        provider: &str,
+    ) -> Result<transcription::TranscriptionResponse, TranscriptionError> {
+        let usage = Usage {
+            input_tokens: self.usage.prompt_tokens.max(0) as u64,
+            output_tokens: self.usage.completion_tokens.max(0) as u64,
+            total_tokens: self.usage.total_tokens.max(0) as u64,
+            ..Usage::new()
+        };
+        Ok(
+            transcription::TranscriptionResponse::new(self.text, provider)
+                .with_model(self.model)
+                .with_usage(usage),
+        )
     }
 }
 
-pub type TranscriptionModel<T = reqwest::Client> =
+pub type TranscriptionModel<T = crate::http_client::BoxedHttpClient> =
     crate::providers::internal::transcription::GenericTranscriptionModel<
-        crate::providers::mistral::client::MistralExt,
+        crate::providers::mistral::client::Mistral,
         T,
     >;
 
-impl<T> transcription::TranscriptionModel for TranscriptionModel<T>
+impl<T> TranscriptionModel<T>
 where
-    T: HttpClientExt + Clone + std::fmt::Debug + Default + WasmCompatSend + 'static,
+    T: HttpClientExt + Clone + WasmCompatSend + 'static,
 {
-    type Response = MistralTranscriptionResponse;
-    type Client = Client<T>;
-
-    fn make(client: &Self::Client, model: impl Into<String>) -> Self {
-        Self::new(client.clone(), model)
+    /// Perform the transcription and return Mistral's native response instead
+    /// of the normalized [`transcription::TranscriptionResponse`]. Same
+    /// request, transport, parser, and error path as
+    /// [`transcription::TranscriptionModel::transcription`].
+    pub async fn raw_transcription(
+        &self,
+        request: transcription::TranscriptionRequest,
+    ) -> Result<MistralTranscriptionResponse, TranscriptionError> {
+        self.raw_transcription_with_request_id(request)
+            .await
+            .map(|(response, _)| response)
     }
 
-    async fn transcription(
+    /// [`Self::raw_transcription`] plus the `mistral-correlation-id` transport
+    /// request id, when the response carried one.
+    pub async fn raw_transcription_with_request_id(
         &self,
         mut request: transcription::TranscriptionRequest,
-    ) -> Result<transcription::TranscriptionResponse<Self::Response>, TranscriptionError> {
+    ) -> Result<(MistralTranscriptionResponse, Option<String>), TranscriptionError> {
         // Mistral's transcription endpoint has no `prompt` field; it has
         // always been dropped rather than sent.
         request.prompt = None;
@@ -128,14 +143,15 @@ where
             .body(body)
             .map_err(|e| TranscriptionError::RequestError(e.into()))?;
 
-        let response = self
-            .client
-            .send_multipart::<Bytes>(req)
-            .await
-            .map_err(TranscriptionError::HttpError)?;
+        let response = self.client.send_multipart::<Bytes>(req).await?;
 
-        let status = response.status();
-        let response_bytes = response.into_body().await?;
+        let (parts, body) = response.into_parts();
+        let status = parts.status;
+        let provider_request_id = request_id_from_headers(
+            &parts.headers,
+            <super::client::Mistral as crate::providers::openai::completion::OpenAICompatibleProvider>::REQUEST_ID_HEADER,
+        );
+        let response_bytes = body.await?;
 
         if status.is_success() {
             let response_body: MistralTranscriptionResponse =
@@ -143,141 +159,43 @@ where
 
             tracing::info!(target: "rig", "Mistral transcription token usage: {}", &response_body.usage);
 
-            Ok(transcription::TranscriptionResponse::try_from(
-                response_body,
-            )?)
+            Ok((response_body, provider_request_id))
         } else {
             Err(TranscriptionError::from_http_response(
                 status,
                 String::from_utf8_lossy(&response_bytes),
-            ))
+            )
+            .with_provider_request_id(provider_request_id)
+            .with_response_headers(Some(Box::new(parts.headers))))
         }
     }
 }
 
-#[cfg(test)]
-mod test {
-    use super::*;
-    use crate::transcription::TranscriptionResponse;
-
-    #[test]
-    fn test_mistral_transcription_response_deserialize() {
-        let json = r#" {
-          "model": "voxtral-mini-latest",
-          "text": "The sun was setting slowly, casting long shadows across the empty field.",
-          "language": null,
-          "segments": [
-            {
-              "text": "The sun was setting slowly, casting long shadows across the empty field.",
-              "start": 0.2,
-              "end": 4.6,
-              "speaker_id": "speaker_1",
-              "type": "transcription_segment"
-            }
-          ],
-          "usage": {
-            "prompt_audio_seconds": 5,
-            "prompt_tokens": 5,
-            "total_tokens": 404,
-            "completion_tokens": 24,
-            "prompt_tokens_details": {
-              "cached_tokens": 368
-            }
-          },
-          "finish_reason": null
-            }"#;
-
-        let response: MistralTranscriptionResponse =
-            serde_json::from_str(json).expect("should deserialize");
-
-        assert_eq!(response.language, None);
-        assert_eq!(response.model, VOXTRAL_MINI);
-        assert_eq!(response.segments.len(), 1);
-
-        let seg0 = &response.segments[0];
-        assert_eq!(seg0.start, 0.2);
-        assert_eq!(seg0.end, 4.6);
-        assert_eq!(seg0.score, None);
-        assert_eq!(seg0.speaker_id, Some("speaker_1".to_string()));
-        assert_eq!(seg0.segment_type, "transcription_segment");
-
-        assert_eq!(response.usage.prompt_audio_seconds, Some(5));
-        assert_eq!(response.usage.prompt_tokens, 5);
-        assert_eq!(response.usage.total_tokens, 404);
-        let usage_token_details = response.usage.prompt_tokens_details.unwrap();
-        let cached_token = usage_token_details.get("cached_tokens").unwrap();
-
-        assert_eq!(cached_token.to_string().parse::<i32>().unwrap(), 368);
-    }
-
-    #[test]
-    fn test_response_conversion() {
-        let mistral_response = MistralTranscriptionResponse {
-            language: Some("en".to_string()),
-            model: VOXTRAL_MINI.to_string(),
-            segments: vec![SegmentChunk {
-                start: 0.0,
-                end: 1.0,
-                text: "Lorem Ipsum is simply dummy text of the printing and typesetting industry."
-                    .into(),
-                score: None,
-                speaker_id: None,
-                segment_type: "speech".to_string(),
-            }],
-            text: "Lorem Ipsum is simply dummy text of the printing and typesetting industry."
-                .to_string(),
-            usage: TranscriptionUsage {
-                prompt_audio_seconds: Some(1),
-                prompt_tokens: 10,
-                total_tokens: 20,
-                completion_tokens: 10,
-                prompt_tokens_details: None,
+impl<T> transcription::TranscriptionModel for TranscriptionModel<T>
+where
+    T: HttpClientExt + Clone + WasmCompatSend + 'static,
+{
+    async fn transcription(
+        &self,
+        request: transcription::TranscriptionRequest,
+    ) -> Result<transcription::TranscriptionResponse, TranscriptionError> {
+        crate::telemetry::instrument_modality(
+            "mistral",
+            &self.model,
+            crate::telemetry::ModalityOperation::Transcription,
+            async {
+                let (response, provider_request_id) =
+                    self.raw_transcription_with_request_id(request).await?;
+                let captured = serde_json::to_value(&response)?;
+                Ok(response
+                    .normalize("mistral")?
+                    .with_optional_provider_request_id(provider_request_id)
+                    .with_raw(captured))
             },
-        };
-
-        let response: TranscriptionResponse<MistralTranscriptionResponse> = mistral_response
-            .try_into()
-            .expect("conversion should succeed");
-
-        assert_eq!(
-            response.text,
-            "Lorem Ipsum is simply dummy text of the printing and typesetting industry."
-        );
-        assert_eq!(response.response.model, VOXTRAL_MINI);
-        assert_eq!(response.response.language, Some("en".to_string()));
-    }
-
-    #[tokio::test]
-    async fn transcription_non_success_preserves_status_and_body() {
-        use crate::client::transcription::TranscriptionClient;
-        use crate::test_utils::RecordingHttpClient;
-        use crate::transcription::{TranscriptionError, TranscriptionModel as _};
-
-        let body = r#"{"error":{"message":"boom"}}"#;
-        let http_client =
-            RecordingHttpClient::with_error_response(http::StatusCode::SERVICE_UNAVAILABLE, body);
-        let client = Client::builder()
-            .api_key("test-key")
-            .http_client(http_client)
-            .build()
-            .expect("build client");
-        let model = client.transcription_model(VOXTRAL_MINI);
-
-        let error = match model
-            .transcription_request()
-            .data(vec![0u8; 16])
-            .send()
-            .await
-        {
-            Err(error) => error,
-            Ok(_) => panic!("transcription should fail with non-success status"),
-        };
-
-        assert!(matches!(error, TranscriptionError::HttpError(_)));
-        assert_eq!(
-            error.provider_response_status(),
-            Some(http::StatusCode::SERVICE_UNAVAILABLE)
-        );
-        assert_eq!(error.provider_response_body(), Some(body));
+        )
+        .await
     }
 }
+
+#[cfg(test)]
+mod test;

@@ -7,7 +7,7 @@ use rig::message::{
 };
 use rig::prelude::*;
 use rig::providers::gemini::interactions_api::{AdditionalParameters, Tool};
-use rig::streaming::StreamedAssistantContent;
+use rig::streaming::{Delta, StreamEvent};
 
 use crate::support::assert_nonempty_response;
 
@@ -242,8 +242,11 @@ async fn streaming_interaction() {
             let mut saw_usage = false;
             while let Some(chunk) = stream.next().await {
                 match chunk.expect("stream chunk should succeed") {
-                    StreamedAssistantContent::Text(delta) => text.push_str(&delta.text),
-                    StreamedAssistantContent::Final(response) => {
+                    StreamEvent::BlockDelta {
+                        delta: Delta::Text { text: delta },
+                        ..
+                    } => text.push_str(&delta),
+                    StreamEvent::Final(response) => {
                         saw_usage = response.usage.has_values();
                     }
                     _ => {}
@@ -278,8 +281,11 @@ async fn streaming_final_metadata_exposes_model_version() {
             let mut saw_usage = false;
             while let Some(chunk) = stream.next().await {
                 match chunk.expect("stream chunk should succeed") {
-                    StreamedAssistantContent::Text(delta) => text.push_str(&delta.text),
-                    StreamedAssistantContent::Final(response) => {
+                    StreamEvent::BlockDelta {
+                        delta: Delta::Text { text: delta },
+                        ..
+                    } => text.push_str(&delta),
+                    StreamEvent::Final(response) => {
                         final_response_count += 1;
                         saw_usage = response.usage.has_values();
                         final_model_version = response.model.clone();
@@ -301,6 +307,55 @@ async fn streaming_final_metadata_exposes_model_version() {
             assert!(
                 saw_usage,
                 "expected final response to expose Interactions token usage"
+            );
+        },
+    )
+    .await;
+}
+
+/// The Interactions surface must surface every token counter it is sent.
+///
+/// Replays a cassette recorded long before this assertion existed, which is what
+/// makes it a genuine regression cell: the recorded wire reports
+/// `total_input_tokens: 14`, `total_output_tokens: 34`, `total_tokens: 270` and
+/// `total_thought_tokens: 222`. Rig's `InteractionUsage` had three fields, so
+/// the 222 thinking tokens — the *majority* of the spend — were dropped on the
+/// floor, and the normalized triple could not explain its own total. The wire
+/// also carries `total_cached_tokens`, which meant `cached_input_tokens` was
+/// structurally zero on this surface no matter what Gemini reported.
+///
+/// On `origin/main` this fails with `reasoning_tokens == 0`.
+#[tokio::test]
+async fn interactions_usage_surfaces_thinking_and_cached_tokens() {
+    super::super::support::with_gemini_interactions_cassette(
+        "interactions_api/basic_interaction_returns_id",
+        |client| async move {
+            let model = client.completion_model("gemini-3-flash-preview");
+            let params = AdditionalParameters {
+                store: Some(true),
+                ..Default::default()
+            };
+            let request = model
+                .completion_request("Give me two fun facts about hummingbirds.")
+                .preamble("Be concise.".to_string())
+                .additional_params(serde_json::to_value(params).expect("params should serialize"))
+                .build();
+
+            let response = rig::completion::CompletionModel::completion(&model, request)
+                .await
+                .expect("completion should succeed");
+            let usage = response.usage;
+
+            assert!(
+                usage.reasoning_tokens > 0,
+                "the recorded interaction reports total_thought_tokens; dropping it loses the \
+                 largest component of the spend. got {usage:?}"
+            );
+            assert_eq!(
+                usage.input_tokens + usage.output_tokens + usage.reasoning_tokens,
+                usage.total_tokens,
+                "on this surface thinking is reported beside input/output, so the components \
+                 should account for the provider's own total: {usage:?}"
             );
         },
     )

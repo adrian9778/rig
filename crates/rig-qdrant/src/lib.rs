@@ -28,7 +28,11 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 /// Represents a vector store implementation using Qdrant - <https://qdrant.tech/> as the backend.
-pub struct QdrantVectorStore<M: EmbeddingModel> {
+///
+/// The store is generic over its embedding model `M`, which is fixed for the
+/// store's lifetime: an index populated under one model is only meaningful under
+/// that same model.
+pub struct QdrantVectorStore<M> {
     /// Model used to generate embeddings for the vector store
     model: M,
     /// Client instance for Qdrant server communication
@@ -37,10 +41,7 @@ pub struct QdrantVectorStore<M: EmbeddingModel> {
     query_params: QueryPoints,
 }
 
-impl<M> QdrantVectorStore<M>
-where
-    M: EmbeddingModel,
-{
+impl<M: EmbeddingModel> QdrantVectorStore<M> {
     /// Creates a new instance of `QdrantVectorStore`.
     ///
     /// # Arguments
@@ -115,10 +116,7 @@ where
     }
 }
 
-impl<Model> InsertDocuments for QdrantVectorStore<Model>
-where
-    Model: EmbeddingModel + Send + Sync,
-{
+impl<M: EmbeddingModel> InsertDocuments for QdrantVectorStore<M> {
     async fn insert_documents<Doc: Serialize + Embed + Send>(
         &self,
         documents: Vec<(Doc, Vec<Embedding>)>,
@@ -158,17 +156,14 @@ where
 fn stringify_id(id: PointId) -> Result<String, VectorStoreError> {
     match id.point_id_options {
         Some(PointIdOptions::Num(num)) => Ok(num.to_string()),
-        Some(PointIdOptions::Uuid(uuid)) => Ok(uuid.to_string()),
+        Some(PointIdOptions::Uuid(uuid)) => Ok(uuid),
         None => Err(VectorStoreError::DatastoreError(
             "Invalid point ID format".into(),
         )),
     }
 }
 
-impl<M> VectorStoreIndex for QdrantVectorStore<M>
-where
-    M: EmbeddingModel + std::marker::Sync + Send,
-{
+impl<M: EmbeddingModel> VectorStoreIndex for QdrantVectorStore<M> {
     type Filter = QdrantFilter;
 
     /// Search for the top `n` nearest neighbors to the given query within the Qdrant vector store.

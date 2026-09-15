@@ -1,12 +1,12 @@
-use super::client::Client;
-use crate::http_client::HttpClientExt;
 use crate::image_generation;
-use crate::image_generation::{ImageGenerationError, ImageGenerationRequest};
+use crate::image_generation::{
+    ImageGenerationError, ImageGenerationRequest, NormalizeImageGenerationResponse,
+};
 use crate::json_utils::merge_inplace;
-use crate::providers::openai::client::ApiResponse;
-use base64::Engine;
-use base64::prelude::BASE64_STANDARD;
-use serde::Deserialize;
+use crate::providers::internal::image_generation::{
+    GenericImageGenerationModel, JsonImageGenerationProvider, decode_base64_image,
+};
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 // ================================================================
@@ -15,73 +15,48 @@ use serde_json::json;
 pub const GROK_IMAGINE_IMAGE: &str = "grok-imagine-image";
 pub const GROK_IMAGINE_IMAGE_PRO: &str = "grok-imagine-image-pro";
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ImageGenerationData {
     pub b64_json: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ImageGenerationResponse {
     pub data: Vec<ImageGenerationData>,
 }
 
-impl TryFrom<ImageGenerationResponse>
-    for image_generation::ImageGenerationResponse<ImageGenerationResponse>
-{
-    type Error = ImageGenerationError;
-
-    fn try_from(value: ImageGenerationResponse) -> Result<Self, Self::Error> {
-        let first = value
-            .data
-            .first()
-            .ok_or_else(|| ImageGenerationError::ResponseError("No image data returned".into()))?;
-
-        let bytes = BASE64_STANDARD.decode(&first.b64_json).map_err(|e| {
-            ImageGenerationError::ResponseError(format!("Base64 decode error: {e}"))
-        })?;
-
-        Ok(image_generation::ImageGenerationResponse {
-            image: bytes,
-            response: value,
-        })
+impl NormalizeImageGenerationResponse for ImageGenerationResponse {
+    fn normalize(
+        self,
+        provider: &str,
+    ) -> Result<image_generation::ImageGenerationResponse, ImageGenerationError> {
+        let image = decode_base64_image(
+            &self,
+            |response| response.data.first().map(|image| image.b64_json.as_str()),
+            "No image data returned",
+            Some("Base64 decode error: "),
+        )?;
+        Ok(image_generation::ImageGenerationResponse::new(
+            image, provider,
+        ))
     }
 }
 
-#[derive(Clone)]
-pub struct ImageGenerationModel<T = reqwest::Client> {
-    client: Client<T>,
-    /// Name of the model (e.g.: grok-imagine-image)
-    pub model: String,
-}
+/// xAI image generation model.
+pub type ImageGenerationModel<T = crate::http_client::BoxedHttpClient> =
+    GenericImageGenerationModel<super::client::XAi, T>;
 
-impl<T> ImageGenerationModel<T> {
-    pub(crate) fn new(client: Client<T>, model: impl Into<String>) -> Self {
-        Self {
-            client,
-            model: model.into(),
-        }
-    }
-}
-
-impl<T> image_generation::ImageGenerationModel for ImageGenerationModel<T>
-where
-    T: HttpClientExt + Clone + Default + std::fmt::Debug + Send + 'static,
-{
+impl JsonImageGenerationProvider for super::client::XAi {
+    const IMAGE_GENERATION_PATH: &'static str = "/v1/images/generations";
+    const PROVIDER_NAME: &'static str = "xai";
     type Response = ImageGenerationResponse;
 
-    type Client = Client<T>;
-
-    fn make(client: &Self::Client, model: impl Into<String>) -> Self {
-        Self::new(client.clone(), model)
-    }
-
-    async fn image_generation(
-        &self,
+    fn image_generation_request_body(
+        model: &str,
         generation_request: ImageGenerationRequest,
-    ) -> Result<image_generation::ImageGenerationResponse<Self::Response>, ImageGenerationError>
-    {
+    ) -> Result<serde_json::Value, ImageGenerationError> {
         let mut request = json!({
-            "model": self.model,
+            "model": model,
             "prompt": generation_request.prompt,
             "response_format": "b64_json",
             "aspect_ratio": "1:1",
@@ -91,85 +66,9 @@ where
             merge_inplace(&mut request, additional_params);
         }
 
-        crate::providers::internal::image_generation::send_image_generation::<
-            _,
-            ApiResponse<ImageGenerationResponse>,
-        >(
-            &self.client,
-            self.client.post("/v1/images/generations")?,
-            request,
-        )
-        .await
+        Ok(request)
     }
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::client::image_generation::ImageGenerationClient;
-    use crate::image_generation::ImageGenerationModel as _;
-
-    fn request() -> ImageGenerationRequest {
-        ImageGenerationRequest {
-            prompt: "draw a cat".to_string(),
-            width: 256,
-            height: 256,
-            additional_params: None,
-        }
-    }
-
-    #[tokio::test]
-    async fn image_generation_non_success_preserves_status_and_body() {
-        use crate::test_utils::RecordingHttpClient;
-
-        let body = r#"{"error":"boom","code":"503"}"#;
-        let http_client =
-            RecordingHttpClient::with_error_response(http::StatusCode::SERVICE_UNAVAILABLE, body);
-        let client = crate::providers::xai::Client::builder()
-            .api_key("test-key")
-            .http_client(http_client)
-            .build()
-            .expect("build client");
-        let model = client.image_generation_model(GROK_IMAGINE_IMAGE);
-
-        let error = model
-            .image_generation(request())
-            .await
-            .expect_err("should fail with non-success status");
-
-        assert!(matches!(error, ImageGenerationError::HttpError(_)));
-        assert_eq!(
-            error.provider_response_status(),
-            Some(http::StatusCode::SERVICE_UNAVAILABLE)
-        );
-        assert_eq!(error.provider_response_body(), Some(body));
-    }
-
-    #[tokio::test]
-    async fn image_generation_2xx_error_envelope_preserves_status_and_body() {
-        use crate::test_utils::RecordingHttpClient;
-
-        // Deserializes to `ApiResponse::Err(ApiErrorResponse)` on a 200 OK.
-        let body = r#"{"error":"boom","code":"503"}"#;
-        let http_client = RecordingHttpClient::new(body);
-        let client = crate::providers::xai::Client::builder()
-            .api_key("test-key")
-            .http_client(http_client)
-            .build()
-            .expect("build client");
-        let model = client.image_generation_model(GROK_IMAGINE_IMAGE);
-
-        let error = model
-            .image_generation(request())
-            .await
-            .expect_err("should fail with provider error envelope");
-
-        match &error {
-            ImageGenerationError::ProviderResponse(stored) => {
-                assert_eq!(stored.body, body);
-                assert_eq!(stored.status, Some(http::StatusCode::OK));
-            }
-            other => panic!("expected ProviderResponse, got {other:?}"),
-        }
-    }
-}
+mod tests;

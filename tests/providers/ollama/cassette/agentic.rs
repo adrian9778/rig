@@ -15,9 +15,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use rig::agent::OutputMode;
-use rig::completion::Prompt;
 use rig::prelude::*;
-use rig::streaming::StreamingPrompt;
 use serde_json::json;
 
 use super::super::support::with_ollama_cassette;
@@ -75,7 +73,7 @@ async fn structured_output_raw_with_thinking() {
             .expect("structured output with thinking should succeed");
 
         let parsed: serde_json::Value =
-            serde_json::from_str(&response).expect("response should be schema JSON");
+            serde_json::from_str(&response.output).expect("response should be schema JSON");
         for key in ["title", "summary"] {
             assert!(
                 parsed
@@ -134,7 +132,7 @@ async fn structured_output_with_tools_and_thinking() {
                 .expect("agentic structured output should succeed");
 
             let parsed: serde_json::Value =
-                serde_json::from_str(&response).expect("response should be schema JSON");
+                serde_json::from_str(&response.output).expect("response should be schema JSON");
             for key in ["city", "summary"] {
                 assert!(
                     parsed
@@ -190,12 +188,12 @@ async fn streaming_structured_output_with_tools() {
                 .build();
 
             let mut stream = agent
-                .stream_prompt(
+                .prompt(
                     "What is the current weather in Tokyo? Use the get_weather tool, then return \
                      the city and a one-sentence summary of the conditions.",
                 )
                 .max_turns(5)
-                .await;
+                .stream();
             let response = collect_stream_final_response(&mut stream)
                 .await
                 .expect("streaming agentic structured output should succeed");
@@ -252,7 +250,7 @@ async fn native_mode_emits_structured_output() {
             .expect("native structured output should succeed");
 
         let parsed: serde_json::Value =
-            serde_json::from_str(&response).expect("response should be schema JSON");
+            serde_json::from_str(&response.output).expect("response should be schema JSON");
         for key in ["city", "summary"] {
             assert!(
                 parsed
@@ -290,7 +288,7 @@ async fn prompted_mode_returns_parseable_json() {
             .await
             .expect("prompted structured output should succeed");
 
-        let parsed: serde_json::Value = first_json_object(&response);
+        let parsed: serde_json::Value = first_json_object(&response.output);
         for key in ["title", "summary"] {
             assert!(
                 parsed

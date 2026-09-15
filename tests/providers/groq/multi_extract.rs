@@ -1,5 +1,7 @@
 //! Groq live coverage for batch multi-extract pipelines.
 
+use std::future::IntoFuture;
+
 use anyhow::Result;
 use futures::stream::{StreamExt, TryStreamExt};
 use rig::prelude::*;
@@ -33,17 +35,17 @@ async fn batch_multi_extract_chain() -> Result<()> {
     let client = groq::Client::from_env().expect("client should build");
     let names_extractor = client
         .extractor::<Names>(MULTI_EXTRACT_NAMES_MODEL)
-        .preamble("Extract names from the given text.")
+        .append_preamble("Extract names from the given text.")
         .retries(2)
         .build();
     let topics_extractor = client
         .extractor::<Topics>(MULTI_EXTRACT_TOPICS_MODEL)
-        .preamble("Extract topics from the given text.")
+        .append_preamble("Extract topics from the given text.")
         .retries(2)
         .build();
     let sentiment_extractor = client
         .extractor::<Sentiment>(MULTI_EXTRACT_SENTIMENT_MODEL)
-        .preamble("Extract sentiment and confidence from the given text.")
+        .append_preamble("Extract sentiment and confidence from the given text.")
         .retries(2)
         .build();
 
@@ -59,16 +61,16 @@ async fn batch_multi_extract_chain() -> Result<()> {
             let sentiment_extractor = &sentiment_extractor;
             async move {
                 let (names, topics, sentiment) = futures::try_join!(
-                    names_extractor.extract(text),
-                    topics_extractor.extract(text),
-                    sentiment_extractor.extract(text),
+                    names_extractor.extract(text).into_future(),
+                    topics_extractor.extract(text).into_future(),
+                    sentiment_extractor.extract(text).into_future(),
                 )?;
                 anyhow::Ok(format!(
                     "Extracted names: {}\nExtracted topics: {}\nExtracted sentiment: {} ({})",
-                    names.names.join(", "),
-                    topics.topics.join(", "),
-                    sentiment.sentiment,
-                    sentiment.confidence,
+                    names.output.names.join(", "),
+                    topics.output.topics.join(", "),
+                    sentiment.output.sentiment,
+                    sentiment.output.confidence,
                 ))
             }
         })

@@ -1,6 +1,6 @@
 use serde::{Deserialize, Deserializer, Serialize};
 
-use super::client::{MistralExt, Usage};
+use super::client::{Mistral, Usage};
 use crate::providers::openai;
 use crate::{
     completion::{self, CompletionError},
@@ -11,10 +11,6 @@ use crate::{
 pub const CODESTRAL: &str = "codestral-latest";
 /// The latest version of the `mistral-large` Mistral model
 pub const MISTRAL_LARGE: &str = "mistral-large-latest";
-/// The latest version of the `pixtral-large` Mistral multimodal model
-pub const PIXTRAL_LARGE: &str = "pixtral-large-latest";
-/// The latest version of the `mistral` Mistral multimodal model, trained on datasets from the Middle East & South Asia
-pub const MISTRAL_SABA: &str = "mistral-saba-latest";
 /// The latest version of the `mistral-3b` Mistral completions model
 pub const MINISTRAL_3B: &str = "ministral-3b-latest";
 /// The latest version of the `mistral-8b` Mistral completions model
@@ -22,16 +18,10 @@ pub const MINISTRAL_8B: &str = "ministral-8b-latest";
 
 /// The latest version of the `mistral-small` Mistral completions model
 pub const MISTRAL_SMALL: &str = "mistral-small-latest";
-/// The `24-09` version of the `pixtral-small` Mistral multimodal model
-pub const PIXTRAL_SMALL: &str = "pixtral-12b-2409";
-/// The `open-mistral-nemo` model
-pub const MISTRAL_NEMO: &str = "open-mistral-nemo";
-/// The `open-mistral-mamba` model
-pub const CODESTRAL_MAMBA: &str = "open-codestral-mamba";
 
 /// Mistral completion model, driven by the shared OpenAI Chat Completions path.
-pub type CompletionModel<H = reqwest::Client> =
-    openai::completion::GenericCompletionModel<MistralExt, H>;
+pub type CompletionModel<H = crate::http_client::BoxedHttpClient> =
+    openai::completion::GenericCompletionModel<Mistral, H>;
 
 /// Mistral's provider-native terminal streaming record: the value carried by
 /// the final item of the stream returned by `CompletionModel::raw_stream`.
@@ -61,6 +51,232 @@ where
         .unwrap_or_default())
 }
 
+/// Mistral's content-chunk tags. The API validates message content as a
+/// tagged union over `text`, `image_url`, `document_url`, `reference`, `bbox`,
+/// `file_url`, `input_audio`, `file`, `thinking`, `resource` and
+/// `resource_link`; the shared OpenAI-compatible message conversion can
+/// produce content for the five named here.
+const TEXT_CHUNK: &str = "text";
+const IMAGE_CHUNK: &str = "image_url";
+const AUDIO_CHUNK: &str = "input_audio";
+const DOCUMENT_CHUNK: &str = "document_url";
+const FILE_CHUNK: &str = "file";
+/// OpenAI's refusal part. Textual content, but under a key Mistral's chunk
+/// schema has no field for, so it is re-tagged rather than forwarded.
+const REFUSAL_TYPE: &str = "refusal";
+
+/// The text a part carries, under either of the two keys the shared
+/// OpenAI-compatible conversion can put it under.
+fn part_text(part: &serde_json::Value) -> Option<&str> {
+    part.get(TEXT_CHUNK)
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| part.get(REFUSAL_TYPE).and_then(serde_json::Value::as_str))
+}
+
+/// Whether a serialized content part is purely textual, and so belongs in the
+/// plain-string form rather than a chunk array.
+///
+/// Decided on the `type` tag first, and only on the keys for a part that
+/// carries no tag. Deciding on the keys alone — as the text-only flattening
+/// this replaces does — would let a part that names a chunk kind *and* happens
+/// to carry a `text` key be flattened away, which is the same silent drop
+/// this whole path exists to prevent.
+fn is_text_part(part: &serde_json::Value) -> bool {
+    match part.get("type").and_then(serde_json::Value::as_str) {
+        Some(TEXT_CHUNK | REFUSAL_TYPE) => true,
+        Some(_) => false,
+        None => part_text(part).is_some(),
+    }
+}
+
+fn unsupported_content_error(what: &str) -> CompletionError {
+    crate::message::MessageError::ConversionError(format!(
+        "Mistral cannot carry {what}. Mistral messages accept text, `{IMAGE_CHUNK}`, \
+         `{AUDIO_CHUNK}`, `{DOCUMENT_CHUNK}` and `{FILE_CHUNK}` content; convert the content \
+         to one of those before sending it."
+    ))
+    .into()
+}
+
+/// Convert OpenAI's `{"type": "file", "file": {…}}` part into the Mistral
+/// chunk carrying the same document.
+///
+/// Inline bytes become `document_url`, which reads the base64 `data:` URI the
+/// shared conversion already built for `file_data`, and carries the filename
+/// in its own optional `document_name` field. An uploaded-file reference
+/// becomes Mistral's `file` chunk, which names the id at the top level rather
+/// than nesting it under `file` as OpenAI does — sending OpenAI's nesting is
+/// rejected twice over, for a missing `file_id` and for a forbidden extra
+/// `file`, since every Mistral chunk forbids unknown fields.
+fn file_part_to_mistral_chunk(
+    part: &serde_json::Value,
+) -> Result<serde_json::Value, CompletionError> {
+    let file = part.get(FILE_CHUNK);
+    let field = |name: &str| {
+        file.and_then(|file| file.get(name))
+            .and_then(serde_json::Value::as_str)
+    };
+
+    // Already a Mistral file chunk (`file_id` at the top level, as this
+    // function emits): pass it through so finalizing an already-finalized body
+    // is a no-op rather than an error about content rig itself built.
+    if let Some(file_id) = part.get("file_id").and_then(serde_json::Value::as_str) {
+        return Ok(serde_json::json!({"type": FILE_CHUNK, "file_id": file_id}));
+    }
+
+    if let Some(data) = field("file_data") {
+        // `document_name` is Mistral's own optional filename field; it is left
+        // out entirely rather than sent as null when the part has no filename.
+        Ok(match field("filename") {
+            Some(filename) => serde_json::json!({
+                "type": DOCUMENT_CHUNK,
+                DOCUMENT_CHUNK: data,
+                "document_name": filename,
+            }),
+            None => serde_json::json!({"type": DOCUMENT_CHUNK, DOCUMENT_CHUNK: data}),
+        })
+    } else if let Some(file_id) = field("file_id") {
+        Ok(serde_json::json!({"type": FILE_CHUNK, "file_id": file_id}))
+    } else {
+        Err(unsupported_content_error(
+            "a file content part carrying neither `file_data` nor `file_id`",
+        ))
+    }
+}
+
+/// Rewrite an `input_audio` part into Mistral's canonical audio chunk, whose
+/// payload is the base64 string itself.
+///
+/// Mistral currently also accepts the `{data, format}` object the shared
+/// OpenAI-compatible conversion produces — its schema flattens the object and
+/// discards `format` — but the bare string is the form its published schema
+/// documents, so that is what rig sends. Nothing is lost: a deliberately wrong
+/// `format` changes no result, and a `format` placed as a *sibling* of
+/// `input_audio` is rejected outright.
+fn audio_part_to_mistral_chunk(
+    part: &serde_json::Value,
+) -> Result<serde_json::Value, CompletionError> {
+    let payload = part.get(AUDIO_CHUNK).ok_or_else(|| {
+        unsupported_content_error("an audio content part carrying no `input_audio` payload")
+    })?;
+
+    let data = match payload {
+        serde_json::Value::String(data) => data.as_str(),
+        payload => payload
+            .get("data")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| {
+                unsupported_content_error(
+                    "an audio content part whose `input_audio` payload is not base64 data",
+                )
+            })?,
+    };
+
+    Ok(serde_json::json!({"type": AUDIO_CHUNK, AUDIO_CHUNK: data}))
+}
+
+/// Render one serialized content part as the Mistral chunk that carries it.
+///
+/// Dispatched on the `type` tag, which the shared OpenAI-compatible conversion
+/// always emits, so a part naming a chunk kind is converted as that kind
+/// regardless of what other keys it carries.
+fn into_mistral_chunk(part: &serde_json::Value) -> Result<serde_json::Value, CompletionError> {
+    /// Text and refusal parts are both re-tagged as `text`: Mistral's chunk
+    /// schema has no `refusal` field, and every chunk forbids unknown keys.
+    fn text_chunk(part: &serde_json::Value) -> Result<serde_json::Value, CompletionError> {
+        let text = part_text(part)
+            .ok_or_else(|| unsupported_content_error("a text content part carrying no text"))?;
+        Ok(serde_json::json!({"type": TEXT_CHUNK, TEXT_CHUNK: text}))
+    }
+
+    match part.get("type").and_then(serde_json::Value::as_str) {
+        Some(TEXT_CHUNK | REFUSAL_TYPE) => text_chunk(part),
+        // The payload needs no reshaping — Mistral's image chunk takes the
+        // `{url, detail}` object rig sends as readily as a bare URL string, and
+        // reads a base64 `data:` URI in either, with `detail` accepting exactly
+        // the `low`/`auto`/`high` range [`openai::completion::ImageDetail`]
+        // serializes. It is still rebuilt rather than forwarded, because every
+        // Mistral chunk forbids unknown fields: a stray sibling key riding on
+        // the part would 422 the whole request.
+        Some(IMAGE_CHUNK) => {
+            let image = part.get(IMAGE_CHUNK).ok_or_else(|| {
+                unsupported_content_error("an image content part carrying no `image_url` payload")
+            })?;
+            Ok(serde_json::json!({"type": IMAGE_CHUNK, IMAGE_CHUNK: image}))
+        }
+        Some(AUDIO_CHUNK) => audio_part_to_mistral_chunk(part),
+        Some(FILE_CHUNK) => file_part_to_mistral_chunk(part),
+        // Already a Mistral document chunk — see `file_part_to_mistral_chunk`
+        // on why an already-converted part passes through.
+        Some(DOCUMENT_CHUNK) => {
+            let url = part.get(DOCUMENT_CHUNK).ok_or_else(|| {
+                unsupported_content_error("a document content part carrying no `document_url`")
+            })?;
+            Ok(match part.get("document_name") {
+                Some(name) => serde_json::json!({
+                    "type": DOCUMENT_CHUNK, DOCUMENT_CHUNK: url, "document_name": name,
+                }),
+                None => serde_json::json!({"type": DOCUMENT_CHUNK, DOCUMENT_CHUNK: url}),
+            })
+        }
+        Some(kind) => Err(unsupported_content_error(&format!(
+            "`{kind}` message content"
+        ))),
+        // Untagged, but textual: the shared flattening would have taken it, so
+        // it converts rather than failing.
+        None if part_text(part).is_some() => text_chunk(part),
+        None => Err(unsupported_content_error("untyped message content")),
+    }
+}
+
+/// Rewrite one serialized message `content` value into Mistral's message
+/// content schema.
+///
+/// Mistral accepts content as either a plain string or an array of typed
+/// chunks. Text-only content keeps the plain-string form it has always taken.
+/// Content carrying anything else keeps the array, with each part rendered the
+/// way Mistral's schema names it, instead of being flattened away: the
+/// text-only flattening this replaces kept only parts with a `text`/`refusal`
+/// key, so an attached image, document or audio clip was dropped from the
+/// request and the caller got an ordinary completion answering a prompt it
+/// never sent (#2290).
+///
+/// Content Mistral has no chunk for — video, and any part type a future
+/// conversion adds — fails here rather than being silently removed. The one
+/// exception is content whose parts are *all* tagged `text`/`refusal`: that
+/// takes the flattening path, which drops a part carrying no string payload
+/// exactly as it always has, rather than inventing a new failure for a shape
+/// rig's own conversion cannot produce.
+pub(super) fn normalize_request_content(
+    content: &mut serde_json::Value,
+) -> Result<(), CompletionError> {
+    let Some(parts) = content.as_array() else {
+        return Ok(());
+    };
+
+    if parts.iter().all(is_text_part) {
+        // Flattened unconditionally rather than under `only_if_all_text`, so
+        // the helper does not re-decide: it judges per key while the guard
+        // above judges on the type tag, and the two disagree for a malformed
+        // part such as `{"type": "text"}` carrying no `text`. Letting the
+        // helper decline would leave that content as an array of chunks
+        // Mistral cannot read; flattening it reproduces what rig sent before.
+        openai::completion::flatten_text_content_parts(content, "", false);
+        return Ok(());
+    }
+
+    // Re-borrowed rather than held across the branch above, which needs
+    // `content` itself. The array-ness was just established, so the `else` is
+    // unreachable — expressed as a no-op instead of an unwrap.
+    if let Some(parts) = content.as_array_mut() {
+        for part in parts {
+            *part = into_mistral_chunk(part)?;
+        }
+    }
+
+    Ok(())
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Choice {
     pub index: usize,
@@ -81,7 +297,7 @@ pub enum Message {
         content: String,
         #[serde(
             default,
-            deserialize_with = "json_utils::null_or_vec",
+            deserialize_with = "json_utils::null_or_default",
             skip_serializing_if = "Vec::is_empty"
         )]
         tool_calls: Vec<ToolCall>,
@@ -131,27 +347,25 @@ pub struct CompletionResponse {
     pub created: u64,
     pub model: String,
     pub system_fingerprint: Option<String>,
+    #[serde(
+        deserialize_with = "crate::providers::internal::openai_chat_completions_compatible::deserialize_choices_dropping_incomplete_tool_calls"
+    )]
     pub choices: Vec<Choice>,
     pub usage: Option<Usage>,
 }
 
 impl crate::telemetry::ProviderResponseExt for CompletionResponse {
-    type OutputMessage = Choice;
     type Usage = Usage;
 
-    fn get_response_id(&self) -> Option<String> {
-        Some(self.id.clone())
+    fn response_id(&self) -> Option<&str> {
+        Some(self.id.as_str())
     }
 
-    fn get_response_model_name(&self) -> Option<String> {
-        Some(self.model.clone())
+    fn response_model_name(&self) -> Option<&str> {
+        Some(self.model.as_str())
     }
 
-    fn get_output_messages(&self) -> Vec<Self::OutputMessage> {
-        self.choices.clone()
-    }
-
-    fn get_text_response(&self) -> Option<String> {
+    fn text_response(&self) -> Option<String> {
         let res = self
             .choices
             .iter()
@@ -160,7 +374,7 @@ impl crate::telemetry::ProviderResponseExt for CompletionResponse {
                     if content.is_empty() {
                         None
                     } else {
-                        Some(content.to_string())
+                        Some(content.clone())
                     }
                 }
                 _ => None,
@@ -171,7 +385,7 @@ impl crate::telemetry::ProviderResponseExt for CompletionResponse {
         if res.is_empty() { None } else { Some(res) }
     }
 
-    fn get_usage(&self) -> Option<Self::Usage> {
+    fn usage(&self) -> Option<Self::Usage> {
         self.usage.clone()
     }
 }
@@ -220,165 +434,4 @@ impl crate::completion::NormalizeCompletionResponse for CompletionResponse {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::providers::openai::completion::OpenAICompatibleProvider;
-
-    #[test]
-    fn deserializes_response_with_array_and_null_content() {
-        let data = r#"{
-            "id": "cmpl-1",
-            "object": "chat.completion",
-            "created": 1,
-            "model": "mistral-small-latest",
-            "system_fingerprint": null,
-            "choices": [
-                {
-                    "index": 0,
-                    "message": {
-                        "role": "assistant",
-                        "content": [{"type": "text", "text": "Hello"}, {"type": "text", "text": " world"}]
-                    },
-                    "logprobs": null,
-                    "finish_reason": "stop"
-                },
-                {
-                    "index": 1,
-                    "message": {
-                        "role": "assistant",
-                        "content": null,
-                        "tool_calls": [{
-                            "id": "call_1",
-                            "type": "function",
-                            "function": {"name": "add", "arguments": "{\"x\":1,\"y\":2}"}
-                        }]
-                    },
-                    "logprobs": null,
-                    "finish_reason": "tool_calls"
-                }
-            ],
-            "usage": {"prompt_tokens": 1, "completion_tokens": 2, "total_tokens": 3}
-        }"#;
-
-        let response: CompletionResponse =
-            serde_json::from_str(data).expect("response should deserialize");
-        match &response.choices[0].message {
-            Message::Assistant { content, .. } => assert_eq!(content, "Hello world"),
-            _ => panic!("expected assistant message"),
-        }
-        match &response.choices[1].message {
-            Message::Assistant {
-                content,
-                tool_calls,
-                ..
-            } => {
-                assert_eq!(content, "");
-                assert_eq!(tool_calls[0].function.name, "add");
-            }
-            _ => panic!("expected assistant message"),
-        }
-    }
-
-    #[test]
-    fn usage_prefers_structured_cached_tokens_and_falls_back() {
-        let structured: Usage = serde_json::from_value(serde_json::json!({
-            "prompt_tokens": 10,
-            "completion_tokens": 5,
-            "total_tokens": 15,
-            "num_cached_tokens": 2,
-            "prompt_tokens_details": {"cached_tokens": 7}
-        }))
-        .expect("usage should deserialize");
-        assert_eq!(structured.cached_tokens(), 7);
-
-        let fallback: Usage = serde_json::from_value(serde_json::json!({
-            "prompt_tokens": 10,
-            "completion_tokens": 5,
-            "total_tokens": 15,
-            "num_cached_tokens": 2
-        }))
-        .expect("usage should deserialize");
-        assert_eq!(fallback.cached_tokens(), 2);
-
-        // The singular alias form used by some Mistral responses.
-        let aliased: Usage = serde_json::from_value(serde_json::json!({
-            "prompt_tokens": 10,
-            "completion_tokens": 5,
-            "total_tokens": 15,
-            "prompt_token_details": {"cached_tokens": 4}
-        }))
-        .expect("usage should deserialize");
-        assert_eq!(aliased.cached_tokens(), 4);
-    }
-
-    #[test]
-    fn finalize_rewrites_required_tool_choice_to_any() {
-        let mut body = serde_json::json!({
-            "model": "mistral-small-latest",
-            "messages": [{"role": "user", "content": "hi"}],
-            "tool_choice": "required"
-        });
-
-        MistralExt
-            .finalize_request_body(&mut body)
-            .expect("finalize should succeed");
-
-        assert_eq!(body["tool_choice"], "any");
-    }
-
-    #[test]
-    fn finalize_preserves_specific_function_tool_choice() {
-        let mut body = serde_json::json!({
-            "model": "mistral-small-latest",
-            "messages": [{"role": "user", "content": "hi"}],
-            "tool_choice": {"type": "function", "function": {"name": "beta"}}
-        });
-
-        MistralExt
-            .finalize_request_body(&mut body)
-            .expect("finalize should succeed");
-
-        assert_eq!(
-            body["tool_choice"],
-            serde_json::json!({"type": "function", "function": {"name": "beta"}})
-        );
-    }
-
-    #[test]
-    fn finalize_flattens_assistant_history_and_adds_prefix() {
-        let mut body = serde_json::json!({
-            "model": "mistral-small-latest",
-            "messages": [
-                {"role": "system", "content": [{"type": "text", "text": "Be brief."}]},
-                {"role": "user", "content": "hi"},
-                {
-                    "role": "assistant",
-                    "content": [{"type": "text", "text": "Hello."}],
-                    "reasoning_content": "hidden thoughts"
-                },
-                {
-                    "role": "assistant",
-                    "tool_calls": [{
-                        "id": "call_1",
-                        "type": "function",
-                        "function": {"name": "add", "arguments": "{}"}
-                    }]
-                }
-            ]
-        });
-
-        MistralExt
-            .finalize_request_body(&mut body)
-            .expect("finalize should succeed");
-
-        assert_eq!(body["messages"][0]["content"], "Be brief.");
-        assert_eq!(body["messages"][2]["content"], "Hello.");
-        assert_eq!(body["messages"][2]["prefix"], false);
-        assert!(
-            body["messages"][2].get("reasoning_content").is_none(),
-            "Mistral rejects unknown assistant fields; reasoning must be stripped"
-        );
-        assert_eq!(body["messages"][3]["content"], "");
-        assert_eq!(body["messages"][3]["prefix"], false);
-    }
-}
+mod tests;

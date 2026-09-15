@@ -11,14 +11,14 @@ use rig::agent::run::{
     StreamedTurnEvent,
 };
 use rig::agent::{
-    AgentHook, InvalidToolCallAction, MultiTurnStreamItem, StreamingError,
-    ToolCall as ToolCallEvent, ToolCallAction,
+    AgentHook, DispatchAction, DispatchEvent, InvalidToolCallAction, MultiTurnStreamItem,
+    StreamingError,
 };
 use rig::completion::{PromptError, Usage};
 use rig::message::{Message, ToolChoice, ToolResult};
 use rig::prelude::*;
 use rig::providers::gemini;
-use rig::streaming::{StreamedAssistantContent, StreamingPrompt};
+use rig::streaming::{Delta, StreamEvent};
 use rig_agent::test_utils::{validate_cancelled_failure, validate_max_turns_failure};
 
 use super::super::agent_run_support::{
@@ -72,16 +72,26 @@ async fn run_streamed_turn(
         while let Some(event) = events.pop_front() {
             match event {
                 StreamedTurnEvent::EmitIngested => {
-                    if let StreamedAssistantContent::Text(text) = &item {
-                        collected_text.push_str(&text.text);
+                    if let StreamEvent::BlockDelta {
+                        delta: Delta::Text { text },
+                        ..
+                    } = &item
+                    {
+                        collected_text.push_str(text);
                     }
                 }
                 StreamedTurnEvent::EmitToolCallDelta { .. } => {}
-                StreamedTurnEvent::Completed { usage, .. } => {
+                StreamedTurnEvent::Completed {
+                    usage,
+                    finish_reason,
+                    ..
+                } => {
                     if !recorded {
                         run.record_streamed_completion_call(
                             usage,
                             rig::completion::ResponseIdentity::default(),
+                            finish_reason,
+                            serde_json::Value::Null,
                         )
                         .expect("completion call should record while the turn is pending");
                         recorded = true;
@@ -102,7 +112,8 @@ async fn run_streamed_turn(
                         Ok(resolution) => {
                             let replayed = assembler.resolve_pending_invalid(&resolution);
                             match resolution {
-                                StreamedResolution::Repaired { .. } => {
+                                StreamedResolution::Repaired { .. }
+                                | StreamedResolution::Ignored => {
                                     events.extend(replayed);
                                 }
                                 StreamedResolution::TurnAbandoned {
@@ -110,7 +121,7 @@ async fn run_streamed_turn(
                                 } => {
                                     let drained_usage = drain_stream_usage(&mut stream).await;
                                     if !recorded {
-                                        run.record_streamed_completion_call(drained_usage, rig::completion::ResponseIdentity::default()).expect(
+                                        run.record_streamed_completion_call(drained_usage, rig::completion::ResponseIdentity::default(), None, serde_json::Value::Null).expect(
                                             "abandoned turns may still record their completion call",
                                         );
                                     }
@@ -134,10 +145,12 @@ async fn run_streamed_turn(
         run.record_streamed_completion_call(
             Usage::new(),
             rig::completion::ResponseIdentity::default(),
+            None,
+            serde_json::Value::Null,
         )
         .expect("turns without provider usage still record a completion call");
     }
-    let streamed_turn = assembler.finish(stream.message_id.clone(), &stream.choice);
+    let streamed_turn = assembler.finish(stream.message_id.clone(), &stream.snapshot());
     run.streamed_turn(streamed_turn)?;
     Ok(TurnEnd::Finished)
 }
@@ -146,7 +159,7 @@ async fn drain_stream_usage(stream: &mut rig::streaming::StreamingCompletionResp
 where
 {
     while let Some(item) = stream.next().await {
-        if let Ok(StreamedAssistantContent::Final(final_response)) = item {
+        if let Ok(StreamEvent::Final(final_response)) = item {
             return final_response.usage;
         }
     }
@@ -162,7 +175,7 @@ async fn streamed_hand_driven_multi_turn_run_completes() {
             // record against.
             let mut fresh = AgentRun::new("unused");
             assert!(
-                fresh.record_streamed_completion_call(Usage::new(), rig::completion::ResponseIdentity::default()).is_err(),
+                fresh.record_streamed_completion_call(Usage::new(), rig::completion::ResponseIdentity::default(), None, serde_json::Value::Null).is_err(),
                 "a phantom completion call must be rejected on a fresh run"
             );
 
@@ -203,10 +216,15 @@ async fn streamed_hand_driven_multi_turn_run_completes() {
                     }
                     AgentRunStep::CallTools { calls } => {
                         for call in &calls {
-                            assert!(
-                                call.internal_call_id.is_some(),
-                                "streamed turns persist internal call ids: {call:?}"
-                            );
+                            // A streamed turn's call carries the block id it
+                            // arrived under: the wire id when the provider
+                            // issued one, else the id the adapter minted.
+                            match &call.block_id {
+                                rig::streaming::BlockId::Wire(id) => {
+                                    assert_eq!(call.tool_call.provider.as_ref().map(|provider| provider.call_id.as_str()), Some(id.as_str()), "{call:?}");
+                                }
+                                rig::streaming::BlockId::Minted { .. } => {}
+                            }
                         }
                         run.tool_results(execute_pending_calls(&calls))
                             .expect("tool results should be accepted");
@@ -232,7 +250,7 @@ async fn streamed_hand_driven_multi_turn_run_completes() {
                 "cassette-recorded usage should be non-zero"
             );
 
-            let messages = response.messages.clone().expect("run reports its messages");
+            let messages = response.messages.expect("run reports its messages");
             assert!(history_has_assistant_tool_call(&messages, "add"));
             assert!(history_has_assistant_tool_call(&messages, "subtract"));
             // The assembler records streamed turns in canonical replay order.
@@ -359,7 +377,7 @@ async fn streamed_repair_continues_the_same_stream() {
 
             assert!(repaired, "the model should call a tool that gets repaired");
             assert_mentions_expected_number(&response.output, 5);
-            let messages = response.messages.clone().expect("run reports its messages");
+            let messages = response.messages.expect("run reports its messages");
             let recorded: Vec<String> = messages
                 .iter()
                 .flat_map(assistant_tool_call_names)
@@ -444,7 +462,7 @@ async fn streamed_skip_abandons_the_turn_and_recovers() {
                                 // name — the synthetic result answers the
                                 // call's minted correlation handle and
                                 // records no provider-issued id.
-                                assert!(!tool_result.call.as_str().is_empty());
+                                assert!(tool_result.call.is_generated());
                                 assert!(tool_result.provider.is_none());
                                 abandoned = true;
                             }
@@ -485,9 +503,9 @@ async fn builtin_streaming_max_turns_error_carries_pending_message() {
                 .build();
 
             let mut stream = agent
-                .stream_prompt("What is 21 + 21? Use the add tool.")
+                .prompt("What is 21 + 21? Use the add tool.")
                 .max_turns(2)
-                .await;
+                .stream();
 
             let mut prompt_error = None;
             while let Some(item) = stream.next().await {
@@ -533,12 +551,15 @@ async fn builtin_streaming_max_turns_error_carries_pending_message() {
 struct CancelOnToolCall;
 
 impl AgentHook for CancelOnToolCall {
-    async fn on_tool_call(
+    async fn on_dispatch(
         &self,
         _ctx: &rig::agent::HookContext,
-        _event: ToolCallEvent<'_>,
-    ) -> ToolCallAction {
-        ToolCallAction::stop("cancelled by test hook")
+        event: DispatchEvent<'_>,
+    ) -> DispatchAction {
+        if event.tool_name().is_none() {
+            return DispatchAction::proceed();
+        }
+        DispatchAction::stop("cancelled by test hook")
     }
 }
 
@@ -555,10 +576,10 @@ async fn builtin_streaming_cancellation_history_includes_assistant_turn() {
                 .build();
 
             let mut stream = agent
-                .stream_prompt("What is 21 + 21? Use the add tool.")
+                .prompt("What is 21 + 21? Use the add tool.")
                 .add_hook(CancelOnToolCall)
                 .max_turns(2)
-                .await;
+                .stream();
 
             let mut prompt_error = None;
             let mut saw_final = false;

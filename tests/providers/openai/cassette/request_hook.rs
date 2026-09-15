@@ -5,10 +5,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use rig::agent::{
-    AgentHook, CompletionCallAction, CompletionCallEvent, CompletionResponseEvent,
-    ObservationAction,
+    AgentHook, CompletionCallAction, CompletionCallEvent, OutcomeAction, OutcomeEvent,
 };
-use rig::completion::{Message, Prompt};
+use rig::completion::Message;
 use rig::message::UserContent;
 use rig::prelude::*;
 use rig::providers::openai;
@@ -52,18 +51,21 @@ impl AgentHook for SessionIdHook<'_> {
         }
     }
 
-    async fn on_completion_response(
+    async fn on_outcome(
         &self,
         _ctx: &rig::agent::HookContext,
-        event: CompletionResponseEvent<'_>,
-    ) -> ObservationAction {
+        event: OutcomeEvent<'_>,
+    ) -> OutcomeAction {
+        let Some(response) = event.completion() else {
+            return OutcomeAction::proceed();
+        };
         self.response_calls.fetch_add(1, Ordering::SeqCst);
         match self.seen_response.lock() {
             Ok(mut seen_response) => {
-                *seen_response = Some(format!("{:?}", event.content));
-                ObservationAction::continue_run()
+                *seen_response = Some(format!("{:?}", response.choice));
+                OutcomeAction::proceed()
             }
-            Err(_) => ObservationAction::stop("response hook state unavailable"),
+            Err(_) => OutcomeAction::stop("response hook state unavailable"),
         }
     }
 }
@@ -86,7 +88,11 @@ async fn request_hook_records_prompt_and_response() -> Result<()> {
                 seen_response: Arc::new(Mutex::new(None)),
             };
 
-            let response = agent.prompt("Entertain me!").add_hook(hook.clone()).await?;
+            let response = agent
+                .prompt("Entertain me!")
+                .add_hook(hook.clone())
+                .await?
+                .output;
 
             assert_nonempty_response(&response);
             anyhow::ensure!(hook.prompt_calls.load(Ordering::SeqCst) == 1);

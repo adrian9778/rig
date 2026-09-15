@@ -8,7 +8,7 @@
 //! Run cassette tests in replay mode by default, or set
 //! `RIG_PROVIDER_TEST_MODE=record` to record against the real provider.
 
-use rig::completion::{Chat, CompletionModel, Message, ToolDefinition};
+use rig::completion::{CompletionModel, Message, ToolDefinition};
 use rig::message::AssistantContent;
 use rig::prelude::*;
 use rig::providers::gemini;
@@ -126,7 +126,7 @@ fn assert_expected_plan_trip_arguments(arguments: &serde_json::Value) {
         "nested city should survive the wire format: {arguments:?}"
     );
     assert_eq!(
-        itinerary.get("days").and_then(|value| value.as_u64()),
+        itinerary.get("days").and_then(serde_json::Value::as_u64),
         Some(3),
         "nested integer should survive the wire format: {arguments:?}"
     );
@@ -144,7 +144,7 @@ fn assert_expected_plan_trip_arguments(arguments: &serde_json::Value) {
         "doubly nested string should survive the wire format: {arguments:?}"
     );
     assert_eq!(
-        lodging.get("rooms").and_then(|value| value.as_u64()),
+        lodging.get("rooms").and_then(serde_json::Value::as_u64),
         Some(2),
         "doubly nested integer should survive the wire format: {arguments:?}"
     );
@@ -170,7 +170,7 @@ async fn nested_arguments_roundtrip_nonstreaming() {
                 .expect("nested-args tool chat should succeed");
 
             assert!(
-                result.contains("SAKURA-77"),
+                result.output.contains("SAKURA-77"),
                 "final answer should repeat the tool's confirmation code, got {result:?}"
             );
 

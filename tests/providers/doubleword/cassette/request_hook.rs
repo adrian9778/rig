@@ -4,10 +4,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use rig::agent::{
-    AgentHook, CompletionCallAction, CompletionCallEvent, CompletionResponseEvent,
-    ObservationAction,
+    AgentHook, CompletionCallAction, CompletionCallEvent, OutcomeAction, OutcomeEvent,
 };
-use rig::completion::{Message, Prompt};
+use rig::completion::Message;
 use rig::message::UserContent;
 use rig::prelude::*;
 
@@ -43,13 +42,15 @@ impl AgentHook for ObservingHook {
         CompletionCallAction::continue_run()
     }
 
-    async fn on_completion_response(
+    async fn on_outcome(
         &self,
         _ctx: &rig::agent::HookContext,
-        _event: CompletionResponseEvent<'_>,
-    ) -> ObservationAction {
-        self.response_calls.fetch_add(1, Ordering::SeqCst);
-        ObservationAction::continue_run()
+        event: OutcomeEvent<'_>,
+    ) -> OutcomeAction {
+        if event.completion().is_some() {
+            self.response_calls.fetch_add(1, Ordering::SeqCst);
+        }
+        OutcomeAction::proceed()
     }
 }
 
@@ -66,7 +67,7 @@ async fn request_hook_records_prompt_and_response() {
                 .add_hook(hook.clone())
                 .await
                 .expect("hooked prompt should succeed");
-            assert_nonempty_response(&response);
+            assert_nonempty_response(&response.output);
             assert_eq!(hook.prompt_calls.load(Ordering::SeqCst), 1);
             assert_eq!(hook.response_calls.load(Ordering::SeqCst), 1);
             assert!(

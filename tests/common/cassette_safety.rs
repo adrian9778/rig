@@ -5,8 +5,7 @@ use std::fs;
 use std::path::Path;
 use std::path::PathBuf;
 
-use syn::visit::{self, Visit};
-use syn::{Expr, ExprCall, ExprLit, ItemFn, Lit};
+use syn::{Expr, ExprLit, Lit};
 
 const CASSETTE_ROOT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/cassettes");
 
@@ -22,12 +21,33 @@ const PROVIDER_CASSETTE_SUITES: &[ProviderCassetteSuite] = &[
         source_dir: "tests/providers/openai/cassette",
         wrapper_names: &[
             "with_openai_cassette",
+            "with_openai_corpus_retrieval_cassette",
+            "with_openai_corpus_output_cassette",
+            "with_openai_corpus_host_cassette",
+            "with_openai_corpus_delta_cassette",
+            "with_openai_corpus_breadth_cassette",
+            "with_openai_lifecycle_cassette",
+            "with_openai_prompt_caching_cassette",
+            "with_openai_completions_prompt_caching_cassette",
+            "with_openai_turn_metadata_cassette",
             "with_openai_cassette_bogus_key",
             "with_openai_completions_cassette",
             "with_openai_cassette_result",
             "with_openai_completions_cassette_result",
             "with_openai_vllm_cassette",
             "with_local_reasoning_content_cassette",
+            "with_openai_refusal_cassette",
+            "with_openai_max_tokens_cassette",
+            "with_openai_image_params_cassette",
+            "with_openai_truncation_cassette",
+            "with_openai_chat_stream_logprobs_cassette_result",
+            "with_openai_tool_truncation_cassette_result",
+            "with_openai_tool_lifecycle_cassette_result",
+            "with_openai_terminal_metadata_cassette_result",
+            "with_openai_history_roundtrip_cassette_result",
+            "with_openai_transcription_cassette",
+            "with_openai_audio_cassette",
+            "with_openai_websocket_cassette",
         ],
     },
     ProviderCassetteSuite {
@@ -53,10 +73,27 @@ const PROVIDER_CASSETTE_SUITES: &[ProviderCassetteSuite] = &[
         source_dir: "tests/providers/anthropic/cassette",
         wrapper_names: &[
             "with_anthropic_cassette",
+            "with_anthropic_lifecycle_cassette",
+            "with_anthropic_turn_metadata_cassette",
             "with_anthropic_cassette_result",
             "with_anthropic_cassette_bogus_key",
             "with_anthropic_files_cassette",
             "with_anthropic_gateway_cassette",
+            "with_anthropic_stop_sequence_cassette",
+            "with_anthropic_empty_stop_cassette",
+            "with_anthropic_reasoning_usage_cassette",
+            "with_anthropic_corpus_request_shape_cassette",
+            "with_anthropic_corpus_hooks_cassette",
+            "with_anthropic_corpus_serving_cassette",
+            "with_anthropic_corpus_outcome_cassette",
+            "with_anthropic_corpus_endings_cassette",
+            "with_anthropic_corpus_output_cassette",
+            "with_anthropic_corpus_host_cassette",
+            "with_anthropic_corpus_memory_cassette",
+            "with_anthropic_corpus_shaping_cassette",
+            "with_anthropic_corpus_oracle_cassette",
+            "with_anthropic_corpus_causal_cassette",
+            "with_anthropic_corpus_layers_cassette",
         ],
     },
     ProviderCassetteSuite {
@@ -68,19 +105,26 @@ const PROVIDER_CASSETTE_SUITES: &[ProviderCassetteSuite] = &[
         provider: "doubleword",
         source_dir: "tests/providers/doubleword/cassette",
         wrapper_names: &[
+            "with_doubleword_prompt_caching_cassette",
             "with_doubleword_cassette",
+            "with_doubleword_bogus_key_cassette",
             "with_doubleword_cassette_result",
+            "with_doubleword_embedding_cassette",
         ],
     },
     ProviderCassetteSuite {
         provider: "cohere",
         source_dir: "tests/providers/cohere/cassette",
-        wrapper_names: &["with_cohere_cassette"],
+        wrapper_names: &[
+            "with_cohere_cassette",
+            "with_cohere_prompt_caching_cassette",
+        ],
     },
     ProviderCassetteSuite {
         provider: "venice",
         source_dir: "tests/providers/venice/cassette",
         wrapper_names: &[
+            "with_venice_prompt_caching_cassette",
             "with_venice_cassette",
             "with_venice_cassette_result",
             "with_venice_direct_cassette",
@@ -90,9 +134,18 @@ const PROVIDER_CASSETTE_SUITES: &[ProviderCassetteSuite] = &[
         provider: "gemini",
         source_dir: "tests/providers/gemini/cassette",
         wrapper_names: &[
+            "with_gemini_prompt_caching_cassette",
             "with_gemini_cassette",
+            "with_gemini_corpus_retrieval_cassette",
+            "with_gemini_corpus_delta_cassette",
+            "with_gemini_corpus_breadth_cassette",
+            "with_gemini_lifecycle_cassette",
+            "with_gemini_turn_metadata_cassette",
             "with_gemini_cassette_bogus_key",
+            "with_gemini_code_execution_cassette",
             "with_gemini_interactions_cassette",
+            "with_gemini_stream_terminal_cassette",
+            "with_gemini_thought_text_cassette",
         ],
     },
     ProviderCassetteSuite {
@@ -101,14 +154,35 @@ const PROVIDER_CASSETTE_SUITES: &[ProviderCassetteSuite] = &[
         wrapper_names: &["with_ollama_cassette"],
     },
     ProviderCassetteSuite {
-        provider: "llamafile",
-        source_dir: "tests/providers/llamafile/cassette",
-        wrapper_names: &["with_llamafile_cassette"],
+        provider: "llamacpp",
+        source_dir: "tests/providers/llamacpp/cassette",
+        wrapper_names: &[
+            "with_llamacpp_cassette",
+            "with_llamacpp_cassette_result",
+            "with_llamacpp_bare_openai_cassette",
+            "with_llamacpp_embeddings_cassette",
+            "with_llamacpp_vision_cassette",
+            "with_llamacpp_small_context_cassette",
+            "with_llamacpp_no_jinja_cassette",
+            "with_llamacpp_rerank_cassette",
+            "with_llamacpp_pooling_none_cassette",
+            "with_llamacpp_causal_embeddings_cassette",
+            "with_llamacpp_competent_cassette",
+            "with_llamacpp_llama_family_cassette",
+            "with_llamacpp_mistral_family_cassette",
+            "with_llamacpp_gemma_family_cassette",
+            "with_llamacpp_prompt_caching_cassette",
+            "with_llamacpp_large_vision_cassette",
+            "with_llamacpp_raw_http_cassette",
+            "with_llamacpp_api_key_cassette",
+            "with_llamacpp_missing_api_key_cassette",
+        ],
     },
     ProviderCassetteSuite {
         provider: "xai",
         source_dir: "tests/providers/xai",
         wrapper_names: &[
+            "with_xai_prompt_caching_cassette",
             "with_xai_cassette",
             "with_xai_cassette_bogus_key",
             "with_xai_cassette_result",
@@ -118,20 +192,41 @@ const PROVIDER_CASSETTE_SUITES: &[ProviderCassetteSuite] = &[
         provider: "openrouter",
         source_dir: "tests/providers/openrouter/cassette",
         wrapper_names: &[
+            "with_openrouter_prompt_caching_cassette",
             "with_openrouter_cassette",
             "with_openrouter_cassette_result",
+            "with_openrouter_cassette_bogus_key_result",
             "with_openrouter_openai_cassette",
+            "with_openrouter_refusal_cassette",
+            "with_openrouter_usage_cassette",
+            "with_openrouter_stream_logprobs_cassette_result",
+            "with_openrouter_tool_truncation_cassette_result",
+            "with_openrouter_tool_lifecycle_cassette_result",
+            "with_openrouter_terminal_metadata_cassette_result",
+            "with_openrouter_history_roundtrip_cassette_result",
+            "with_openrouter_reasoning_tool_order_cassette_result",
         ],
     },
     ProviderCassetteSuite {
         provider: "deepseek",
         source_dir: "tests/providers/deepseek",
-        wrapper_names: &["with_deepseek_cassette", "with_deepseek_cassette_result"],
+        wrapper_names: &[
+            "with_deepseek_prompt_caching_cassette",
+            "with_deepseek_cassette",
+            "with_deepseek_cassette_result",
+            "with_deepseek_cassette_bogus_key_result",
+            "with_deepseek_truncation_cassette_result",
+            "with_deepseek_block_order_cassette_result",
+            "with_deepseek_wire_shape_cassette_result",
+            "with_deepseek_followup_hunt_cassette_result",
+            "with_deepseek_stream_logprobs_cassette_result",
+        ],
     },
     ProviderCassetteSuite {
         provider: "groq",
         source_dir: "tests/providers/groq",
         wrapper_names: &[
+            "with_groq_prompt_caching_cassette",
             "with_groq_cassette_result",
             "with_groq_cassette_bogus_key_result",
         ],
@@ -139,12 +234,28 @@ const PROVIDER_CASSETTE_SUITES: &[ProviderCassetteSuite] = &[
     ProviderCassetteSuite {
         provider: "mistral",
         source_dir: "tests/providers/mistral",
-        wrapper_names: &["with_mistral_cassette_result"],
+        wrapper_names: &[
+            "with_mistral_embedding_cassette",
+            "with_mistral_prompt_caching_cassette",
+            "with_mistral_cassette_result",
+            "with_mistral_multimodal_cassette",
+            "with_mistral_cassette_bogus_key_result",
+            "with_mistral_capability_cassette",
+            "with_mistral_terminal_metadata_cassette_result",
+            "with_mistral_tool_truncation_cassette_result",
+            "with_mistral_tool_lifecycle_cassette_result",
+            "with_mistral_history_roundtrip_cassette_result",
+            "with_mistral_request_shape_cassette_result",
+            "with_mistral_logprobs_rejection_cassette_result",
+        ],
     },
     ProviderCassetteSuite {
         provider: "perplexity",
         source_dir: "tests/providers/perplexity/cassette",
-        wrapper_names: &["with_perplexity_cassette"],
+        wrapper_names: &[
+            "with_perplexity_cassette",
+            "with_perplexity_prompt_caching_cassette",
+        ],
     },
     ProviderCassetteSuite {
         provider: "mistralrs",
@@ -417,112 +528,10 @@ fn cassette_scenarios_in_file(
     path: &Path,
     wrapper_names: &[&'static str],
 ) -> Result<Vec<String>, String> {
-    let contents = fs::read_to_string(path)
+    let source = fs::read_to_string(path)
         .map_err(|error| format!("{} should be readable: {error}", display_repo_path(path)))?;
-    let syntax = syn::parse_file(&contents)
-        .map_err(|error| format!("{} should parse as Rust: {error}", display_repo_path(path)))?;
-    let mut visitor = CassetteScenarioVisitor {
-        path,
-        wrapper_names,
-        scenarios: Vec::new(),
-        failures: Vec::new(),
-    };
-    visitor.visit_file(&syntax);
-
-    if visitor.failures.is_empty() {
-        Ok(visitor.scenarios)
-    } else {
-        Err(visitor.failures.join("\n"))
-    }
-}
-
-struct CassetteScenarioVisitor<'a> {
-    path: &'a Path,
-    wrapper_names: &'a [&'static str],
-    scenarios: Vec<String>,
-    failures: Vec<String>,
-}
-
-impl<'ast, 'a> Visit<'ast> for CassetteScenarioVisitor<'a> {
-    fn visit_item_fn(&mut self, node: &'ast ItemFn) {
-        // A `#[ignore]`d test documents that its cassette isn't recorded yet
-        // (e.g. no provider API key available to record with); don't require
-        // a file for scenarios it references.
-        if node.attrs.iter().any(|attr| attr.path().is_ident("ignore")) {
-            return;
-        }
-
-        visit::visit_item_fn(self, node);
-    }
-
-    fn visit_expr_call(&mut self, node: &'ast ExprCall) {
-        if let Some(wrapper_name) = cassette_wrapper_name(node)
-            && self.wrapper_names.contains(&wrapper_name.as_str())
-        {
-            match node.args.first() {
-                Some(expr) => match cassette_scenario_value(expr) {
-                    Some(scenario) => self.scenarios.push(scenario),
-                    None => self.failures.push(format!(
-                        "{} calls {wrapper_name} without a string-literal cassette scenario",
-                        display_repo_path(self.path)
-                    )),
-                },
-                _ => self.failures.push(format!(
-                    "{} calls {wrapper_name} without a string-literal cassette scenario",
-                    display_repo_path(self.path)
-                )),
-            }
-        }
-
-        visit::visit_expr_call(self, node);
-    }
-}
-
-fn cassette_scenario_value(expr: &Expr) -> Option<String> {
-    match expr {
-        Expr::Lit(ExprLit {
-            lit: Lit::Str(scenario),
-            ..
-        }) => Some(scenario.value()),
-        Expr::Call(call) if is_cassette_spec_new(call) => call.args.first().and_then(|expr| {
-            let Expr::Lit(ExprLit {
-                lit: Lit::Str(scenario),
-                ..
-            }) = expr
-            else {
-                return None;
-            };
-
-            Some(scenario.value())
-        }),
-        Expr::MethodCall(method_call) => cassette_scenario_value(&method_call.receiver),
-        Expr::Paren(paren) => cassette_scenario_value(&paren.expr),
-        _ => None,
-    }
-}
-
-fn is_cassette_spec_new(call: &ExprCall) -> bool {
-    let Expr::Path(path) = call.func.as_ref() else {
-        return false;
-    };
-
-    let mut segments = path.path.segments.iter().rev();
-    matches!(
-        (segments.next(), segments.next()),
-        (Some(method), Some(receiver))
-            if method.ident == "new" && receiver.ident == "CassetteSpec"
-    )
-}
-
-fn cassette_wrapper_name(node: &ExprCall) -> Option<String> {
-    let Expr::Path(path) = node.func.as_ref() else {
-        return None;
-    };
-
-    path.path
-        .segments
-        .last()
-        .map(|segment| segment.ident.to_string())
+    rig_test_support::scenario_registry::cassette_scenarios(&source, wrapper_names)
+        .map_err(|error| format!("{}: {error}", display_repo_path(path)))
 }
 
 fn repo_path(path: &str) -> PathBuf {

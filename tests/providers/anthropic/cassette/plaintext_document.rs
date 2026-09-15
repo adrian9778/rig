@@ -1,11 +1,10 @@
 //! Migrated from `examples/anthropic_plaintext_document.rs`.
+use rig::completion::CompletionModel;
 use rig::completion::NormalizeCompletionResponse;
-use rig::completion::{CompletionModel, Prompt};
 use rig::message::{Document, DocumentMediaType, DocumentSourceKind, Message, UserContent};
 use rig::prelude::*;
 use rig::providers::anthropic::completion::Citation;
 use rig::providers::anthropic::completion::{self as anthropic_completion, CLAUDE_SONNET_4_6};
-use rig::streaming::StreamingPrompt;
 use rig::telemetry::ProviderResponseExt;
 
 use serde_json::json;
@@ -101,7 +100,8 @@ async fn plaintext_document_prompt() {
             let response = agent
                 .prompt(document)
                 .await
-                .expect("document prompt should succeed");
+                .expect("document prompt should succeed")
+                .output;
 
             assert_nonempty_response(&response);
             assert_contains_any_case_insensitive(&response, &["safety", "speed", "concurrency"]);
@@ -131,7 +131,8 @@ async fn plaintext_document_with_instruction() {
                     ],
                 })
                 .await
-                .expect("instruction prompt should succeed");
+                .expect("instruction prompt should succeed")
+                .output;
 
             assert_contains_any_case_insensitive(&response, &["safety", "speed", "concurrency"]);
         },
@@ -150,7 +151,7 @@ async fn streaming_document_citations_accepts_null_citation_start() {
                 .temperature(0.0)
                 .build();
 
-            let mut stream = agent.stream_prompt(citation_prompt()).await;
+            let mut stream = agent.prompt(citation_prompt()).stream();
             let response = collect_stream_final_response(&mut stream)
                 .await
                 .expect("streaming document citations should accept null citations on text start");
@@ -184,7 +185,7 @@ async fn document_citations_followup_preserves_assistant_citation_history() {
                 .raw_completion(first_request)
                 .await
                 .expect("first document citation turn should succeed");
-            let first_turn_raw_text = first_turn_raw.get_text_response();
+            let first_turn_raw_text = first_turn_raw.text_response();
             let first_turn: rig::completion::CompletionResponse = first_turn_raw
                 .normalize(ANTHROPIC_PROVIDER)
                 .expect("first document citation turn should normalize");
@@ -203,17 +204,12 @@ async fn document_citations_followup_preserves_assistant_citation_history() {
             let citations = collect_anthropic_citations(&first_turn.choice);
             assert!(!citations.is_empty(), "expected citations: {first_turn:?}");
             assert!(citations.iter().any(|citation| match citation {
-                Citation::CharLocation {
-                    cited_text,
-                    document_index,
-                    document_title,
-                    ..
-                } => {
-                    *document_index == 0
-                        && document_title.as_deref() == Some("Rust Goals")
+                Citation::CharLocation(citation) => {
+                    citation.document_index == 0
+                        && citation.document_title.as_deref() == Some("Rust Goals")
                         && ["safety", "speed", "concurrency"]
                             .iter()
-                            .any(|needle| cited_text.to_lowercase().contains(needle))
+                            .any(|needle| citation.cited_text.to_lowercase().contains(needle))
                 }
                 _ => false,
             }));

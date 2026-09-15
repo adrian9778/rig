@@ -1,5 +1,9 @@
 use crate::{
-    client::{self, BearerAuth, DebugExt, Provider},
+    client::{
+        self, BearerAuth, HasCompletion, HasEmbeddings, HasModelListing, HasTranscription,
+        ModelTransport, Provider, ProviderClientResult,
+    },
+    http_client::{self, HttpClientExt},
     providers::mistral::MistralModelLister,
 };
 use serde::{Deserialize, Serialize};
@@ -8,23 +12,93 @@ use std::fmt::Debug;
 const MISTRAL_API_BASE_URL: &str = "https://api.mistral.ai";
 
 #[derive(Debug, Default, Clone, Copy)]
-pub struct MistralExt;
-#[derive(Debug, Default, Clone, Copy)]
-pub struct MistralBuilder;
-
+pub struct Mistral;
 type MistralApiKey = BearerAuth;
 
-pub type Client<H = reqwest::Client> = client::Client<MistralExt, H>;
-pub type ClientBuilder<H = crate::markers::Missing> =
-    client::ClientBuilder<MistralBuilder, MistralApiKey, H>;
+pub type Client<H = crate::http_client::BoxedHttpClient> = client::Client<Mistral, H>;
+pub type ClientBuilder<H = crate::markers::Missing> = client::ClientBuilder<Mistral, H>;
 
-impl Provider for MistralExt {
-    type Builder = MistralBuilder;
-    const VERIFY_PATH: &'static str = "/models";
+impl Provider for Mistral {
+    const NAME: &'static str = "mistral";
+    const BASE_URL: &'static str = MISTRAL_API_BASE_URL;
+    // The client base URL is the bare host, so every Mistral path carries its
+    // own `/v1` — as `completion_path` and `MistralModelLister` already do.
+    // `/models` is a gateway 404 ("no Route matched with those values"), which
+    // made `verify()` fail for every key, valid or not.
+    const VERIFY_PATH: &'static str = "/v1/models";
+    type ApiKey = MistralApiKey;
+    type Config = ();
+    type EnvInput = String;
+
+    fn build(_: (), _: &MistralApiKey) -> http_client::Result<Self> {
+        Ok(Mistral)
+    }
+
+    fn from_env<H: HttpClientExt>(http: H) -> ProviderClientResult<Client<H>> {
+        Client::from_env_api_key("MISTRAL_API_KEY", None, http)
+    }
+
+    fn from_val<H: HttpClientExt>(input: String, http: H) -> ProviderClientResult<Client<H>> {
+        Client::new_with(input, http)
+    }
 }
 
-impl crate::providers::openai::completion::OpenAICompatibleProvider for MistralExt {
+impl HasCompletion for Mistral {
+    type Model<H>
+        = super::CompletionModel<H>
+    where
+        H: ModelTransport;
+
+    fn completion_model<H: ModelTransport>(client: &Client<H>, model: String) -> Self::Model<H> {
+        super::CompletionModel::new(client.clone(), model)
+    }
+}
+
+impl HasEmbeddings for Mistral {
+    type Model<H>
+        = super::EmbeddingModel<H>
+    where
+        H: ModelTransport;
+
+    fn embedding_model<H: ModelTransport>(
+        client: &Client<H>,
+        model: String,
+        ndims: Option<usize>,
+    ) -> Self::Model<H> {
+        super::EmbeddingModel::make(client, model, ndims)
+    }
+}
+
+impl HasTranscription for Mistral {
+    type Model<H>
+        = super::TranscriptionModel<H>
+    where
+        H: ModelTransport;
+
+    fn transcription_model<H: ModelTransport>(client: &Client<H>, model: String) -> Self::Model<H> {
+        super::TranscriptionModel::new(client.clone(), model)
+    }
+}
+
+impl HasModelListing for Mistral {
+    type Lister<H>
+        = MistralModelLister<H>
+    where
+        H: ModelTransport;
+
+    fn model_lister<H: ModelTransport>(client: &Client<H>) -> Self::Lister<H> {
+        MistralModelLister::new(client.clone())
+    }
+}
+
+impl crate::providers::openai::completion::OpenAICompatibleProvider for Mistral {
     const PROVIDER_NAME: &'static str = "mistral";
+
+    /// Mistral labels its transport request id `mistral-correlation-id`, and
+    /// sends it on every response — success and error alike. It also mirrors
+    /// the same value under the gateway's `x-kong-request-id`; the
+    /// provider-branded spelling is the one rig reads.
+    const REQUEST_ID_HEADER: Option<&'static str> = Some("mistral-correlation-id");
 
     type StreamingUsage = Usage;
 
@@ -57,6 +131,43 @@ impl crate::providers::openai::completion::OpenAICompatibleProvider for MistralE
             *tool_choice = serde_json::Value::String("any".to_string());
         }
 
+        // Mistral accepts a *structured* response format beside tools only
+        // under `tool_choice: auto` (or `none`): anything that forces a call
+        // is a 400, "`json_schema` response type with tools is only compatible
+        // with `tool_choice: auto`". Rig reaches that combination on its own —
+        // a structured-output agent defers `response_format` until a tool
+        // result exists, then emits it beside the caller's standing
+        // `tool_choice`, so the turn after the first tool call dies. Relaxing
+        // the choice keeps both features working; dropping the response format
+        // instead would silently discard the schema the caller asked for.
+        //
+        // Keyed on the format's *type* rather than its presence: the
+        // constraint is specific to `json_schema` and `json_object`, and
+        // `{"type": "text"}` — the API default, which a caller can still pass
+        // explicitly — rides beside a forced choice happily.
+        let forces_a_tool_call = map
+            .get("tool_choice")
+            .is_some_and(|choice| !matches!(choice.as_str(), Some("auto" | "none")));
+        let has_tools = map
+            .get("tools")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|tools| !tools.is_empty());
+        let has_structured_format = map
+            .get("response_format")
+            .and_then(|format| format.get("type"))
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|kind| matches!(kind, "json_schema" | "json_object"));
+        if forces_a_tool_call && has_tools && has_structured_format {
+            tracing::debug!(
+                "relaxing tool_choice to `auto`: Mistral rejects a forced tool choice \
+                 alongside a response format"
+            );
+            map.insert(
+                "tool_choice".to_string(),
+                serde_json::Value::String("auto".to_string()),
+            );
+        }
+
         if let Some(messages) = map
             .get_mut("messages")
             .and_then(serde_json::Value::as_array_mut)
@@ -68,11 +179,12 @@ impl crate::providers::openai::completion::OpenAICompatibleProvider for MistralE
                 let is_assistant =
                     message.get("role").and_then(serde_json::Value::as_str) == Some("assistant");
 
-                // Mistral takes message `content` as a plain string.
+                // Mistral takes text-only message `content` as a plain string
+                // and carries images, audio and documents as its own chunk
+                // array. Content it has no chunk for fails here rather than
+                // reaching the API with the part removed.
                 if let Some(content) = message.get_mut("content") {
-                    crate::providers::openai::completion::flatten_text_content_parts(
-                        content, "", false,
-                    );
+                    super::completion::normalize_request_content(content)?;
                 }
 
                 if is_assistant {
@@ -97,24 +209,6 @@ impl crate::providers::openai::completion::OpenAICompatibleProvider for MistralE
     }
 }
 
-client::impl_capabilities!(
-    MistralExt,
-    completion = super::CompletionModel<H>,
-    embeddings = super::EmbeddingModel<H>,
-    transcription = super::TranscriptionModel<H>,
-    model_listing = MistralModelLister<H>,
-);
-
-impl DebugExt for MistralExt {}
-
-client::impl_default_provider_builder!(
-    MistralBuilder => MistralExt,
-    api_key = MistralApiKey,
-    base_url = MISTRAL_API_BASE_URL,
-);
-
-client::impl_provider_client!(Client, input = String, api_key_env = "MISTRAL_API_KEY");
-
 /// In-depth details on prompt tokens.
 ///
 /// Mirrors Mistral's `PromptTokensDetails` schema. The Mistral API also exposes
@@ -125,6 +219,11 @@ pub struct PromptTokensDetails {
     /// Number of tokens served from the prompt cache.
     #[serde(default)]
     pub cached_tokens: u64,
+    /// Tokens the audio-input models charge for the prompt's audio. Reported
+    /// *alongside* `prompt_tokens` rather than inside it — the two plus
+    /// `completion_tokens` are what add up to `total_tokens`.
+    #[serde(default)]
+    pub audio_tokens: u64,
 }
 
 /// Token usage returned by Mistral's chat completions and embeddings endpoints.
@@ -138,6 +237,15 @@ pub struct Usage {
     pub completion_tokens: usize,
     pub prompt_tokens: usize,
     pub total_tokens: usize,
+    /// Capacity tier that served the request, when Mistral reports it.
+    ///
+    /// Although the generated `UsageInfo` reference currently omits this
+    /// field, the live chat-completions wire includes values such as
+    /// `"standard"` in both blocking responses and terminal stream chunks.
+    /// Keeping it here prevents the provider-native `raw_completion` and
+    /// `raw_stream` surfaces from silently discarding that wire metadata.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service_tier: Option<String>,
     /// Duration in seconds of audio tokens in the prompt (audio-input models only).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt_audio_seconds: Option<u64>,
@@ -166,12 +274,30 @@ impl Usage {
             .or(self.num_cached_tokens)
             .unwrap_or(0)
     }
+
+    /// Tokens charged for audio in the prompt. 0 for every non-audio turn.
+    pub fn audio_tokens(&self) -> u64 {
+        self.prompt_tokens_details
+            .as_ref()
+            .map_or(0, |details| details.audio_tokens)
+    }
+
+    /// Every token charged against the prompt.
+    ///
+    /// Mistral reports audio outside `prompt_tokens`: a Voxtral turn answering
+    /// a 375-audio-token clip reports `prompt_tokens: 6`, `audio_tokens: 375`,
+    /// `completion_tokens: 2` and `total_tokens: 383`. Counting only
+    /// `prompt_tokens` as input leaves `input + output` short of `total` by the
+    /// whole audio payload.
+    pub fn input_tokens(&self) -> u64 {
+        self.prompt_tokens as u64 + self.audio_tokens()
+    }
 }
 
 impl From<&Usage> for crate::completion::Usage {
     fn from(usage: &Usage) -> Self {
         crate::providers::internal::completion_usage(
-            usage.prompt_tokens as u64,
+            usage.input_tokens(),
             usage.completion_tokens as u64,
             usage.total_tokens as u64,
             usage.cached_tokens(),
@@ -196,13 +322,4 @@ impl std::fmt::Display for Usage {
 }
 
 #[cfg(test)]
-mod tests {
-    #[test]
-    fn test_client_initialization() {
-        let _client =
-            crate::providers::mistral::Client::new("dummy-key").expect("Client::new() failed");
-        let builder: crate::providers::mistral::ClientBuilder =
-            crate::providers::mistral::Client::builder().api_key("dummy-key");
-        let _client_from_builder = builder.build().expect("Client::builder() failed");
-    }
-}
+mod tests;

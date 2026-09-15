@@ -2,7 +2,6 @@ use anyhow::Result;
 use rig::prelude::*;
 use rig::{
     agent::Agent,
-    completion::Prompt,
     message::Message,
     providers::{cohere, openai},
 };
@@ -47,7 +46,6 @@ impl Debater {
                 .gpt_4
                 .prompt(prompt_a.as_str())
                 .history(&history_a)
-                .extended_details()
                 .await?;
             // Extract updated history for next iteration
             history_a = resp_a
@@ -60,7 +58,6 @@ impl Debater {
                 .coral
                 .prompt(resp_a.output.as_str())
                 .history(&history_b)
-                .extended_details()
                 .await?;
             // Extract updated history for next iteration
             history_b = resp_b
@@ -69,7 +66,7 @@ impl Debater {
                 .unwrap_or_default();
             println!("Coral:\n{}", resp_b.output);
             println!("================================================================");
-            last_resp_b = Some(resp_b.output)
+            last_resp_b = Some(resp_b.output);
         }
         Ok(())
     }

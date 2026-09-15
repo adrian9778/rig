@@ -4,23 +4,22 @@
 //!
 //! - [`VectorStoreIndex`]: Query a vector store for similar documents.
 //! - [`InsertDocuments`]: Insert documents and their embeddings.
-//! - [`VectorStoreIndexDyn`]: Type-erased vector queries for runtime-defined retrieval policies.
 //!
 //! Use [`VectorSearchRequest`] to build queries. See [`request`] for filtering.
 //!
 //! Types implementing [`VectorStoreIndex`] automatically implement [`PortableTool`].
 
+use http::StatusCode;
 pub use request::VectorSearchRequest;
-use reqwest::StatusCode;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 
 use crate::{
     Embed,
     embeddings::{Embedding, EmbeddingError},
     tool::PortableTool,
-    vector_store::request::{Filter, FilterError, SearchFilter},
-    wasm_compat::{WasmBoxedFuture, WasmCompatSend, WasmCompatSync},
+    vector_store::request::{FilterError, SearchFilter},
+    wasm_compat::{WasmCompatSend, WasmCompatSync},
 };
 
 pub mod builder;
@@ -30,7 +29,6 @@ pub mod request;
 
 /// Errors from vector store operations.
 #[derive(Debug, thiserror::Error)]
-#[non_exhaustive]
 pub enum VectorStoreError {
     /// Embedding generation failed while preparing a vector query or insert.
     #[error("Embedding error: {0}")]
@@ -59,8 +57,13 @@ pub enum VectorStoreError {
     MissingIdError(String),
 
     /// HTTP request failed for an external vector store service.
+    ///
+    /// Non-success responses arrive as the status-bearing
+    /// [`crate::http_client::Error`] variants, so callers can still inspect
+    /// the status code; response-less transport failures arrive as
+    /// [`crate::http_client::Error::Instance`].
     #[error("HTTP request error: {0}")]
-    ReqwestError(#[from] reqwest::Error),
+    Http(#[from] crate::http_client::Error),
 
     /// External vector store service returned an error response.
     #[error("External call to API returned an error. Error code: {0} Message: {1}")]
@@ -132,7 +135,7 @@ pub trait VectorStoreIndex: WasmCompatSend + WasmCompatSync {
     type Filter: SearchFilter + WasmCompatSend + WasmCompatSync;
 
     /// Returns the top N most similar documents as `(score, id, document)` tuples.
-    fn top_n<T: for<'a> Deserialize<'a> + WasmCompatSend>(
+    fn top_n<T: DeserializeOwned + WasmCompatSend>(
         &self,
         req: VectorSearchRequest<Self::Filter>,
     ) -> impl std::future::Future<Output = Result<Vec<(f64, String, T)>, VectorStoreError>>
@@ -145,85 +148,6 @@ pub trait VectorStoreIndex: WasmCompatSend + WasmCompatSync {
     ) -> impl std::future::Future<Output = Result<Vec<(f64, String)>, VectorStoreError>> + WasmCompatSend;
 }
 
-/// Type-erased `top_n` result: `(score, id, document)` tuples as JSON values.
-pub type TopNResults = Result<Vec<(f64, String, Value)>, VectorStoreError>;
-
-/// Type-erased [`VectorStoreIndex`] for dynamic dispatch.
-pub trait VectorStoreIndexDyn: WasmCompatSend + WasmCompatSync {
-    /// Returns the top N documents for a JSON-serializable request.
-    fn top_n<'a>(
-        &'a self,
-        req: VectorSearchRequest<Filter<serde_json::Value>>,
-    ) -> WasmBoxedFuture<'a, TopNResults>;
-
-    /// Returns only the top N document IDs for a JSON-serializable request.
-    fn top_n_ids<'a>(
-        &'a self,
-        req: VectorSearchRequest<Filter<serde_json::Value>>,
-    ) -> WasmBoxedFuture<'a, Result<Vec<(f64, String)>, VectorStoreError>>;
-}
-
-impl<I: VectorStoreIndex<Filter = F>, F> VectorStoreIndexDyn for I
-where
-    F: std::fmt::Debug
-        + Clone
-        + SearchFilter<Value = serde_json::Value>
-        + WasmCompatSend
-        + WasmCompatSync
-        + Serialize
-        + for<'de> Deserialize<'de>
-        + 'static,
-{
-    fn top_n<'a>(
-        &'a self,
-        req: VectorSearchRequest<Filter<serde_json::Value>>,
-    ) -> WasmBoxedFuture<'a, TopNResults> {
-        let req = req.map_filter(Filter::interpret);
-
-        Box::pin(async move {
-            Ok(self
-                .top_n::<serde_json::Value>(req)
-                .await?
-                .into_iter()
-                .map(|(score, id, doc)| (score, id, prune_document(doc).unwrap_or_default()))
-                .collect::<Vec<_>>())
-        })
-    }
-
-    fn top_n_ids<'a>(
-        &'a self,
-        req: VectorSearchRequest<Filter<serde_json::Value>>,
-    ) -> WasmBoxedFuture<'a, Result<Vec<(f64, String)>, VectorStoreError>> {
-        let req = req.map_filter(Filter::interpret);
-
-        Box::pin(self.top_n_ids(req))
-    }
-}
-
-fn prune_document(document: serde_json::Value) -> Option<serde_json::Value> {
-    match document {
-        Value::Object(mut map) => {
-            let new_map = map
-                .iter_mut()
-                .filter_map(|(key, value)| {
-                    prune_document(value.take()).map(|value| (key.clone(), value))
-                })
-                .collect::<serde_json::Map<_, _>>();
-
-            Some(Value::Object(new_map))
-        }
-        Value::Array(vec) if vec.len() > 400 => None,
-        Value::Array(vec) => Some(Value::Array(
-            vec.into_iter().filter_map(prune_document).collect(),
-        )),
-        Value::Number(num) => Some(Value::Number(num)),
-        Value::String(s) => Some(Value::String(s)),
-        Value::Bool(b) => Some(Value::Bool(b)),
-        Value::Null => Some(Value::Null),
-    }
-}
-
-/// The output of vector store queries invoked via [`PortableTool`]
 #[derive(Serialize, Deserialize, Debug)]
 pub struct VectorStoreOutput {
     /// Similarity score returned by the vector store.
@@ -239,7 +163,7 @@ where
     F: SearchFilter<Value = serde_json::Value>
         + WasmCompatSend
         + WasmCompatSync
-        + for<'de> Deserialize<'de>,
+        + serde::de::DeserializeOwned,
     T: VectorStoreIndex<Filter = F>,
 {
     const NAME: &'static str = "search_vector_store";
@@ -304,69 +228,4 @@ pub enum IndexStrategy {
 }
 
 #[cfg(test)]
-mod tests {
-    use std::sync::{Arc, Mutex};
-
-    use super::*;
-    use crate::vector_store::request::Filter;
-
-    struct TestIndex {
-        queries: Arc<Mutex<Vec<String>>>,
-    }
-
-    impl VectorStoreIndex for TestIndex {
-        type Filter = Filter<serde_json::Value>;
-
-        async fn top_n<T: for<'a> Deserialize<'a> + WasmCompatSend>(
-            &self,
-            req: VectorSearchRequest,
-        ) -> Result<Vec<(f64, String, T)>, VectorStoreError> {
-            self.queries
-                .lock()
-                .expect("query recorder lock")
-                .push(req.query().to_string());
-            let document = serde_json::from_value(json!({ "answer": 42 }))?;
-            Ok(vec![(0.9, "doc-1".to_string(), document)])
-        }
-
-        async fn top_n_ids(
-            &self,
-            _req: VectorSearchRequest,
-        ) -> Result<Vec<(f64, String)>, VectorStoreError> {
-            Ok(vec![(0.9, "doc-1".to_string())])
-        }
-    }
-
-    #[tokio::test]
-    async fn vector_store_index_remains_a_tool() {
-        let queries = Arc::new(Mutex::new(Vec::new()));
-        let index = TestIndex {
-            queries: queries.clone(),
-        };
-        let request = VectorSearchRequest::builder()
-            .query("answer")
-            .samples(1)
-            .build();
-        let output = <TestIndex as PortableTool>::call(&index, request)
-            .await
-            .expect("vector tool call should succeed");
-
-        assert_eq!(<TestIndex as PortableTool>::NAME, "search_vector_store");
-        assert_eq!(
-            *queries.lock().expect("query recorder lock"),
-            vec!["answer"]
-        );
-        assert_eq!(output.len(), 1);
-        let result = output.first().expect("one vector result");
-        assert_eq!(result.score, 0.9);
-        assert_eq!(result.id, "doc-1");
-        assert_eq!(result.document, json!({ "answer": 42 }));
-    }
-
-    #[test]
-    fn datastore_wraps_backend_errors() {
-        let err = VectorStoreError::datastore(std::io::Error::other("db down"));
-        assert!(matches!(err, VectorStoreError::DatastoreError(_)));
-        assert_eq!(err.to_string(), "Datastore error: db down");
-    }
-}
+mod tests;

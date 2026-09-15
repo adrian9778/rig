@@ -7,7 +7,7 @@
 //! `RIG_PROVIDER_TEST_MODE=record` to record against the real provider.
 
 use rig::completion::NormalizeCompletionResponse;
-use rig::completion::{Chat, CompletionModel, FinishReason, Message};
+use rig::completion::{CompletionModel, FinishReason, Message};
 use rig::message::AssistantContent;
 use rig::prelude::*;
 use rig::providers::openai;
@@ -51,7 +51,7 @@ async fn strict_tools_opt_in_roundtrip() {
                     .function
                     .arguments
                     .get("x")
-                    .and_then(|value| value.as_f64()),
+                    .and_then(serde_json::Value::as_f64),
                 Some(7.0),
                 "strict-mode arguments should carry both required fields: {:?}",
                 tool_call.function.arguments
@@ -61,7 +61,7 @@ async fn strict_tools_opt_in_roundtrip() {
                     .function
                     .arguments
                     .get("y")
-                    .and_then(|value| value.as_f64()),
+                    .and_then(serde_json::Value::as_f64),
                 Some(5.0),
                 "strict-mode arguments should carry both required fields: {:?}",
                 tool_call.function.arguments
@@ -159,7 +159,8 @@ async fn system_messages_as_input_items_mid_conversation() {
             let result = agent
                 .chat("What is my codename?", &mut history)
                 .await
-                .expect("chat with a mid-conversation system message should succeed");
+                .expect("chat with a mid-conversation system message should succeed")
+                .output;
 
             assert!(
                 result.contains("FALCON-9"),

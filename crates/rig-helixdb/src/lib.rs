@@ -101,10 +101,10 @@ impl HelixDBClient for HelixDB {
             code => match response.text().await {
                 Ok(details) => Err(HelixError::RemoteError { details }),
                 Err(_) => Err(HelixError::RemoteError {
-                    details: code
-                        .canonical_reason()
-                        .map(ToString::to_string)
-                        .unwrap_or_else(|| format!("unknown error with code: {code}")),
+                    details: code.canonical_reason().map_or_else(
+                        || format!("unknown error with code: {code}"),
+                        ToString::to_string,
+                    ),
                 }),
             },
         }
@@ -117,7 +117,8 @@ impl HelixDBClient for HelixDB {
 ///
 /// Usage:
 /// ```no_run
-/// use rig_core::client::{EmbeddingsClient, ProviderClient};
+/// use rig_core::client::EmbeddingsClient;
+/// use rig_reqwest::prelude::*;
 /// use rig_helixdb::{HelixDB, HelixDBVectorStore};
 ///
 /// # fn example() -> anyhow::Result<()> {
@@ -130,9 +131,13 @@ impl HelixDBClient for HelixDB {
 /// # Ok(())
 /// # }
 /// ```
-pub struct HelixDBVectorStore<C, E> {
+///
+/// The store is generic over its embedding model `M`, which is fixed for the
+/// store's lifetime: an index populated under one model is only meaningful under
+/// that same model.
+pub struct HelixDBVectorStore<C, M> {
     client: C,
-    model: E,
+    model: M,
 }
 
 pub type HelixDBFilter = Filter<serde_json::Value>;
@@ -171,13 +176,9 @@ struct VecResult {
     vec_docs: Vec<QueryResult>,
 }
 
-impl<C, E> HelixDBVectorStore<C, E>
-where
-    C: HelixDBClient + WasmCompatSend,
-    E: EmbeddingModel,
-{
+impl<C, M: EmbeddingModel> HelixDBVectorStore<C, M> {
     /// Creates a new HelixDB vector store.
-    pub fn new(client: C, model: E) -> Self {
+    pub fn new(client: C, model: M) -> Self {
         Self { client, model }
     }
 
@@ -187,11 +188,10 @@ where
     }
 }
 
-impl<C, E> HelixDBVectorStore<C, E>
+impl<C, M: EmbeddingModel> HelixDBVectorStore<C, M>
 where
     C: HelixDBClient + WasmCompatSend + WasmCompatSync,
-    C::Err: std::error::Error + WasmCompatSend + WasmCompatSync + 'static,
-    E: EmbeddingModel + WasmCompatSend + WasmCompatSync,
+    C::Err: WasmCompatSend + WasmCompatSync + 'static,
 {
     /// Embeds the query and runs the `VectorSearch` HelixDB query.
     async fn vector_search(
@@ -213,11 +213,10 @@ where
     }
 }
 
-impl<C, E> InsertDocuments for HelixDBVectorStore<C, E>
+impl<C, M: EmbeddingModel> InsertDocuments for HelixDBVectorStore<C, M>
 where
     C: HelixDBClient + WasmCompatSend + WasmCompatSync,
-    C::Err: std::error::Error + WasmCompatSend + WasmCompatSync + 'static,
-    E: EmbeddingModel + WasmCompatSend + WasmCompatSync,
+    C::Err: WasmCompatSend + WasmCompatSync + 'static,
 {
     async fn insert_documents<Doc: Serialize + rig_core::Embed + WasmCompatSend>(
         &self,
@@ -254,11 +253,10 @@ where
     }
 }
 
-impl<C, E> VectorStoreIndex for HelixDBVectorStore<C, E>
+impl<C, M: EmbeddingModel> VectorStoreIndex for HelixDBVectorStore<C, M>
 where
     C: HelixDBClient + WasmCompatSend + WasmCompatSync,
-    C::Err: std::error::Error + WasmCompatSend + WasmCompatSync + 'static,
-    E: EmbeddingModel + WasmCompatSend + WasmCompatSync,
+    C::Err: WasmCompatSend + WasmCompatSync + 'static,
 {
     type Filter = HelixDBFilter;
 
@@ -271,22 +269,18 @@ where
             .await?
             .into_iter()
             .filter(|x| {
-                let is_threshold = req
-                    .threshold()
-                    .map(|t| -(x.score - 1.) >= t)
-                    .unwrap_or(true);
+                let is_threshold = req.threshold().is_none_or(|t| -(x.score - 1.) >= t);
 
                 is_threshold
                     && req
                         .filter()
                         .clone()
                         .zip(serde_json::from_str(&x.json_payload).ok())
-                        .map(
+                        .is_none_or(
                             |(filter, payload): (Filter<serde_json::Value>, serde_json::Value)| {
                                 filter.satisfies(&payload)
                             },
                         )
-                        .unwrap_or(true)
             })
             .map(|x| {
                 let doc: T = serde_json::from_str(&x.json_payload)?;

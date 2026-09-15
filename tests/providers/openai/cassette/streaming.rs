@@ -2,7 +2,6 @@
 
 use rig::prelude::*;
 use rig::providers::openai;
-use rig::streaming::StreamingPrompt;
 
 use super::super::support::with_openai_cassette;
 use crate::support::{
@@ -18,7 +17,7 @@ async fn streaming_smoke() {
             .preamble(STREAMING_PREAMBLE)
             .build();
 
-        let mut stream = agent.stream_prompt(STREAMING_PROMPT).await;
+        let mut stream = agent.prompt(STREAMING_PROMPT).stream();
         let (response, provider_final) =
             collect_stream_final_response_and_provider_final(&mut stream)
                 .await
@@ -44,8 +43,8 @@ async fn example_streaming_prompt() {
             .build();
 
         let mut stream = agent
-            .stream_prompt("When and where and what type is the next solar eclipse?")
-            .await;
+            .prompt("When and where and what type is the next solar eclipse?")
+            .stream();
         let response = collect_stream_final_response(&mut stream)
             .await
             .expect("streaming prompt should succeed");

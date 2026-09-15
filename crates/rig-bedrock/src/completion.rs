@@ -216,7 +216,7 @@ impl CompletionModel {
         let span =
             CompletionSpanBuilder::new("aws_bedrock", &request_model, CompletionOperation::Chat)
                 .system_instructions(
-                    completion_request.preamble.as_deref(),
+                    completion_request.system_instructions(),
                     completion_request.record_telemetry_content,
                 )
                 .build();
@@ -228,19 +228,22 @@ impl CompletionModel {
 
         let mut converse_builder = self
             .client
-            .get_inner()
+            .inner()
             .await
             .converse()
             .model_id(request_model.clone());
 
         let tool_config = request.tools_config()?;
-        let messages = request.messages()?;
         let output_config = request.output_config()?;
+        let additional_params = request.additional_params();
+        let inference_config = request.inference_config();
+        let system_prompt = request.system_prompt()?;
+        let messages = request.messages()?;
         converse_builder = converse_builder
-            .set_additional_model_request_fields(request.additional_params())
-            .set_inference_config(request.inference_config())
+            .set_additional_model_request_fields(additional_params)
+            .set_inference_config(Some(inference_config))
             .set_tool_config(tool_config)
-            .set_system(request.system_prompt()?)
+            .set_system(system_prompt)
             .set_messages(Some(messages))
             .set_output_config(output_config)
             .set_guardrail_config(self.guardrail.clone());
@@ -258,7 +261,7 @@ impl CompletionModel {
 
             let span = tracing::Span::current();
             span.record_response_metadata(&aws_output);
-            span.record_token_usage(&aws_output.get_usage().unwrap_or_default());
+            span.record_token_usage(&aws_output.usage().unwrap_or_default());
 
             Ok(aws_output)
         }
@@ -272,7 +275,11 @@ impl completion::CompletionModel for CompletionModel {
         &self,
         completion_request: completion::CompletionRequest,
     ) -> Result<completion::CompletionResponse, CompletionError> {
-        self.raw_completion(completion_request).await?.try_into()
+        // Capture before `try_into` consumes the raw value.
+        let raw = self.raw_completion(completion_request).await?;
+        let captured = serde_json::to_value(&raw)?;
+        let response: completion::CompletionResponse = raw.try_into()?;
+        Ok(response.with_raw(captured))
     }
 
     async fn stream(

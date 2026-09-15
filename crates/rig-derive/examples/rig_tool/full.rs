@@ -1,8 +1,7 @@
-use rig_agent::completion::Prompt;
 use rig_agent::prelude::*;
-use rig_core::client::ProviderClient;
 use rig_core::providers;
 use rig_derive::rig_tool;
+use rig_reqwest::prelude::*;
 
 /// A tool that performs string operations
 #[rig_tool]
@@ -52,7 +51,7 @@ async fn main() -> Result<(), anyhow::Error> {
         "Perform an invalid operation on 'hello world'",
     ] {
         println!("User: {prompt}");
-        println!("Agent: {}", string_agent.prompt(prompt).await?);
+        println!("Agent: {}", string_agent.prompt(prompt).await?.output);
     }
 
     Ok(())

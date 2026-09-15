@@ -3,8 +3,43 @@ use std::pin::Pin;
 
 use futures::Stream;
 
+// The markers below are no-ops on browser wasm because that target has no
+// threads: a value that is `!Send` there can never reach a thread that does
+// not exist. Threaded wasm (`+atomics`) breaks that premise and is not
+// supported: reaching it needs a provider-side `Send + Sync` rewrite
+// (`Rc`→`Arc`, `RefCell`→`Mutex`, and a thread-safe wasm HTTP client), not
+// a change here. Nothing in the crate asserts `Send` by hand on the
+// strength of this premise; the bus carries `!Send` handlers only through
+// values that are themselves `!Send` there (rig-agent's `bus::Registrar`).
+#[cfg(all(
+    target_arch = "wasm32",
+    target_os = "unknown",
+    target_feature = "atomics"
+))]
+compile_error!(
+    "rig-core does not support threaded wasm (`+atomics`): its wasm-compat markers assume a \
+     single-threaded target"
+);
+
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 /// `Send` on native targets, a no-op marker on browser wasm.
+///
+/// ```compile_fail
+/// use std::rc::Rc;
+/// use rig_core::{serve::{Dispatch, Reply, Serve}, effect::{EffectKind, HandlerDescriptor, family}};
+///
+/// struct Local(Rc<u8>);
+/// impl Serve for Local {
+///     type Family = family::Dynamic;
+///     fn descriptor(&self) -> HandlerDescriptor { unimplemented!() }
+///     async fn serve(&self, _kind: EffectKind, _dispatch: Dispatch) -> Reply { unimplemented!() }
+/// }
+/// ```
+#[diagnostic::on_unimplemented(
+    message = "`{Self}` is not `Send`, and every bus handler must be `Send + Sync` natively",
+    label = "not `Send`",
+    note = "a handler runs inside the driver's task: hold the model, tool or memory behind an `Arc` (never an `Rc`), or register a `!Send` value only on browser wasm, where this marker is a no-op"
+)]
 pub trait WasmCompatSend: Send {}
 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
 /// `Send` on native targets, a no-op marker on browser wasm.
@@ -47,6 +82,23 @@ where
 
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 /// `Sync` on native targets, a no-op marker on browser wasm.
+///
+/// ```compile_fail
+/// use std::cell::Cell;
+/// use rig_core::{serve::{Dispatch, Reply, Serve}, effect::{EffectKind, HandlerDescriptor, family}};
+///
+/// struct Local(Cell<u8>);
+/// impl Serve for Local {
+///     type Family = family::Dynamic;
+///     fn descriptor(&self) -> HandlerDescriptor { unimplemented!() }
+///     async fn serve(&self, _kind: EffectKind, _dispatch: Dispatch) -> Reply { unimplemented!() }
+/// }
+/// ```
+#[diagnostic::on_unimplemented(
+    message = "`{Self}` is not `Sync`, and every bus handler must be `Send + Sync` natively",
+    label = "not `Sync`",
+    note = "a handler is shared between the driver and its in-flight tasks: use `Mutex`/atomics instead of `Cell`/`RefCell`, or register a `!Sync` value only on browser wasm, where this marker is a no-op"
+)]
 pub trait WasmCompatSync: Sync {}
 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
 /// `Sync` on native targets, a no-op marker on browser wasm.
@@ -115,6 +167,17 @@ where
     }
 }
 
+/// Sleep for `duration`.
+///
+/// A cross-platform (native + wasm) replacement for `tokio::time::sleep`, for
+/// the same reason as [`timeout`]: rig's `tokio` dependency is built without
+/// the `time` feature, and `tokio::time` does not function on wasm. Built on
+/// [`futures_timer::Delay`], whose backend selection (background timer thread
+/// natively, `setTimeout` on browser wasm) is documented on [`timeout`].
+pub async fn sleep(duration: std::time::Duration) {
+    futures_timer::Delay::new(duration).await;
+}
+
 #[macro_export]
 macro_rules! if_wasm {
     ($($tokens:tt)*) => {
@@ -134,27 +197,4 @@ macro_rules! if_not_wasm {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::{Elapsed, timeout};
-    use std::time::Duration;
-
-    #[tokio::test]
-    async fn timeout_returns_ok_for_a_future_that_completes_in_time() {
-        let result = timeout(Duration::from_secs(5), async { 42 }).await;
-        assert_eq!(result, Ok(42));
-    }
-
-    #[tokio::test]
-    async fn timeout_returns_elapsed_for_a_future_that_never_completes() {
-        let result = timeout(Duration::from_millis(20), std::future::pending::<()>()).await;
-        assert_eq!(result, Err(Elapsed));
-    }
-
-    #[tokio::test]
-    async fn timeout_zero_duration_still_polls_a_ready_future_once() {
-        // Documented contract: a zero/already-elapsed duration still polls the
-        // future once before electing `Elapsed`, so a ready future wins.
-        let result = timeout(Duration::ZERO, async { 7 }).await;
-        assert_eq!(result, Ok(7));
-    }
-}
+mod tests;

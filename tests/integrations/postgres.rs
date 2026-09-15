@@ -6,6 +6,7 @@
     clippy::unreachable
 )]
 
+use rig::client::DefaultTransportBuilder as _;
 use rig::client::EmbeddingsClient;
 use rig::postgres::PostgresVectorStore;
 use rig::providers::openai;
@@ -64,7 +65,7 @@ async fn vector_search_test() {
     let pg_pool = connect_to_postgres(host, port).await;
 
     // run migrations on Postgres
-    sqlx::migrate!("./tests/migrations")
+    sqlx::migrate!("../../tests/migrations")
         .run(&pg_pool)
         .await
         .expect("Failed to run migrations");

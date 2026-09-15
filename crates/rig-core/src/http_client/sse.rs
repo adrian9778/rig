@@ -11,7 +11,9 @@ use crate::{
 };
 use bytes::Bytes;
 use eventsource_stream::{Event as MessageEvent, EventStreamError, Eventsource};
-use futures::Stream;
+use futures::{Stream, StreamExt};
+
+pub(crate) mod tail;
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 use futures::{future::BoxFuture, stream::BoxStream};
 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
@@ -43,16 +45,16 @@ pin_project! {
     /// Internal state variants for the SSE state machine.
     #[project = SourceStateProjection]
     enum SourceState {
-        /// Initial connection attempt (no retry history yet)
+        /// A connection attempt in flight, carrying the retry that produced it
+        /// — `None` for the initial connect. The history belongs in the state
+        /// rather than in a separate `Reconnecting` variant because it is the
+        /// only thing a reconnect ever did differently: everything else (the
+        /// response check, the request-id capture, the handoff to `Open`) was
+        /// identical, so two variants meant two copies of it.
         Connecting {
             #[pin]
             response_future: ResponseFuture,
-        },
-        /// Reconnection attempt after a retry delay (always has retry history)
-        Reconnecting {
-            #[pin]
-            response_future: ResponseFuture,
-            last_retry: (usize, Duration),
+            last_retry: Option<(usize, Duration)>,
         },
         /// Actively receiving SSE events
         Open {
@@ -87,6 +89,7 @@ pin_project! {
         last_event_id: Option<String>,
         allow_missing_content_type: bool,
         request_id_capture: Option<(String, RequestIdSlot)>,
+        observation: Option<crate::observe::AdapterSlot>,
         #[pin]
         state: SourceState,
     }
@@ -99,8 +102,13 @@ where
 {
     /// Create a new event source that will connect to the given request.
     pub fn new(client: HttpClient, req: Request<RequestBody>) -> Self {
-        let response_future = Self::create_response_future(&client, &req, None);
-        let state = SourceState::Connecting { response_future };
+        let observation = crate::observe::AdapterContext::slot_for_request(&req);
+        let response_future =
+            Self::create_response_future(&client, &req, None, observation.clone());
+        let state = SourceState::Connecting {
+            response_future,
+            last_retry: None,
+        };
 
         Self {
             client,
@@ -109,6 +117,7 @@ where
             last_event_id: None,
             allow_missing_content_type: false,
             request_id_capture: None,
+            observation,
             state,
         }
     }
@@ -129,11 +138,16 @@ where
         (self, slot)
     }
 
+    pub(crate) fn observation(&self) -> Option<crate::observe::AdapterSlot> {
+        self.observation.clone()
+    }
+
     /// Create a response future for connecting/reconnecting
     fn create_response_future(
         client: &HttpClient,
         req: &Request<RequestBody>,
         last_event_id: Option<&str>,
+        observation: Option<crate::observe::AdapterSlot>,
     ) -> ResponseFuture {
         let mut req_clone = req.clone();
         req_clone
@@ -150,7 +164,40 @@ where
         }
 
         let client_clone = client.clone();
-        Box::pin(async move { client_clone.send_streaming(req_clone).await })
+        Box::pin(async move {
+            if let Some(observation) = &observation {
+                observation.start(&req_clone);
+            }
+            let response = match client_clone.send_streaming(req_clone).await {
+                // The bundled transports reject a non-success reply before it
+                // gets here; a custom `HttpClientExt` may hand it back as a
+                // response. Either way the server answered, and its answer —
+                // status, headers, body — is the error, never a bare status.
+                Ok(response) if response.status() != StatusCode::OK => {
+                    Err(reject_response(response).await)
+                }
+                other => other,
+            };
+            if let Some(observation) = &observation {
+                match &response {
+                    Ok(response) => observation
+                        .response_with_headers(response.status(), Some(response.headers())),
+                    Err(error) => {
+                        observation
+                            .error_boundary(crate::observe::AdapterErrorBoundary::from_http(error));
+                        if let Some(status) = error.non_success_status() {
+                            observation.response_with_headers(status, error.non_success_headers());
+                        }
+                        if let Some(body) = error.non_success_body() {
+                            observation.payload(body.as_bytes());
+                        }
+                        // The frame driver preserves the owned error and closes the
+                        // attempt. Do not clone or consume transport errors here.
+                    }
+                }
+            }
+            response
+        })
     }
 
     /// Get the last event id
@@ -192,7 +239,13 @@ where
 
         loop {
             match this.state.as_mut().project() {
-                SourceStateProjection::Connecting { response_future } => {
+                SourceStateProjection::Connecting {
+                    response_future,
+                    last_retry,
+                } => {
+                    // Copied out before the poll so the state projection's
+                    // borrow ends before the transition writes `this.state`.
+                    let last_retry = *last_retry;
                     match response_future.poll(cx) {
                         Poll::Pending => return Poll::Pending,
                         Poll::Ready(Ok(response)) => {
@@ -203,7 +256,17 @@ where
                                         this.request_id_capture.as_ref(),
                                         &response,
                                     );
-                                    let mut event_stream = response.into_body().eventsource();
+                                    let body = response.into_body();
+                                    let body: BoxedStream = match this.observation.clone() {
+                                        Some(observation) => Box::pin(body.map(move |item| {
+                                            if let Ok(bytes) = &item {
+                                                observation.bytes(bytes);
+                                            }
+                                            item
+                                        })),
+                                        None => body,
+                                    };
+                                    let mut event_stream = body.eventsource();
                                     if let Some(id) = &this.last_event_id {
                                         event_stream.set_last_event_id(id.clone());
                                     }
@@ -213,77 +276,31 @@ where
                                     return Poll::Ready(Some(Ok(Event::Open)));
                                 }
                                 Err(err) => {
-                                    // Transition: Connecting -> Closed (non-retryable error)
-                                    this.state.set(SourceState::Closed);
-                                    return Poll::Ready(Some(Err(err)));
-                                }
-                            }
-                        }
-                        Poll::Ready(Err(err)) => {
-                            // First connection attempt failed - start retry cycle
-                            if let Some(delay_duration) = this.retry_policy.retry(&err, None) {
-                                // Transition: Connecting -> WaitingToRetry
-                                this.state.set(SourceState::WaitingToRetry {
-                                    retry_delay: Delay::new(delay_duration),
-                                    current_retry: (1, delay_duration),
-                                });
-                                return Poll::Ready(Some(Err(err)));
-                            } else {
-                                // Transition: Connecting -> Closed
-                                this.state.set(SourceState::Closed);
-                                return Poll::Ready(Some(Err(err)));
-                            }
-                        }
-                    }
-                }
-
-                SourceStateProjection::Reconnecting {
-                    response_future,
-                    last_retry,
-                } => {
-                    match response_future.poll(cx) {
-                        Poll::Pending => return Poll::Pending,
-                        Poll::Ready(Ok(response)) => {
-                            match check_response(response, *this.allow_missing_content_type) {
-                                Ok(response) => {
-                                    // Transition: Reconnecting -> Open (retry cycle complete)
-                                    capture_request_id_header(
-                                        this.request_id_capture.as_ref(),
-                                        &response,
-                                    );
-                                    let mut event_stream = response.into_body().eventsource();
-                                    if let Some(id) = &this.last_event_id {
-                                        event_stream.set_last_event_id(id.clone());
+                                    if let Some(observation) = this.observation.as_ref() {
+                                        observation.error_boundary(
+                                            crate::observe::AdapterErrorBoundary::from_http(&err),
+                                        );
                                     }
-                                    this.state.set(SourceState::Open {
-                                        event_stream: Box::pin(event_stream),
-                                    });
-                                    return Poll::Ready(Some(Ok(Event::Open)));
-                                }
-                                Err(err) => {
-                                    // Transition: Reconnecting -> Closed (non-retryable error)
+                                    // Transition: Connecting -> Closed. Only a
+                                    // content-type failure reaches here (a non-200
+                                    // was rejected in the response future and goes
+                                    // to the retry policy like any transport
+                                    // rejection); a 200 that is not an event stream
+                                    // is terminal.
                                     this.state.set(SourceState::Closed);
                                     return Poll::Ready(Some(Err(err)));
                                 }
                             }
                         }
                         Poll::Ready(Err(err)) => {
-                            // Reconnection attempt failed - continue retry cycle
-                            if let Some(delay_duration) =
-                                this.retry_policy.retry(&err, Some(*last_retry))
-                            {
-                                let (retry_num, _) = *last_retry;
-                                // Transition: Reconnecting -> WaitingToRetry
-                                this.state.set(SourceState::WaitingToRetry {
-                                    retry_delay: Delay::new(delay_duration),
-                                    current_retry: (retry_num + 1, delay_duration),
-                                });
-                                return Poll::Ready(Some(Err(err)));
-                            } else {
-                                // Transition: Reconnecting -> Closed (max retries exceeded)
-                                this.state.set(SourceState::Closed);
-                                return Poll::Ready(Some(Err(err)));
-                            }
+                            // Transition: Connecting -> WaitingToRetry or Closed,
+                            // continuing the retry cycle `last_retry` describes.
+                            this.state.set(state_after_transport_error(
+                                this.retry_policy,
+                                &err,
+                                last_retry,
+                            ));
+                            return Poll::Ready(Some(Err(err)));
                         }
                     }
                 }
@@ -301,19 +318,21 @@ where
                             return Poll::Ready(Some(Ok(Event::Message(event))));
                         }
                         Poll::Ready(Some(Err(EventStreamError::Transport(err)))) => {
-                            // Connection error while open - start fresh retry cycle
-                            if let Some(delay_duration) = this.retry_policy.retry(&err, None) {
-                                // Transition: Open -> WaitingToRetry
-                                this.state.set(SourceState::WaitingToRetry {
-                                    retry_delay: Delay::new(delay_duration),
-                                    current_retry: (1, delay_duration),
-                                });
-                                return Poll::Ready(Some(Err(err)));
-                            } else {
-                                // Transition: Open -> Closed
-                                this.state.set(SourceState::Closed);
-                                return Poll::Ready(Some(Err(err)));
+                            if let Some(observation) = this.observation.as_ref() {
+                                observation.error_boundary(
+                                    crate::observe::AdapterErrorBoundary::Transport,
+                                );
                             }
+                            // Transition: Open -> WaitingToRetry or Closed. A
+                            // failure mid-stream starts a *fresh* cycle (history
+                            // `None`): this connection had already succeeded, so
+                            // the attempts that preceded it no longer apply.
+                            this.state.set(state_after_transport_error(
+                                this.retry_policy,
+                                &err,
+                                None,
+                            ));
+                            return Poll::Ready(Some(Err(err)));
                         }
                         Poll::Ready(Some(Err(EventStreamError::Parser(_)))) => {
                             // Parser errors are recoverable - continue polling
@@ -340,16 +359,17 @@ where
                     match retry_delay.poll(cx) {
                         Poll::Pending => return Poll::Pending,
                         Poll::Ready(()) => {
-                            // Transition: WaitingToRetry -> Reconnecting
+                            // Transition: WaitingToRetry -> Connecting
                             let response_future =
                                 GenericEventSource::<HttpClient, RequestBody>::create_response_future(
                                     this.client,
                                     this.req,
                                     this.last_event_id.as_deref(),
+                                    this.observation.clone(),
                                 );
-                            this.state.set(SourceState::Reconnecting {
+                            this.state.set(SourceState::Connecting {
                                 response_future,
-                                last_retry: retry_info,
+                                last_retry: Some(retry_info),
                             });
                             continue;
                         }
@@ -361,6 +381,26 @@ where
                 }
             }
         }
+    }
+}
+
+/// The state a transport failure moves the machine to: wait out the policy's
+/// next delay, or close when it declines to retry.
+///
+/// `last_retry` is the retry that produced the failed attempt, so the retry
+/// number the policy sees and the one recorded for the next attempt advance
+/// together — the numbering is stated once instead of per call site.
+fn state_after_transport_error(
+    retry_policy: &impl RetryPolicy,
+    error: &super::Error,
+    last_retry: Option<(usize, Duration)>,
+) -> SourceState {
+    match retry_policy.retry(error, last_retry) {
+        Some(delay) => SourceState::WaitingToRetry {
+            retry_delay: Delay::new(delay),
+            current_retry: (last_retry.map_or(1, |(retry_num, _)| retry_num + 1), delay),
+        },
+        None => SourceState::Closed,
     }
 }
 
@@ -381,24 +421,54 @@ fn capture_request_id_header<T>(capture: Option<&(String, RequestIdSlot)>, respo
     }
 }
 
+/// Bytes of a rejected reply's body kept on the error; a reply longer than
+/// this is cut there, the way a provider's error payload never is (a cut
+/// body is not JSON any more, so `provider_response_json` reports it as
+/// malformed rather than absent).
+const REJECTED_BODY_LIMIT: usize = 1 << 20;
+
+/// Chunks read off a rejected reply before giving up on it, so a transport
+/// that keeps yielding empty chunks cannot hold the opener.
+const REJECTED_CHUNK_LIMIT: usize = 4096;
+
+/// Turn a reply the event source will not stream (any status but 200,
+/// a 204 included: a status is a status) into the non-success error,
+/// reading the body to its end (bounded in bytes and chunks; the transport's
+/// own timeouts bound the time) so the provider's payload and the
+/// transport's headers ride on the error.
+async fn reject_response(response: Response<BoxedStream>) -> super::Error {
+    let (parts, mut body) = response.into_parts();
+    let mut collected = Vec::new();
+    let mut chunks = 0;
+    while let Some(chunk) = body.next().await {
+        chunks += 1;
+        let room = REJECTED_BODY_LIMIT.saturating_sub(collected.len());
+        match chunk {
+            Ok(bytes) if room > 0 && chunks <= REJECTED_CHUNK_LIMIT => {
+                collected.extend(bytes.iter().take(room));
+            }
+            _ => break,
+        }
+    }
+    super::Error::non_success_with_details(
+        parts.status,
+        parts.headers,
+        String::from_utf8_lossy(&collected).into_owned(),
+    )
+}
+
 fn check_response<T>(
     response: Response<T>,
     allow_missing_content_type: bool,
 ) -> Result<Response<T>, super::Error> {
-    let StatusCode::OK = response.status() else {
-        return Err(super::Error::InvalidStatusCode(response.status()));
-    };
-
-    let content_type =
-        if let Some(content_type) = response.headers().get(&reqwest::header::CONTENT_TYPE) {
-            content_type
-        } else if allow_missing_content_type {
+    let Some(content_type) = response.headers().get(&http::header::CONTENT_TYPE) else {
+        if allow_missing_content_type {
             return Ok(response);
-        } else {
-            return Err(super::Error::InvalidContentType(HeaderValue::from_static(
-                "",
-            )));
-        };
+        }
+        return Err(super::Error::InvalidContentType(HeaderValue::from_static(
+            "",
+        )));
+    };
 
     if content_type
         .to_str()
@@ -419,135 +489,4 @@ fn check_response<T>(
 }
 
 #[cfg(all(test, not(all(target_arch = "wasm32", target_os = "unknown"))))]
-mod tests {
-    use super::*;
-    use crate::http_client::{self, HttpClientExt};
-    use futures::StreamExt;
-    use std::collections::VecDeque;
-    use std::future::Future;
-    use std::sync::{Arc, Mutex};
-
-    /// One scripted connection: its request-id header value and body chunks.
-    type ScriptedConnection = (Option<&'static str>, Vec<StreamResult<Bytes>>);
-
-    /// Scripted connection outcomes: each `send_streaming` call pops one
-    /// [`ScriptedConnection`].
-    #[derive(Clone)]
-    struct SequencedStreamingClient {
-        connections: Arc<Mutex<VecDeque<ScriptedConnection>>>,
-    }
-
-    impl SequencedStreamingClient {
-        fn new(connections: impl IntoIterator<Item = ScriptedConnection>) -> Self {
-            Self {
-                connections: Arc::new(Mutex::new(connections.into_iter().collect())),
-            }
-        }
-    }
-
-    impl HttpClientExt for SequencedStreamingClient {
-        fn send<T, U>(
-            &self,
-            _req: Request<T>,
-        ) -> impl Future<Output = http_client::Result<Response<http_client::LazyBody<U>>>>
-        + WasmCompatSend
-        + 'static
-        where
-            T: Into<Bytes> + WasmCompatSend,
-            U: From<Bytes> + WasmCompatSend + 'static,
-        {
-            std::future::ready(Err(http_client::Error::InvalidStatusCode(
-                StatusCode::NOT_IMPLEMENTED,
-            )))
-        }
-
-        fn send_multipart<U>(
-            &self,
-            _req: Request<crate::http_client::MultipartForm>,
-        ) -> impl Future<Output = http_client::Result<Response<http_client::LazyBody<U>>>>
-        + WasmCompatSend
-        + 'static
-        where
-            U: From<Bytes> + WasmCompatSend + 'static,
-        {
-            std::future::ready(Err(http_client::Error::InvalidStatusCode(
-                StatusCode::NOT_IMPLEMENTED,
-            )))
-        }
-
-        fn send_streaming<T>(
-            &self,
-            _req: Request<T>,
-        ) -> impl Future<Output = http_client::Result<http_client::StreamingResponse>> + WasmCompatSend
-        where
-            T: Into<Bytes> + WasmCompatSend,
-        {
-            let next = self
-                .connections
-                .lock()
-                .expect("scripted connections")
-                .pop_front();
-            async move {
-                let (request_id, chunks) =
-                    next.expect("a scripted connection should remain for each connect");
-                let boxed: BoxedStream = Box::pin(futures::stream::iter(chunks));
-                let mut builder = Response::builder()
-                    .status(StatusCode::OK)
-                    .header(http::header::CONTENT_TYPE, "text/event-stream");
-                if let Some(id) = request_id {
-                    builder = builder.header("x-request-id", id);
-                }
-                builder.body(boxed).map_err(http_client::Error::Protocol)
-            }
-        }
-    }
-
-    /// Regression (rig#2265): after a mid-stream failure and reconnect, the
-    /// slot must describe the connection that is now open — a reconnect whose
-    /// response omits the header resets it to `None` instead of leaking the
-    /// first connection's id.
-    #[tokio::test]
-    async fn reconnect_replaces_request_id_slot_including_with_none() {
-        let client = SequencedStreamingClient::new([
-            (
-                Some("req-first-connection"),
-                vec![
-                    Ok(Bytes::from_static(b"data: one\n\n")),
-                    Err(http_client::Error::StreamEnded),
-                ],
-            ),
-            (None, vec![Ok(Bytes::from_static(b"data: two\n\n"))]),
-        ]);
-        let req = Request::builder()
-            .uri("http://mock.invalid/stream")
-            .body(Vec::<u8>::new())
-            .expect("request should build");
-        let (source, slot) =
-            GenericEventSource::new(client, req).capture_request_id("x-request-id");
-        let mut source = Box::pin(source);
-
-        let mut messages = Vec::new();
-        let mut checked_first_connection = false;
-        while let Some(item) = source.next().await {
-            if let Ok(Event::Message(message)) = item {
-                if !checked_first_connection {
-                    assert_eq!(
-                        slot.lock().expect("slot").as_deref(),
-                        Some("req-first-connection"),
-                        "the first connection's id is captured at connect"
-                    );
-                    checked_first_connection = true;
-                }
-                messages.push(message.data);
-            }
-        }
-
-        assert_eq!(messages, ["one", "two"], "both connections delivered data");
-        assert_eq!(
-            slot.lock().expect("slot").as_deref(),
-            None,
-            "the reconnect omitted the header, so the slot must not retain the \
-             first connection's id"
-        );
-    }
-}
+mod tests;

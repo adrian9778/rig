@@ -138,10 +138,9 @@ async fn main() -> Result<()> {
                     You may emit one or multiple tool calls in a single turn. \
                     Once all tool results are available, give a short final answer.";
 
-    let local_tools = ToolSet::builder()
-        .static_tool(Add)
-        .static_tool(Subtract)
-        .build();
+    let mut local_tools = ToolSet::default();
+    local_tools.add_tool(Add);
+    local_tools.add_tool(Subtract);
 
     let mut history = Vec::new();
     let mut current_prompt = Message::user(
@@ -155,7 +154,7 @@ async fn main() -> Result<()> {
             .completion_request(current_prompt.clone())
             .preamble(preamble.to_string())
             .messages(history.clone())
-            .tools(local_tools.get_tool_definitions());
+            .tools(local_tools.tool_definitions());
         if round == 1 {
             // Force the first turn through the tool path so the example always demonstrates it.
             request = request.tool_choice(ToolChoice::Required);

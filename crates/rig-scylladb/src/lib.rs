@@ -11,10 +11,12 @@ use rig_core::{
     Embed,
     embeddings::{Embedding, EmbeddingModel},
     vector_store::{
-        InsertDocuments, TopNResults, VectorStoreError, VectorStoreIndex, VectorStoreIndexDyn,
-        request::{Filter, FilterError, SearchFilter, VectorSearchRequest},
+        InsertDocuments, VectorStoreError, VectorStoreIndex,
+        request::{
+            DynamicSearchFilter, Filter, FilterError, SearchFilter, SqlCondition,
+            VectorSearchRequest,
+        },
     },
-    wasm_compat::WasmBoxedFuture,
 };
 use scylla::{
     client::{Compression, session::Session, session_builder::SessionBuilder},
@@ -33,7 +35,11 @@ use uuid::Uuid;
 ///
 /// ScyllaDB is a high-performance NoSQL database that's compatible with Apache Cassandra
 /// and provides excellent performance for vector storage and similarity search operations.
-pub struct ScyllaDbVectorStore<M: EmbeddingModel> {
+///
+/// The store is generic over its embedding model `M`, which is fixed for the
+/// store's lifetime: an index populated under one model is only meaningful under
+/// that same model.
+pub struct ScyllaDbVectorStore<M> {
     /// Model used to generate embeddings for the vector store
     model: M,
     /// Session instance for ScyllaDB communication
@@ -93,15 +99,18 @@ fn cql_value_from_json(value: serde_json::Value) -> Result<CqlValue, FilterError
     }
 }
 
-#[derive(Clone, Debug)]
-pub struct ScyllaSearchFilter {
-    condition: String,
-    params: Vec<CqlValue>,
-}
+/// Placeholder token CQL expects for every bind parameter.
+const PLACEHOLDER: &str = "?";
 
+/// ScyllaDB query filter: a CQL `WHERE` fragment plus the values to bind to it.
+#[derive(Clone, Debug)]
+pub struct ScyllaSearchFilter(SqlCondition<CqlValue>);
+
+/// Only the condition is hashed: it is what the prepared-statement cache is
+/// keyed on, and the bound parameters do not change the statement text.
 impl std::hash::Hash for ScyllaSearchFilter {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        self.condition.hash(state)
+        self.0.condition().hash(state);
     }
 }
 
@@ -109,82 +118,58 @@ impl SearchFilter for ScyllaSearchFilter {
     type Value = CqlValue;
 
     fn eq(key: impl AsRef<str>, value: Self::Value) -> Self {
-        Self {
-            condition: format!("{} = ?", key.as_ref()),
-            params: vec![value],
-        }
+        Self(SqlCondition::binary(key, "=", PLACEHOLDER, value))
     }
 
     fn gt(key: impl AsRef<str>, value: Self::Value) -> Self {
-        Self {
-            condition: format!("{} > ?", key.as_ref()),
-            params: vec![value],
-        }
+        Self(SqlCondition::binary(key, ">", PLACEHOLDER, value))
     }
 
     fn lt(key: impl AsRef<str>, value: Self::Value) -> Self {
-        Self {
-            condition: format!("{} < ?", key.as_ref()),
-            params: vec![value],
-        }
+        Self(SqlCondition::binary(key, "<", PLACEHOLDER, value))
     }
 
     fn and(self, rhs: Self) -> Self {
-        Self {
-            condition: format!("({}) AND ({})", self.condition, rhs.condition),
-            params: self.params.into_iter().chain(rhs.params).collect(),
-        }
+        Self(self.0.and(rhs.0))
     }
 
     fn or(self, rhs: Self) -> Self {
-        Self {
-            condition: format!("({}) OR ({})", self.condition, rhs.condition),
-            params: self.params.into_iter().chain(rhs.params).collect(),
-        }
+        Self(self.0.or(rhs.0))
     }
 }
 
 impl ScyllaSearchFilter {
+    fn condition(&self) -> &str {
+        self.0.condition()
+    }
+
     fn params(&self) -> &[CqlValue] {
-        self.params.as_slice()
+        self.0.params()
     }
 
     #[allow(clippy::should_implement_trait)]
     pub fn not(self) -> Self {
-        Self {
-            condition: format!("NOT ({})", self.condition),
-            ..self
-        }
+        Self(self.0.not())
     }
 
-    pub fn gte(key: String, value: <Self as SearchFilter>::Value) -> Self {
-        Self {
-            condition: format!("{key} >= ?"),
-            params: vec![value],
-        }
+    pub fn gte(key: impl Into<String>, value: <Self as SearchFilter>::Value) -> Self {
+        let key = key.into();
+        Self(SqlCondition::binary(key, ">=", PLACEHOLDER, value))
     }
 
-    pub fn lte(key: String, value: <Self as SearchFilter>::Value) -> Self {
-        Self {
-            condition: format!("{key} <= ?"),
-            params: vec![value],
-        }
+    pub fn lte(key: impl Into<String>, value: <Self as SearchFilter>::Value) -> Self {
+        let key = key.into();
+        Self(SqlCondition::binary(key, "<=", PLACEHOLDER, value))
     }
 
-    pub fn ne(key: String, value: <Self as SearchFilter>::Value) -> Self {
-        Self {
-            condition: format!("{key} != ?"),
-            params: vec![value],
-        }
+    pub fn ne(key: impl Into<String>, value: <Self as SearchFilter>::Value) -> Self {
+        let key = key.into();
+        Self(SqlCondition::binary(key, "!=", PLACEHOLDER, value))
     }
 
-    pub fn member(key: String, values: Vec<<Self as SearchFilter>::Value>) -> Self {
-        let placeholders = vec!["?"; values.len()].join(", ");
-
-        Self {
-            condition: format!("{key} IN ({placeholders})"),
-            params: values,
-        }
+    pub fn member(key: impl Into<String>, values: Vec<<Self as SearchFilter>::Value>) -> Self {
+        let key = key.into();
+        Self(SqlCondition::list(key, "IN", PLACEHOLDER, values))
     }
 }
 
@@ -196,10 +181,13 @@ impl TryFrom<Filter<serde_json::Value>> for ScyllaSearchFilter {
     }
 }
 
-impl<M> ScyllaDbVectorStore<M>
-where
-    M: EmbeddingModel,
-{
+impl DynamicSearchFilter for ScyllaSearchFilter {
+    fn from_dynamic_filter(filter: Filter<serde_json::Value>) -> Result<Self, FilterError> {
+        Self::try_from(filter)
+    }
+}
+
+impl<M: EmbeddingModel> ScyllaDbVectorStore<M> {
     /// Creates a new instance of `ScyllaDbVectorStore`.
     ///
     /// # Arguments
@@ -364,7 +352,9 @@ where
             } else {
                 let query = format!(
                     "SELECT id, vector, metadata, created_at FROM {}.{} WHERE {} ALLOW FILTERING",
-                    self.keyspace, self.table, filter.condition
+                    self.keyspace,
+                    self.table,
+                    filter.condition()
                 );
 
                 let prepared = self
@@ -439,10 +429,7 @@ where
     }
 }
 
-impl<Model> InsertDocuments for ScyllaDbVectorStore<Model>
-where
-    Model: EmbeddingModel + Send + Sync,
-{
+impl<M: EmbeddingModel> InsertDocuments for ScyllaDbVectorStore<M> {
     async fn insert_documents<Doc: Serialize + Embed + Send>(
         &self,
         documents: Vec<(Doc, Vec<Embedding>)>,
@@ -478,10 +465,7 @@ where
     }
 }
 
-impl<M> VectorStoreIndex for ScyllaDbVectorStore<M>
-where
-    M: EmbeddingModel + std::marker::Sync + Send,
-{
+impl<M: EmbeddingModel> VectorStoreIndex for ScyllaDbVectorStore<M> {
     type Filter = ScyllaSearchFilter;
 
     /// Search for the top `n` nearest neighbors to the given query.
@@ -516,33 +500,6 @@ where
     }
 }
 
-impl<M> VectorStoreIndexDyn for ScyllaDbVectorStore<M>
-where
-    M: EmbeddingModel + Sync + Send,
-{
-    fn top_n<'a>(
-        &'a self,
-        req: VectorSearchRequest<Filter<serde_json::Value>>,
-    ) -> WasmBoxedFuture<'a, TopNResults> {
-        Box::pin(async move {
-            let req = req.try_map_filter(ScyllaSearchFilter::try_from)?;
-            let results = <Self as VectorStoreIndex>::top_n::<serde_json::Value>(self, req).await?;
-            Ok(results)
-        })
-    }
-
-    fn top_n_ids<'a>(
-        &'a self,
-        req: VectorSearchRequest<Filter<serde_json::Value>>,
-    ) -> WasmBoxedFuture<'a, Result<Vec<(f64, String)>, VectorStoreError>> {
-        Box::pin(async move {
-            let req = req.try_map_filter(ScyllaSearchFilter::try_from)?;
-            let results = <Self as VectorStoreIndex>::top_n_ids(self, req).await?;
-            Ok(results)
-        })
-    }
-}
-
 /// Convenience function to create a ScyllaDB session
 pub async fn create_session(uri: &str) -> Result<Session, VectorStoreError> {
     SessionBuilder::new()
@@ -552,3 +509,6 @@ pub async fn create_session(uri: &str) -> Result<Session, VectorStoreError> {
         .await
         .map_err(VectorStoreError::datastore)
 }
+
+#[cfg(test)]
+mod tests;

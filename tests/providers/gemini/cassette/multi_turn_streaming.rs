@@ -7,7 +7,6 @@ use futures::StreamExt;
 use rig::agent::MultiTurnStreamItem;
 use rig::prelude::*;
 use rig::providers::gemini;
-use rig::streaming::StreamingPrompt;
 use rig::tool::Tool;
 use schemars::{JsonSchema, schema_for};
 use serde::Deserialize;
@@ -37,9 +36,9 @@ async fn runner_driven_multi_turn_streaming_loop() {
                 .build();
 
             let mut stream = agent
-                .stream_prompt(MULTI_TURN_STREAMING_PROMPT)
+                .prompt(MULTI_TURN_STREAMING_PROMPT)
                 .max_turns(10)
-                .await;
+                .stream();
             let mut response = None;
             while let Some(item) = stream.next().await {
                 if let MultiTurnStreamItem::FinalResponse(final_response) =
@@ -53,8 +52,7 @@ async fn runner_driven_multi_turn_streaming_loop() {
             assert_nonempty_response(&response);
             assert!(
                 response.trim().len() >= 30,
-                "expected a substantial streamed response, got {:?}",
-                response
+                "expected a substantial streamed response, got {response:?}"
             );
             assert_mentions_expected_number(&response, MULTI_TURN_STREAMING_EXPECTED_RESULT);
             assert!(

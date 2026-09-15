@@ -1,6 +1,6 @@
 use rig::prelude::*;
 use rig::providers::gemini;
-use rig::providers::gemini::client::Client;
+use rig::providers::gemini::Client;
 use rig::{
     Embed, embeddings::EmbeddingsBuilder, vector_store::in_memory_store::InMemoryVectorStore,
 };
@@ -95,7 +95,7 @@ async fn main() -> Result<(), anyhow::Error> {
     // Create vector store index
     let index = vector_store.index(embedding_model);
     let rag_extractor = gemini_client.extractor::<QuestionnaireResponses>("gemini-2.5-flash")
-        .preamble("
+        .append_preamble("
             You are a questionnaire assistant provided by the procurement department to assist the user in answering the questions.
             You are provided with the questions and based on the information available, you must answer the questions with the right format.
             Use the answer ID field to map the answer to the right question ID. Answer as much as possible without inventing information.
@@ -104,7 +104,7 @@ async fn main() -> Result<(), anyhow::Error> {
         .build();
 
     // Prompt the agent and print the response
-    let response = rag_extractor.extract(APPLICANT_INFO).await?;
+    let response = rag_extractor.extract(APPLICANT_INFO).await?.output;
 
     println!("{response:#?}");
 

@@ -7,11 +7,12 @@ use reqwest_middleware::ClientBuilder;
 use reqwest_retry::{RetryTransientMiddleware, policies::ExponentialBackoff};
 use rig::{prelude::*, providers::anthropic};
 
-fn build_http_client() -> reqwest_middleware::ClientWithMiddleware {
+fn build_http_client() -> rig::rig_reqwest::ReqwestMiddlewareClient {
     let retry_policy = ExponentialBackoff::builder().build_with_max_retries(5);
     ClientBuilder::new(Default::default())
         .with(RetryTransientMiddleware::new_with_policy(retry_policy))
         .build()
+        .into()
 }
 
 #[tokio::main]
@@ -28,8 +29,8 @@ async fn main() -> Result<()> {
         .preamble("You are a helpful assistant.")
         .build();
 
-    let response = agent.prompt("What is 2 + 2?").await?;
-    println!("Response: {}", response);
+    let response = agent.prompt("What is 2 + 2?").await?.output;
+    println!("Response: {response}");
 
     Ok(())
 }

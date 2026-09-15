@@ -1,11 +1,13 @@
-use super::{Client, client::ApiResponse};
-use crate::http_client::HttpClientExt;
+use super::{OpenAICompletions, OpenAIResponses};
 use crate::image_generation;
-use crate::image_generation::{ImageGenerationError, ImageGenerationRequest};
+use crate::image_generation::{
+    ImageGenerationError, ImageGenerationRequest, NormalizeImageGenerationResponse,
+};
 use crate::json_utils::merge_inplace;
-use base64::Engine;
-use base64::prelude::BASE64_STANDARD;
-use serde::Deserialize;
+use crate::providers::internal::image_generation::{
+    GenericImageGenerationModel, JsonImageGenerationProvider, decode_base64_image,
+};
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 // ================================================================
@@ -17,168 +19,112 @@ pub const GPT_IMAGE_1: &str = "gpt-image-1";
 pub const GPT_IMAGE_1_5: &str = "gpt-image-1.5";
 pub const GPT_IMAGE_2: &str = "gpt-image-2";
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ImageGenerationData {
     pub b64_json: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ImageGenerationResponse {
     pub created: i32,
     pub data: Vec<ImageGenerationData>,
 }
 
-impl TryFrom<ImageGenerationResponse>
-    for image_generation::ImageGenerationResponse<ImageGenerationResponse>
-{
-    type Error = ImageGenerationError;
-
-    fn try_from(value: ImageGenerationResponse) -> Result<Self, Self::Error> {
-        let b64_json = value
-            .data
-            .first()
-            .ok_or_else(|| ImageGenerationError::ResponseError("missing image data".into()))?
-            .b64_json
-            .clone();
-
-        let bytes = BASE64_STANDARD
-            .decode(&b64_json)
-            .map_err(|err| ImageGenerationError::ResponseError(err.to_string()))?;
-
-        Ok(image_generation::ImageGenerationResponse {
-            image: bytes,
-            response: value,
-        })
+impl NormalizeImageGenerationResponse for ImageGenerationResponse {
+    fn normalize(
+        self,
+        provider: &str,
+    ) -> Result<image_generation::ImageGenerationResponse, ImageGenerationError> {
+        let image = decode_base64_image(
+            &self,
+            |response| response.data.first().map(|image| image.b64_json.as_str()),
+            "missing image data",
+            None,
+        )?;
+        Ok(image_generation::ImageGenerationResponse::new(
+            image, provider,
+        ))
     }
 }
 
-#[derive(Clone)]
-pub struct ImageGenerationModel<T = reqwest::Client> {
-    client: Client<T>,
-    /// Name of the model (e.g.: dall-e-2)
-    pub model: String,
-}
+/// OpenAI image generation model.
+pub type ImageGenerationModel<T = crate::http_client::BoxedHttpClient> =
+    GenericImageGenerationModel<OpenAIResponses, T>;
 
-impl<T> ImageGenerationModel<T> {
-    pub(crate) fn new(client: Client<T>, model: impl Into<String>) -> Self {
-        Self {
-            client,
-            model: model.into(),
-        }
+/// OpenAI image generation model for a client using Chat Completions.
+pub type CompletionsImageGenerationModel<T = crate::http_client::BoxedHttpClient> =
+    GenericImageGenerationModel<OpenAICompletions, T>;
+
+/// Build the `/v1/images/generations` body.
+///
+/// `response_format` is deliberately absent: it is no longer part of this
+/// endpoint's request schema, which rejects it before it even looks at the
+/// model — a request naming a model that does not exist still fails on
+/// `400 Unknown parameter: 'response_format'` first. Rig used to add it for
+/// every model outside a hardcoded `gpt-image-1`/`1.5`/`2` allowlist, so every
+/// other image model — `gpt-image-1-mini`, `chatgpt-image-latest`, and any
+/// dated snapshot of an allowlisted model such as `gpt-image-2-2026-04-21` —
+/// could not generate an image at all. The models this endpoint currently
+/// serves answer with `data[].b64_json`, which is what
+/// [`decode_base64_image`] reads.
+///
+/// This is a statement about *this* endpoint. An OpenAI-**compatible** images
+/// endpoint reached through the same client may still take the field, and may
+/// need it to answer with base64 rather than a URL; such a caller passes it
+/// explicitly through `additional_params`, which the merge below now honors.
+fn build_request(model: &str, generation_request: ImageGenerationRequest) -> serde_json::Value {
+    let mut request = json!({
+        "model": model,
+        "prompt": generation_request.prompt,
+        "size": format!("{}x{}", generation_request.width, generation_request.height),
+    });
+
+    // Last, so a caller can reach the endpoint's other parameters (`quality`,
+    // `background`, `output_format`, `user`, …) and override what is derived
+    // above. xAI's and Gemini's image bodies already honor this field;
+    // dropping it here made `ImageGenerationRequestBuilder::additional_params`
+    // silently inert for OpenAI.
+    //
+    // Azure OpenAI's image body (`providers::azure`) has both defects and in a
+    // worse combination: it hardcodes `response_format` *and* drops
+    // `additional_params`, so an Azure caller cannot even work around the
+    // former. Left alone here because a fix that cannot be recorded against
+    // Azure would be a guess, which is what this change set is trying not to
+    // ship.
+    if let Some(additional_params) = generation_request.additional_params {
+        merge_inplace(&mut request, additional_params);
     }
+
+    request
 }
 
-impl<T> image_generation::ImageGenerationModel for ImageGenerationModel<T>
-where
-    T: HttpClientExt + Clone + Default + std::fmt::Debug + Send + 'static,
-{
+impl JsonImageGenerationProvider for OpenAIResponses {
+    const IMAGE_GENERATION_PATH: &'static str = "/images/generations";
+    const PROVIDER_NAME: &'static str = "openai";
+    const REQUEST_ID_HEADER: Option<&'static str> = Some("x-request-id");
     type Response = ImageGenerationResponse;
 
-    type Client = Client<T>;
-
-    fn make(client: &Self::Client, model: impl Into<String>) -> Self {
-        Self::new(client.clone(), model)
+    fn image_generation_request_body(
+        model: &str,
+        request: ImageGenerationRequest,
+    ) -> Result<serde_json::Value, ImageGenerationError> {
+        Ok(build_request(model, request))
     }
+}
 
-    async fn image_generation(
-        &self,
-        generation_request: ImageGenerationRequest,
-    ) -> Result<image_generation::ImageGenerationResponse<Self::Response>, ImageGenerationError>
-    {
-        let mut request = json!({
-            "model": self.model,
-            "prompt": generation_request.prompt,
-            "size": format!("{}x{}", generation_request.width, generation_request.height),
-        });
+impl JsonImageGenerationProvider for OpenAICompletions {
+    const IMAGE_GENERATION_PATH: &'static str = "/images/generations";
+    const PROVIDER_NAME: &'static str = "openai";
+    const REQUEST_ID_HEADER: Option<&'static str> = Some("x-request-id");
+    type Response = ImageGenerationResponse;
 
-        if !matches!(
-            self.model.as_str(),
-            GPT_IMAGE_1 | GPT_IMAGE_1_5 | GPT_IMAGE_2
-        ) {
-            merge_inplace(
-                &mut request,
-                json!({
-                    "response_format": "b64_json"
-                }),
-            );
-        }
-
-        crate::providers::internal::image_generation::send_image_generation::<
-            _,
-            ApiResponse<ImageGenerationResponse>,
-        >(
-            &self.client,
-            self.client.post("/images/generations")?,
-            request,
-        )
-        .await
+    fn image_generation_request_body(
+        model: &str,
+        request: ImageGenerationRequest,
+    ) -> Result<serde_json::Value, ImageGenerationError> {
+        Ok(build_request(model, request))
     }
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::client::image_generation::ImageGenerationClient;
-    use crate::image_generation::ImageGenerationModel as _;
-    use crate::test_utils::RecordingHttpClient;
-
-    fn request() -> ImageGenerationRequest {
-        ImageGenerationRequest {
-            prompt: "draw a cat".to_string(),
-            width: 256,
-            height: 256,
-            additional_params: None,
-        }
-    }
-
-    #[tokio::test]
-    async fn image_generation_non_success_response_preserves_status_and_body() {
-        let body = r#"{"error":{"message":"invalid image","type":"invalid_request_error"}}"#;
-        let http_client =
-            RecordingHttpClient::with_error_response(http::StatusCode::BAD_REQUEST, body);
-        let client = Client::builder()
-            .api_key("test-key")
-            .http_client(http_client)
-            .build()
-            .expect("build client");
-        let model = client.image_generation_model(DALL_E_3);
-
-        let error = model
-            .image_generation(request())
-            .await
-            .expect_err("image generation should fail with non-success status");
-
-        assert!(matches!(error, ImageGenerationError::HttpError(_)));
-        assert_eq!(
-            error.provider_response_status(),
-            Some(http::StatusCode::BAD_REQUEST)
-        );
-        assert_eq!(error.provider_response_body(), Some(body));
-    }
-
-    #[tokio::test]
-    async fn image_generation_preserves_raw_provider_error_json_on_api_error_envelope() {
-        let body = r#"{"message":"quota exceeded","type":"insufficient_quota"}"#;
-        let http_client = RecordingHttpClient::new(body);
-        let client = Client::builder()
-            .api_key("test-key")
-            .http_client(http_client)
-            .build()
-            .expect("build client");
-        let model = client.image_generation_model(DALL_E_3);
-
-        let error = model
-            .image_generation(request())
-            .await
-            .expect_err("image generation should fail with provider error envelope");
-
-        match &error {
-            ImageGenerationError::ProviderResponse(stored) => {
-                assert_eq!(stored.body, body);
-                assert_eq!(stored.status, Some(http::StatusCode::OK));
-                assert_eq!(error.provider_response_body(), Some(body));
-            }
-            other => panic!("expected ProviderResponse, got {other:?}"),
-        }
-    }
-}
+mod tests;

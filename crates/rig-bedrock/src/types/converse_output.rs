@@ -109,10 +109,10 @@ impl TryFrom<aws_sdk_bedrockruntime::operation::converse::ConverseOutput>
         } = value;
 
         Ok(Self {
-            output: output.map(|x| x.try_into()).transpose()?,
+            output: output.map(std::convert::TryInto::try_into).transpose()?,
             stop_reason: stop_reason.try_into()?,
-            usage: usage.map(|x| x.try_into()).transpose()?,
-            metrics: metrics.map(|x| x.try_into()).transpose()?,
+            usage: usage.map(std::convert::TryInto::try_into).transpose()?,
+            metrics: metrics.map(std::convert::TryInto::try_into).transpose()?,
             additional_model_response_fields: additional_model_response_fields
                 .map(|doc| AwsDocument(doc).into()),
             request_id,
@@ -204,7 +204,6 @@ pub enum ContentBlock {
     ToolResult(ToolResultBlock),
     ToolUse(ToolUseBlock),
     Video(VideoBlock),
-    #[non_exhaustive]
     Unknown,
 }
 #[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
@@ -247,7 +246,6 @@ pub enum CitationLocation {
     DocumentChar(DocumentCharLocation),
     DocumentChunk(DocumentChunkLocation),
     DocumentPage(DocumentPageLocation),
-    #[non_exhaustive]
     Unknown,
 }
 #[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
@@ -296,7 +294,6 @@ pub enum DocumentSource {
     Content(Vec<DocumentContentBlock>),
     S3Location(S3Location),
     Text(String),
-    #[non_exhaustive]
     Unknown,
 }
 #[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
@@ -338,7 +335,6 @@ pub enum GuardrailConverseImageFormat {
 #[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
 pub enum GuardrailConverseImageSource {
     Bytes(Blob),
-    #[non_exhaustive]
     Unknown,
 }
 #[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
@@ -370,7 +366,6 @@ pub enum ImageFormat {
 pub enum ImageSource {
     Bytes(Blob),
     S3Location(S3Location),
-    #[non_exhaustive]
     Unknown,
 }
 
@@ -378,7 +373,6 @@ pub enum ImageSource {
 pub enum ReasoningContentBlock {
     ReasoningText(ReasoningTextBlock),
     RedactedContent(Blob),
-    #[non_exhaustive]
     Unknown,
 }
 #[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
@@ -401,7 +395,6 @@ pub enum ToolResultContentBlock {
     Json(serde_json::Value),
     Text(String),
     Video(VideoBlock),
-    #[non_exhaustive]
     Unknown,
 }
 #[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
@@ -426,7 +419,6 @@ pub enum VideoFormat {
 pub enum VideoSource {
     Bytes(Blob),
     S3Location(S3Location),
-    #[non_exhaustive]
     Unknown,
 }
 #[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
@@ -452,10 +444,9 @@ pub enum ToolResultStatus {
 // error strings match the historical hand-written impls exactly:
 // `Unknown variant for TYPE: {invalid:?}`.
 
-/// Mirror a unit-variant AWS enum: emits owned + borrowed `TryFrom<aws>` impls
-/// and, with the trailing `reverse` flag, a `TryFrom<ours> for aws` impl.
-/// Unlisted variants (including this crate's `Unknown`) fall through to a
-/// `TypeConversionError`.
+/// Mirror a unit-variant AWS enum: emits owned + borrowed `TryFrom<aws>`
+/// impls. Unlisted variants (including this crate's `Unknown`) fall through to
+/// a `TypeConversionError`.
 macro_rules! mirror_enum {
     ($ours:ident, $aws:ty { $($aws_variant:ident => $ours_variant:ident),+ $(,)? }) => {
         impl TryFrom<$aws> for $ours {
@@ -478,27 +469,10 @@ macro_rules! mirror_enum {
             }
         }
     };
-    ($ours:ident, $aws:ty { $($aws_variant:ident => $ours_variant:ident),+ $(,)? }, reverse) => {
-        mirror_enum!($ours, $aws { $($aws_variant => $ours_variant),+ });
-        impl TryFrom<$ours> for $aws {
-            type Error = TypeConversionError;
-            fn try_from(value: $ours) -> Result<Self, TypeConversionError> {
-                type Aws = $aws;
-                match value {
-                    $($ours::$ours_variant => Ok(Aws::$aws_variant),)+
-                    invalid => Err(TypeConversionError::new(&format!(
-                        concat!("Unknown variant for ", stringify!($ours), ": {:?}"),
-                        invalid
-                    ))),
-                }
-            }
-        }
-    };
 }
 
 /// Mirror an AWS union (every listed variant carries a single payload that
-/// converts via `TryInto`): emits the owned `TryFrom<aws>` impl and, with
-/// `reverse`, the `TryFrom<ours> for aws` impl.
+/// converts via `TryInto`): emits the owned `TryFrom<aws>` impl.
 macro_rules! mirror_union {
     ($ours:ident, $aws:ty { $($aws_variant:ident => $ours_variant:ident),+ $(,)? }) => {
         impl TryFrom<$aws> for $ours {
@@ -507,22 +481,6 @@ macro_rules! mirror_union {
                 type Aws = $aws;
                 match value {
                     $(Aws::$aws_variant(value) => Ok($ours::$ours_variant(value.try_into()?)),)+
-                    invalid => Err(TypeConversionError::new(&format!(
-                        concat!("Unknown variant for ", stringify!($ours), ": {:?}"),
-                        invalid
-                    ))),
-                }
-            }
-        }
-    };
-    ($ours:ident, $aws:ty { $($aws_variant:ident => $ours_variant:ident),+ $(,)? }, reverse) => {
-        mirror_union!($ours, $aws { $($aws_variant => $ours_variant),+ });
-        impl TryFrom<$ours> for $aws {
-            type Error = TypeConversionError;
-            fn try_from(value: $ours) -> Result<Self, TypeConversionError> {
-                type Aws = $aws;
-                match value {
-                    $($ours::$ours_variant(value) => Ok(Aws::$aws_variant(value.try_into()?)),)+
                     invalid => Err(TypeConversionError::new(&format!(
                         concat!("Unknown variant for ", stringify!($ours), ": {:?}"),
                         invalid
@@ -544,10 +502,10 @@ mirror_enum!(StopReason, aws_bedrock::StopReason {
 mirror_enum!(ConversationRole, aws_bedrock::ConversationRole {
     Assistant => Assistant,
     User => User,
-}, reverse);
+});
 mirror_enum!(CachePointType, aws_bedrock::CachePointType {
     Default => Default,
-}, reverse);
+});
 mirror_enum!(DocumentFormat, aws_bedrock::DocumentFormat {
     Csv => Csv,
     Doc => Doc,
@@ -558,13 +516,13 @@ mirror_enum!(DocumentFormat, aws_bedrock::DocumentFormat {
     Txt => Txt,
     Xls => Xls,
     Xlsx => Xlsx,
-}, reverse);
+});
 mirror_enum!(ImageFormat, aws_bedrock::ImageFormat {
     Gif => Gif,
     Jpeg => Jpeg,
     Png => Png,
     Webp => Webp,
-}, reverse);
+});
 mirror_enum!(VideoFormat, aws_bedrock::VideoFormat {
     Flv => Flv,
     Mkv => Mkv,
@@ -575,20 +533,20 @@ mirror_enum!(VideoFormat, aws_bedrock::VideoFormat {
     ThreeGp => ThreeGp,
     Webm => Webm,
     Wmv => Wmv,
-}, reverse);
+});
 mirror_enum!(ToolResultStatus, aws_bedrock::ToolResultStatus {
     Error => IsError,
     Success => Success,
-}, reverse);
+});
 mirror_enum!(GuardrailConverseImageFormat, aws_bedrock::GuardrailConverseImageFormat {
     Jpeg => Jpeg,
     Png => Png,
-}, reverse);
+});
 mirror_enum!(GuardrailConverseContentQualifier, aws_bedrock::GuardrailConverseContentQualifier {
     GroundingSource => GroundingSource,
     GuardContent => GuardContent,
     Query => Query,
-}, reverse);
+});
 
 mirror_union!(ConverseOutput, aws_bedrock::ConverseOutput {
     Message => Message,
@@ -604,44 +562,44 @@ mirror_union!(ContentBlock, aws_bedrock::ContentBlock {
     ToolResult => ToolResult,
     ToolUse => ToolUse,
     Video => Video,
-}, reverse);
+});
 mirror_union!(CitationGeneratedContent, aws_bedrock::CitationGeneratedContent {
     Text => Text,
-}, reverse);
+});
 mirror_union!(CitationSourceContent, aws_bedrock::CitationSourceContent {
     Text => Text,
-}, reverse);
+});
 mirror_union!(CitationLocation, aws_bedrock::CitationLocation {
     DocumentChar => DocumentChar,
     DocumentChunk => DocumentChunk,
     DocumentPage => DocumentPage,
-}, reverse);
+});
 mirror_union!(DocumentContentBlock, aws_bedrock::DocumentContentBlock {
     Text => Text,
-}, reverse);
+});
 mirror_union!(GuardrailConverseContentBlock, aws_bedrock::GuardrailConverseContentBlock {
     Image => Image,
     Text => Text,
-}, reverse);
+});
 mirror_union!(GuardrailConverseImageSource, aws_bedrock::GuardrailConverseImageSource {
     Bytes => Bytes,
-}, reverse);
+});
 mirror_union!(ImageSource, aws_bedrock::ImageSource {
     Bytes => Bytes,
     S3Location => S3Location,
-}, reverse);
+});
 mirror_union!(VideoSource, aws_bedrock::VideoSource {
     Bytes => Bytes,
     S3Location => S3Location,
-}, reverse);
+});
 mirror_union!(ReasoningContentBlock, aws_bedrock::ReasoningContentBlock {
     ReasoningText => ReasoningText,
     RedactedContent => RedactedContent,
-}, reverse);
+});
 
 // `DocumentSource::Content` carries a `Vec` payload and
-// `ToolResultContentBlock::Json` bridges Smithy `Document` <-> `serde_json::Value`,
-// so those two unions stay hand-written.
+// `ToolResultContentBlock::Json` bridges Smithy `Document` into
+// `serde_json::Value`, so those two unions stay hand-written.
 
 impl TryFrom<aws_bedrock::DocumentSource> for DocumentSource {
     type Error = TypeConversionError;
@@ -660,30 +618,6 @@ impl TryFrom<aws_bedrock::DocumentSource> for DocumentSource {
                 Ok(DocumentSource::S3Location(value.try_into()?))
             }
             aws_bedrock::DocumentSource::Text(value) => Ok(DocumentSource::Text(value)),
-            invalid => Err(TypeConversionError::new(&format!(
-                "Unknown variant for DocumentSource: {invalid:?}"
-            ))),
-        }
-    }
-}
-
-impl TryFrom<DocumentSource> for aws_bedrock::DocumentSource {
-    type Error = TypeConversionError;
-    fn try_from(value: DocumentSource) -> Result<Self, Self::Error> {
-        match value {
-            DocumentSource::Bytes(value) => {
-                Ok(aws_bedrock::DocumentSource::Bytes(value.try_into()?))
-            }
-            DocumentSource::Content(value) => Ok(aws_bedrock::DocumentSource::Content(
-                value
-                    .into_iter()
-                    .map(TryInto::try_into)
-                    .collect::<Result<_, Self::Error>>()?,
-            )),
-            DocumentSource::S3Location(value) => {
-                Ok(aws_bedrock::DocumentSource::S3Location(value.try_into()?))
-            }
-            DocumentSource::Text(value) => Ok(aws_bedrock::DocumentSource::Text(value)),
             invalid => Err(TypeConversionError::new(&format!(
                 "Unknown variant for DocumentSource: {invalid:?}"
             ))),
@@ -710,32 +644,6 @@ impl TryFrom<aws_bedrock::ToolResultContentBlock> for ToolResultContentBlock {
             aws_bedrock::ToolResultContentBlock::Video(value) => {
                 Ok(ToolResultContentBlock::Video(value.try_into()?))
             }
-            invalid => Err(TypeConversionError::new(&format!(
-                "Unknown variant for ToolResultContentBlock: {invalid:?}"
-            ))),
-        }
-    }
-}
-
-impl TryFrom<ToolResultContentBlock> for aws_bedrock::ToolResultContentBlock {
-    type Error = TypeConversionError;
-    fn try_from(value: ToolResultContentBlock) -> Result<Self, Self::Error> {
-        match value {
-            ToolResultContentBlock::Document(value) => Ok(
-                aws_bedrock::ToolResultContentBlock::Document(value.try_into()?),
-            ),
-            ToolResultContentBlock::Image(value) => Ok(aws_bedrock::ToolResultContentBlock::Image(
-                value.try_into()?,
-            )),
-            ToolResultContentBlock::Json(value) => Ok(aws_bedrock::ToolResultContentBlock::Json(
-                AwsDocument::from(value).0,
-            )),
-            ToolResultContentBlock::Text(value) => {
-                Ok(aws_bedrock::ToolResultContentBlock::Text(value))
-            }
-            ToolResultContentBlock::Video(value) => Ok(aws_bedrock::ToolResultContentBlock::Video(
-                value.try_into()?,
-            )),
             invalid => Err(TypeConversionError::new(&format!(
                 "Unknown variant for ToolResultContentBlock: {invalid:?}"
             ))),
@@ -781,39 +689,12 @@ impl TryFrom<aws_bedrock::Message> for Message {
     }
 }
 
-impl TryFrom<Message> for aws_bedrock::Message {
-    type Error = TypeConversionError;
-    fn try_from(value: Message) -> Result<Self, Self::Error> {
-        aws_bedrock::Message::builder()
-            .set_role(Some(value.role.try_into()?))
-            .set_content(Some(
-                value
-                    .content
-                    .into_iter()
-                    .map(TryInto::try_into)
-                    .collect::<Result<_, Self::Error>>()?,
-            ))
-            .build()
-            .map_err(|e| TypeConversionError::new(&e.to_string()))
-    }
-}
-
 impl TryFrom<aws_bedrock::CachePointBlock> for CachePointBlock {
     type Error = TypeConversionError;
     fn try_from(value: aws_bedrock::CachePointBlock) -> Result<Self, Self::Error> {
         Ok(CachePointBlock {
             kind: value.r#type.try_into()?,
         })
-    }
-}
-
-impl TryFrom<CachePointBlock> for aws_bedrock::CachePointBlock {
-    type Error = TypeConversionError;
-    fn try_from(value: CachePointBlock) -> Result<Self, Self::Error> {
-        aws_bedrock::CachePointBlock::builder()
-            .set_type(Some(value.kind.try_into()?))
-            .build()
-            .map_err(|x| TypeConversionError::new(format!("Converting from CachePointBlock to AWS CachePointBlock should never fail but it seems to have done so: {x}").as_ref()))
     }
 }
 
@@ -841,24 +722,6 @@ impl TryFrom<aws_bedrock::CitationsContentBlock> for CitationsContentBlock {
     }
 }
 
-impl TryFrom<CitationsContentBlock> for aws_bedrock::CitationsContentBlock {
-    type Error = TypeConversionError;
-    fn try_from(value: CitationsContentBlock) -> Result<Self, Self::Error> {
-        let citations = value
-            .citations
-            .map(|x| x.into_iter().map(TryInto::try_into).collect())
-            .transpose()?;
-        let content = value
-            .content
-            .map(|x| x.into_iter().map(TryInto::try_into).collect())
-            .transpose()?;
-        Ok(aws_bedrock::CitationsContentBlock::builder()
-            .set_citations(citations)
-            .set_content(content)
-            .build())
-    }
-}
-
 impl TryFrom<aws_bedrock::Citation> for Citation {
     type Error = TypeConversionError;
     fn try_from(value: aws_bedrock::Citation) -> Result<Self, Self::Error> {
@@ -877,26 +740,6 @@ impl TryFrom<aws_bedrock::Citation> for Citation {
     }
 }
 
-impl TryFrom<Citation> for aws_bedrock::Citation {
-    type Error = TypeConversionError;
-    fn try_from(value: Citation) -> Result<Self, Self::Error> {
-        let location = value.location.map(TryInto::try_into).transpose()?;
-        let content = value
-            .source_content
-            .map(|x| {
-                x.into_iter()
-                    .map(TryInto::try_into)
-                    .collect::<Result<_, Self::Error>>()
-            })
-            .transpose()?;
-        Ok(aws_bedrock::Citation::builder()
-            .set_title(value.title)
-            .set_location(location)
-            .set_source_content(content)
-            .build())
-    }
-}
-
 /// The three citation-location structs are field-identical; mirror them with
 /// one macro.
 macro_rules! mirror_location {
@@ -909,16 +752,6 @@ macro_rules! mirror_location {
                     start: value.start,
                     end: value.end,
                 })
-            }
-        }
-        impl TryFrom<$name> for aws_bedrock::$name {
-            type Error = TypeConversionError;
-            fn try_from(value: $name) -> Result<Self, Self::Error> {
-                Ok(aws_bedrock::$name::builder()
-                    .set_document_index(value.document_index)
-                    .set_start(value.start)
-                    .set_end(value.end)
-                    .build())
             }
         }
     )+};
@@ -942,20 +775,6 @@ impl TryFrom<aws_bedrock::DocumentBlock> for DocumentBlock {
     }
 }
 
-impl TryFrom<DocumentBlock> for aws_bedrock::DocumentBlock {
-    type Error = TypeConversionError;
-    fn try_from(value: DocumentBlock) -> Result<Self, Self::Error> {
-        aws_bedrock::DocumentBlock::builder()
-            .set_format(Some(value.format.try_into()?))
-            .set_name(Some(value.name))
-            .set_source(value.source.map(TryInto::try_into).transpose()?)
-            .set_context(value.context)
-            .set_citations(value.citations.map(TryInto::try_into).transpose()?)
-            .build()
-            .map_err(|e| TypeConversionError::new(&e.to_string()))
-    }
-}
-
 impl TryFrom<aws_bedrock::S3Location> for S3Location {
     type Error = TypeConversionError;
     fn try_from(value: aws_bedrock::S3Location) -> Result<Self, Self::Error> {
@@ -963,17 +782,6 @@ impl TryFrom<aws_bedrock::S3Location> for S3Location {
             uri: value.uri,
             bucket_owner: value.bucket_owner,
         })
-    }
-}
-
-impl TryFrom<S3Location> for aws_bedrock::S3Location {
-    type Error = TypeConversionError;
-    fn try_from(value: S3Location) -> Result<Self, Self::Error> {
-        aws_bedrock::S3Location::builder()
-            .set_uri(Some(value.uri))
-            .set_bucket_owner(value.bucket_owner)
-            .build()
-            .map_err(|e| TypeConversionError::new(&e.to_string()))
     }
 }
 
@@ -986,29 +794,12 @@ impl TryFrom<aws_sdk_bedrockruntime::primitives::Blob> for Blob {
     }
 }
 
-impl TryFrom<Blob> for aws_sdk_bedrockruntime::primitives::Blob {
-    type Error = TypeConversionError;
-    fn try_from(value: Blob) -> Result<Self, Self::Error> {
-        Ok(aws_sdk_bedrockruntime::primitives::Blob::new(value.inner))
-    }
-}
-
 impl TryFrom<aws_bedrock::CitationsConfig> for CitationsConfig {
     type Error = TypeConversionError;
     fn try_from(value: aws_bedrock::CitationsConfig) -> Result<Self, Self::Error> {
         Ok(CitationsConfig {
             enabled: value.enabled,
         })
-    }
-}
-
-impl TryFrom<CitationsConfig> for aws_bedrock::CitationsConfig {
-    type Error = TypeConversionError;
-    fn try_from(value: CitationsConfig) -> Result<Self, Self::Error> {
-        aws_bedrock::CitationsConfig::builder()
-            .set_enabled(Some(value.enabled))
-            .build()
-            .map_err(|e| TypeConversionError::new(&e.to_string()))
     }
 }
 
@@ -1019,17 +810,6 @@ impl TryFrom<aws_bedrock::GuardrailConverseImageBlock> for GuardrailConverseImag
             format: value.format.try_into()?,
             source: value.source.map(TryInto::try_into).transpose()?,
         })
-    }
-}
-
-impl TryFrom<GuardrailConverseImageBlock> for aws_bedrock::GuardrailConverseImageBlock {
-    type Error = TypeConversionError;
-    fn try_from(value: GuardrailConverseImageBlock) -> Result<Self, Self::Error> {
-        aws_bedrock::GuardrailConverseImageBlock::builder()
-            .set_format(Some(value.format.try_into()?))
-            .set_source(value.source.map(TryInto::try_into).transpose()?)
-            .build()
-            .map_err(|e| TypeConversionError::new(&e.to_string()))
     }
 }
 
@@ -1050,21 +830,6 @@ impl TryFrom<aws_bedrock::GuardrailConverseTextBlock> for GuardrailConverseTextB
     }
 }
 
-impl TryFrom<GuardrailConverseTextBlock> for aws_bedrock::GuardrailConverseTextBlock {
-    type Error = TypeConversionError;
-    fn try_from(value: GuardrailConverseTextBlock) -> Result<Self, Self::Error> {
-        let qualifiers = value
-            .qualifiers
-            .map(|v| v.into_iter().map(TryInto::try_into).collect())
-            .transpose()?;
-        aws_bedrock::GuardrailConverseTextBlock::builder()
-            .set_text(Some(value.text))
-            .set_qualifiers(qualifiers)
-            .build()
-            .map_err(|e| TypeConversionError::new(&e.to_string()))
-    }
-}
-
 impl TryFrom<aws_bedrock::ImageBlock> for ImageBlock {
     type Error = TypeConversionError;
     fn try_from(value: aws_bedrock::ImageBlock) -> Result<Self, Self::Error> {
@@ -1075,17 +840,6 @@ impl TryFrom<aws_bedrock::ImageBlock> for ImageBlock {
     }
 }
 
-impl TryFrom<ImageBlock> for aws_bedrock::ImageBlock {
-    type Error = TypeConversionError;
-    fn try_from(value: ImageBlock) -> Result<Self, Self::Error> {
-        aws_bedrock::ImageBlock::builder()
-            .set_format(Some(value.format.try_into()?))
-            .set_source(value.source.map(TryInto::try_into).transpose()?)
-            .build()
-            .map_err(|e| TypeConversionError::new(&e.to_string()))
-    }
-}
-
 impl TryFrom<aws_bedrock::ReasoningTextBlock> for ReasoningTextBlock {
     type Error = TypeConversionError;
     fn try_from(value: aws_bedrock::ReasoningTextBlock) -> Result<Self, Self::Error> {
@@ -1093,17 +847,6 @@ impl TryFrom<aws_bedrock::ReasoningTextBlock> for ReasoningTextBlock {
             text: value.text,
             signature: value.signature,
         })
-    }
-}
-
-impl TryFrom<ReasoningTextBlock> for aws_bedrock::ReasoningTextBlock {
-    type Error = TypeConversionError;
-    fn try_from(value: ReasoningTextBlock) -> Result<Self, Self::Error> {
-        aws_bedrock::ReasoningTextBlock::builder()
-            .set_text(Some(value.text))
-            .set_signature(value.signature)
-            .build()
-            .map_err(|e| TypeConversionError::new(&e.to_string()))
     }
 }
 
@@ -1122,24 +865,6 @@ impl TryFrom<aws_bedrock::ToolResultBlock> for ToolResultBlock {
     }
 }
 
-impl TryFrom<ToolResultBlock> for aws_bedrock::ToolResultBlock {
-    type Error = TypeConversionError;
-    fn try_from(value: ToolResultBlock) -> Result<Self, Self::Error> {
-        aws_bedrock::ToolResultBlock::builder()
-            .set_tool_use_id(Some(value.tool_use_id))
-            .set_content(Some(
-                value
-                    .content
-                    .into_iter()
-                    .map(TryInto::try_into)
-                    .collect::<Result<_, Self::Error>>()?,
-            ))
-            .set_status(value.status.map(TryInto::try_into).transpose()?)
-            .build()
-            .map_err(|e| TypeConversionError::new(&e.to_string()))
-    }
-}
-
 impl TryFrom<aws_bedrock::VideoBlock> for VideoBlock {
     type Error = TypeConversionError;
     fn try_from(value: aws_bedrock::VideoBlock) -> Result<Self, Self::Error> {
@@ -1147,17 +872,6 @@ impl TryFrom<aws_bedrock::VideoBlock> for VideoBlock {
             format: value.format.try_into()?,
             source: value.source.map(TryInto::try_into).transpose()?,
         })
-    }
-}
-
-impl TryFrom<VideoBlock> for aws_bedrock::VideoBlock {
-    type Error = TypeConversionError;
-    fn try_from(value: VideoBlock) -> Result<Self, Self::Error> {
-        aws_bedrock::VideoBlock::builder()
-            .set_format(Some(value.format.try_into()?))
-            .set_source(value.source.map(TryInto::try_into).transpose()?)
-            .build()
-            .map_err(|e| TypeConversionError::new(&e.to_string()))
     }
 }
 
@@ -1172,202 +886,5 @@ impl TryFrom<aws_bedrock::ToolUseBlock> for ToolUseBlock {
     }
 }
 
-impl TryFrom<ToolUseBlock> for aws_bedrock::ToolUseBlock {
-    type Error = TypeConversionError;
-    fn try_from(value: ToolUseBlock) -> Result<Self, Self::Error> {
-        aws_bedrock::ToolUseBlock::builder()
-            .set_tool_use_id(Some(value.tool_use_id))
-            .set_name(Some(value.name))
-            .set_input(Some(AwsDocument::from(value.input).0))
-            .build()
-            .map_err(|e| TypeConversionError::new(&e.to_string()))
-    }
-}
-
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use serde_json::json;
-
-    /// The escape hatch's contract is that nothing the provider sent was
-    /// dropped, and the SDK's output type is `#[non_exhaustive]`, so the
-    /// conversion's rest pattern hides every field added upstream. This pins
-    /// the ones known today — `trace`, `performance_config` and `service_tier`
-    /// were all silently discarded before.
-    #[test]
-    fn converse_output_carries_every_sdk_field() {
-        let sdk_output = aws_sdk_bedrockruntime::operation::converse::ConverseOutput::builder()
-            .stop_reason(aws_bedrock::StopReason::GuardrailIntervened)
-            .output(aws_bedrock::ConverseOutput::Message(
-                aws_bedrock::Message::builder()
-                    .role(aws_bedrock::ConversationRole::Assistant)
-                    .content(aws_bedrock::ContentBlock::Text("blocked".into()))
-                    .build()
-                    .unwrap(),
-            ))
-            .usage(
-                aws_bedrock::TokenUsage::builder()
-                    .input_tokens(1)
-                    .output_tokens(2)
-                    .total_tokens(3)
-                    .build()
-                    .unwrap(),
-            )
-            .metrics(
-                aws_bedrock::ConverseMetrics::builder()
-                    .latency_ms(4)
-                    .build()
-                    .unwrap(),
-            )
-            .trace(
-                aws_bedrock::ConverseTrace::builder()
-                    .guardrail(aws_bedrock::GuardrailTraceAssessment::builder().build())
-                    .build(),
-            )
-            .performance_config(
-                aws_bedrock::PerformanceConfiguration::builder()
-                    .latency(aws_bedrock::PerformanceConfigLatency::Standard)
-                    .build(),
-            )
-            .service_tier(
-                aws_bedrock::ServiceTier::builder()
-                    .r#type(aws_bedrock::ServiceTierType::Default)
-                    .build()
-                    .unwrap(),
-            )
-            .build()
-            .unwrap();
-
-        let mirrored = InternalConverseOutput::try_from(sdk_output).unwrap();
-
-        assert!(mirrored.output.is_some());
-        assert_eq!(mirrored.stop_reason, StopReason::GuardrailIntervened);
-        assert!(mirrored.usage.is_some());
-        assert!(mirrored.metrics.is_some());
-        assert!(
-            mirrored.trace().is_some(),
-            "the guardrail trace must survive the conversion"
-        );
-        assert!(
-            mirrored.performance_config.is_some(),
-            "the performance configuration must survive the conversion"
-        );
-        assert!(
-            mirrored.service_tier.is_some(),
-            "the service tier must survive the conversion"
-        );
-    }
-
-    /// The SDK types behind `trace`, `performance_config` and `service_tier`
-    /// are not `Serialize`, so they are `#[serde(skip)]`: serializing must
-    /// still succeed and must not invent values on the way back.
-    #[test]
-    fn skipped_provider_fields_round_trip_as_absent() {
-        let output = InternalConverseOutput {
-            output: None,
-            stop_reason: StopReason::EndTurn,
-            usage: None,
-            metrics: None,
-            additional_model_response_fields: None,
-            request_id: Some("req-1".to_string()),
-            trace: None,
-            performance_config: None,
-            service_tier: None,
-        };
-
-        let json = serde_json::to_string(&output).unwrap();
-        let restored: InternalConverseOutput = serde_json::from_str(&json).unwrap();
-
-        assert_eq!(restored.request_id(), Some("req-1"));
-        assert!(restored.trace().is_none());
-        assert!(restored.performance_config.is_none());
-        assert!(restored.service_tier.is_none());
-    }
-
-    #[test]
-    fn mirror_enum_converts_known_variants_both_ways() {
-        assert_eq!(
-            StopReason::try_from(aws_bedrock::StopReason::EndTurn).unwrap(),
-            StopReason::EndTurn
-        );
-        // Borrowed impl.
-        assert_eq!(
-            StopReason::try_from(&aws_bedrock::StopReason::ToolUse).unwrap(),
-            StopReason::ToolUse
-        );
-        // Reverse impl, including a renamed pairing (aws `Error` -> ours `IsError`).
-        assert_eq!(
-            ToolResultStatus::try_from(aws_bedrock::ToolResultStatus::Error).unwrap(),
-            ToolResultStatus::IsError
-        );
-        assert_eq!(
-            aws_bedrock::ToolResultStatus::try_from(ToolResultStatus::IsError).unwrap(),
-            aws_bedrock::ToolResultStatus::Error
-        );
-    }
-
-    #[test]
-    fn mirror_enum_unknown_variant_preserves_error_string() {
-        let unknown = aws_bedrock::StopReason::from("weird_stop");
-        let err = StopReason::try_from(unknown.clone()).unwrap_err();
-        assert_eq!(
-            err.to_string(),
-            format!("Unknown variant for StopReason: {unknown:?}")
-        );
-
-        let err = aws_bedrock::ConversationRole::try_from(ConversationRole::Unknown(
-            UnknownVariantValue("nope".to_owned()),
-        ))
-        .unwrap_err();
-        assert!(
-            err.to_string()
-                .starts_with("Unknown variant for ConversationRole:")
-        );
-    }
-
-    #[test]
-    fn additional_model_response_fields_survive_as_json() {
-        let doc: AwsDocument = json!({"reasoning_effort": "low", "depth": 3}).into();
-        let output = aws_sdk_bedrockruntime::operation::converse::ConverseOutput::builder()
-            .stop_reason(aws_bedrock::StopReason::EndTurn)
-            .additional_model_response_fields(doc.0)
-            .build()
-            .unwrap();
-
-        let internal = InternalConverseOutput::try_from(output).unwrap();
-        assert_eq!(
-            internal.additional_model_response_fields,
-            Some(json!({"reasoning_effort": "low", "depth": 3}))
-        );
-
-        // The whole normalized output stays serializable and the extras
-        // survive a serde round trip.
-        let value = serde_json::to_value(&internal).unwrap();
-        assert_eq!(
-            value.get("additional_model_response_fields"),
-            Some(&json!({"reasoning_effort": "low", "depth": 3}))
-        );
-        let back: InternalConverseOutput = serde_json::from_value(value).unwrap();
-        assert_eq!(back, internal);
-    }
-
-    #[test]
-    fn tool_use_input_round_trips_through_json_value() {
-        let aws_block = aws_bedrock::ToolUseBlock::builder()
-            .tool_use_id("call_1")
-            .name("add")
-            .input(AwsDocument::from(json!({"x": 1, "y": 2})).0)
-            .build()
-            .unwrap();
-
-        let ours = ToolUseBlock::try_from(aws_block).unwrap();
-        assert_eq!(ours.input, json!({"x": 1, "y": 2}));
-
-        let back = aws_bedrock::ToolUseBlock::try_from(ours).unwrap();
-        assert_eq!(back.tool_use_id, "call_1");
-        assert_eq!(
-            serde_json::Value::from(AwsDocument(back.input)),
-            json!({"x": 1, "y": 2})
-        );
-    }
-}
+mod tests;

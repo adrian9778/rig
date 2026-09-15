@@ -7,7 +7,7 @@
 //! build time, query embedding at prompt time) alongside the completion
 //! turns.
 
-use rig::completion::{Chat, Message};
+use rig::completion::Message;
 use rig::embeddings::EmbeddingsBuilder;
 use rig::prelude::*;
 use rig::providers::gemini;
@@ -26,8 +26,8 @@ async fn build_tool_index(
     client: &gemini::Client,
     toolset: &ToolSet,
 ) -> rig::vector_store::in_memory_store::InMemoryVectorIndex<
-    gemini::embedding::EmbeddingModel,
     rig::embeddings::ToolSchema,
+    gemini::embedding::EmbeddingModel,
 > {
     let embedding_model = client.embedding_model(gemini::embedding::EMBEDDING_001);
     // ToolSet::schemas() returns registration order, so the recorded
@@ -53,10 +53,13 @@ async fn dynamic_tool_retrieved_and_merged_with_static() {
     with_gemini_cassette(
         "dynamic_tools/dynamic_tool_retrieved_and_merged_with_static",
         |client| async move {
-            let toolset = ToolSet::builder()
-                .retrieved_tool(subtract)
-                .retrieved_tool(EmbedMultiply::default())
-                .build();
+            let mut toolset = ToolSet::default();
+            toolset
+                .add_retrieved_tool(subtract)
+                .expect("the tool context serializes");
+            toolset
+                .add_retrieved_tool(EmbedMultiply::default())
+                .expect("the tool context serializes");
             let index = build_tool_index(&client, &toolset).await;
 
             let agent = client
@@ -74,7 +77,7 @@ async fn dynamic_tool_retrieved_and_merged_with_static() {
                 .await
                 .expect("dynamic tool prompt should succeed");
 
-            assert_mentions_expected_number(&response, 42);
+            assert_mentions_expected_number(&response.output, 42);
             assert!(
                 history_has_assistant_tool_call(&history, "subtract"),
                 "the retrieved dynamic tool should be called: {history:?}"
@@ -97,10 +100,13 @@ async fn dynamic_only_agent_retrieves_tool_per_prompt() {
     with_gemini_cassette(
         "dynamic_tools/dynamic_only_agent_retrieves_tool_per_prompt",
         |client| async move {
-            let toolset = ToolSet::builder()
-                .retrieved_tool(add)
-                .retrieved_tool(EmbedSubtract::default())
-                .build();
+            let mut toolset = ToolSet::default();
+            toolset
+                .add_retrieved_tool(add)
+                .expect("the tool context serializes");
+            toolset
+                .add_retrieved_tool(EmbedSubtract::default())
+                .expect("the tool context serializes");
             let index = build_tool_index(&client, &toolset).await;
 
             let agent = client
@@ -117,7 +123,7 @@ async fn dynamic_only_agent_retrieves_tool_per_prompt() {
                 .await
                 .expect("dynamic-only tool prompt should succeed");
 
-            assert_mentions_expected_number(&response, 42);
+            assert_mentions_expected_number(&response.output, 42);
             let texts: Vec<String> = history.iter().flat_map(tool_result_texts).collect();
             assert_eq!(texts, vec!["42".to_string()]);
             assert_eq!(
@@ -135,11 +141,16 @@ async fn sample_caps_retrieved_definitions() {
     with_gemini_cassette(
         "dynamic_tools/sample_caps_retrieved_definitions",
         |client| async move {
-            let toolset = ToolSet::builder()
-                .retrieved_tool(EmbedAdd::default())
-                .retrieved_tool(EmbedSubtract::default())
-                .retrieved_tool(EmbedMultiply::default())
-                .build();
+            let mut toolset = ToolSet::default();
+            toolset
+                .add_retrieved_tool(EmbedAdd::default())
+                .expect("the tool context serializes");
+            toolset
+                .add_retrieved_tool(EmbedSubtract::default())
+                .expect("the tool context serializes");
+            toolset
+                .add_retrieved_tool(EmbedMultiply::default())
+                .expect("the tool context serializes");
             let index = build_tool_index(&client, &toolset).await;
 
             let agent = client

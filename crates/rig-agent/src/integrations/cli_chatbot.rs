@@ -4,17 +4,46 @@ use rig_core::{
 };
 
 use crate::{
-    agent::{Agent, MultiTurnStreamItem, Text},
-    completion::{Chat, CompletionError, PromptError, Usage},
-    streaming::{StreamedAssistantContent, StreamingPrompt},
+    agent::{Agent, MultiTurnStreamItem},
+    completion::{CompletionError, PromptError, Usage},
+    streaming::{Delta, StreamEvent},
 };
+use rig_core::wasm_compat::WasmCompatSend;
+
+/// One chat turn against caller-owned history, as the CLI chatbot drives it.
+///
+/// [`Agent`] implements it through [`Agent::chat`]; implement it on your own
+/// type to put something other than an agent behind
+/// [`ChatBotBuilder::chat`].
+pub trait Chat {
+    /// Execute one turn and append only committed messages to `history`.
+    fn chat(
+        &self,
+        prompt: impl Into<Message> + WasmCompatSend,
+        history: &mut Vec<Message>,
+    ) -> impl Future<Output = Result<String, PromptError>> + WasmCompatSend;
+}
+
+impl Chat for Agent {
+    async fn chat(
+        &self,
+        prompt: impl Into<Message> + WasmCompatSend,
+        history: &mut Vec<Message>,
+    ) -> Result<String, PromptError> {
+        Agent::chat(self, prompt, history)
+            .await
+            .map(|response| response.output)
+    }
+}
 use futures::StreamExt;
 use std::io::{self, Write};
 
+/// A chatbot over any [`Chat`] implementation.
 pub struct ChatImpl<T>(T)
 where
     T: Chat;
 
+/// A chatbot over an [`Agent`], streaming each answer as it is produced.
 pub struct AgentImpl {
     agent: Agent,
     max_turns: usize,
@@ -22,8 +51,10 @@ pub struct AgentImpl {
     usage: Usage,
 }
 
+/// Builds a [`ChatBot`]: give it an agent or a [`Chat`], then `build`.
 pub struct ChatBotBuilder<T = Missing>(T);
 
+/// A terminal chat loop over an agent or a [`Chat`]; see [`ChatBot::run`].
 pub struct ChatBot<T>(T);
 
 /// Trait to abstract message behavior away from cli_chat/`run` loop
@@ -68,10 +99,10 @@ impl CliChat for AgentImpl {
     ) -> Result<String, PromptError> {
         let mut response_stream = self
             .agent
-            .stream_prompt(prompt)
+            .prompt(prompt)
             .history(history.clone())
             .max_turns(self.max_turns)
-            .await;
+            .stream();
 
         let mut acc = String::new();
         let mut messages = None;
@@ -83,20 +114,23 @@ impl CliChat for AgentImpl {
             };
 
             match chunk {
-                Ok(MultiTurnStreamItem::StreamAssistantItem(StreamedAssistantContent::Text(
-                    Text { text, .. },
-                ))) => {
-                    print!("{}", text);
+                Ok(MultiTurnStreamItem::StreamAssistantItem(StreamEvent::BlockDelta {
+                    delta: Delta::Text { text },
+                    ..
+                })) => {
+                    print!("{text}");
                     acc.push_str(&text);
                 }
                 Ok(MultiTurnStreamItem::FinalResponse(final_response)) => {
                     self.usage = final_response.usage();
-                    messages = final_response.messages().map(|history| history.to_vec());
+                    messages = final_response
+                        .messages()
+                        .map(<[rig_core::completion::Message]>::to_vec);
                 }
                 Err(e) => {
-                    break Err(PromptError::CompletionError(
-                        CompletionError::ResponseError(e.to_string()),
-                    ));
+                    // The stream's error is the run's error: the provider's
+                    // report, a cancel, a memory failure — not its `Display`.
+                    break Err(crate::agent::streaming_error_into_prompt(e));
                 }
                 _ => continue,
             }
@@ -130,10 +164,12 @@ impl Default for ChatBotBuilder<Missing> {
 }
 
 impl ChatBotBuilder<Missing> {
+    /// A builder with nothing chosen yet.
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// Chat with `agent`.
     pub fn agent(self, agent: Agent) -> ChatBotBuilder<Provided<AgentImpl>> {
         ChatBotBuilder(Provided(AgentImpl {
             agent,
@@ -143,6 +179,7 @@ impl ChatBotBuilder<Missing> {
         }))
     }
 
+    /// Chat with any [`Chat`] implementation.
     pub fn chat<T: Chat>(self, chatbot: T) -> ChatBotBuilder<Provided<ChatImpl<T>>> {
         ChatBotBuilder(Provided(ChatImpl(chatbot)))
     }
@@ -152,6 +189,7 @@ impl<T> ChatBotBuilder<Provided<ChatImpl<T>>>
 where
     T: Chat,
 {
+    /// The chatbot.
     pub fn build(self) -> ChatBot<ChatImpl<T>> {
         ChatBot(self.0.0)
     }
@@ -167,6 +205,7 @@ impl ChatBotBuilder<Provided<AgentImpl>> {
         }))
     }
 
+    /// Print the token usage after every answer.
     pub fn show_usage(self) -> Self {
         ChatBotBuilder(Provided(AgentImpl {
             show_usage: true,
@@ -174,6 +213,7 @@ impl ChatBotBuilder<Provided<AgentImpl>> {
         }))
     }
 
+    /// The chatbot.
     pub fn build(self) -> ChatBot<AgentImpl> {
         ChatBot(self.0.0)
     }
@@ -184,6 +224,7 @@ impl<T> ChatBot<T>
 where
     T: CliChat,
 {
+    /// Read prompts from stdin and print answers until EOF or `exit`.
     pub async fn run(mut self) -> Result<(), PromptError> {
         let stdin = io::stdin();
         let mut stdout = io::stdout();

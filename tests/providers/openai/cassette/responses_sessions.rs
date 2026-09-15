@@ -13,11 +13,10 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use futures::StreamExt;
 use rig::agent::MultiTurnStreamItem;
-use rig::completion::{Chat, CompletionModel, Message};
+use rig::completion::{CompletionModel, Message};
 use rig::message::{AssistantContent, UserContent};
 use rig::prelude::*;
 use rig::providers::openai;
-use rig::streaming::{StreamingChat, StreamingPrompt};
 use rig::tool::Tool;
 
 use super::super::support::with_openai_cassette;
@@ -111,7 +110,8 @@ async fn sequential_tool_calls_nonstreaming() {
             let result = agent
                 .chat(SEQUENTIAL_TOOLS_PROMPT, &mut history)
                 .await
-                .expect("sequential tool chat should succeed");
+                .expect("sequential tool chat should succeed")
+                .output;
 
             assert_mentions_expected_number(&result, 2);
 
@@ -179,9 +179,10 @@ async fn sequential_tool_calls_streaming() {
                 .build();
 
             let mut stream = agent
-                .stream_chat(SEQUENTIAL_TOOLS_PROMPT, Vec::<Message>::new())
+                .prompt(SEQUENTIAL_TOOLS_PROMPT)
+                .history(Vec::<Message>::new())
                 .max_turns(6)
-                .await;
+                .stream();
             let observation = collect_stream_observation(&mut stream).await;
 
             assert!(
@@ -229,7 +230,8 @@ async fn parallel_tool_calls_single_turn_nonstreaming() {
             let result = agent
                 .chat(TWO_TOOL_STREAM_PROMPT, &mut history)
                 .await
-                .expect("parallel tool chat should succeed");
+                .expect("parallel tool chat should succeed")
+                .output;
 
             let lowered = result.to_ascii_lowercase();
             assert!(
@@ -285,10 +287,7 @@ async fn parallel_tool_calls_single_turn_streaming() {
                 .tool(BetaSignal)
                 .build();
 
-            let mut stream = agent
-                .stream_prompt(TWO_TOOL_STREAM_PROMPT)
-                .max_turns(5)
-                .await;
+            let mut stream = agent.prompt(TWO_TOOL_STREAM_PROMPT).max_turns(5).stream();
             let observation = collect_stream_observation(&mut stream).await;
 
             assert_two_tool_roundtrip_contract(
@@ -328,11 +327,10 @@ async fn long_history_replay_nonstreaming() {
                     _ => None,
                 })
                 .expect("first turn should call lookup_harbor_label");
-            let call_id = tool_call
-                .provider
-                .as_ref()
-                .map(|provider| provider.call_id.clone())
-                .unwrap_or_else(|| tool_call.id.to_string());
+            let call_id = tool_call.provider.as_ref().map_or_else(
+                || tool_call.id.to_string(),
+                |provider| provider.call_id.clone(),
+            );
 
             // Follow-up: replay a long client-owned history around that tool
             // roundtrip. The tool call is re-tagged with a local item ID (not
@@ -417,14 +415,14 @@ async fn reasoning_session_two_tool_calls_streaming() {
                 .build();
 
             let stream = agent
-                .stream_chat(
+                .prompt(
                     "I need the current weather in Tokyo and in Paris. Use the get_weather \
                      tool once per city, then compare the two cities in one short paragraph \
                      that mentions both city names.",
-                    Vec::<Message>::new(),
                 )
+                .history(Vec::<Message>::new())
                 .max_turns(5)
-                .await;
+                .stream();
 
             let stats = reasoning::collect_stream_stats(stream, "openai").await;
 
@@ -484,9 +482,9 @@ async fn usage_accumulates_across_streaming_multi_turn() {
                 .build();
 
             let mut stream = agent
-                .stream_prompt(ORDERED_TOOL_STREAM_PROMPT)
+                .prompt(ORDERED_TOOL_STREAM_PROMPT)
                 .max_turns(5)
-                .await;
+                .stream();
 
             let mut saw_tool_result = false;
             let mut final_usage = None;

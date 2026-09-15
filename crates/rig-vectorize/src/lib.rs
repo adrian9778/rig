@@ -6,7 +6,7 @@
 //! # Example
 //!
 //! ```ignore
-//! use rig_core::client::ProviderClient;
+//! use rig_reqwest::prelude::*;
 //! use rig_core::providers::openai;
 //! use rig_vectorize::VectorizeVectorStore;
 //!
@@ -48,6 +48,10 @@ impl From<VectorizeError> for VectorStoreError {
 ///
 /// This struct implements [`VectorStoreIndex`] to provide vector similarity search
 /// using Cloudflare's globally distributed Vectorize service.
+///
+/// The store is generic over its embedding model `M`, which is fixed for the
+/// store's lifetime: an index populated under one model is only meaningful under
+/// that same model.
 #[derive(Debug, Clone)]
 pub struct VectorizeVectorStore<M> {
     /// The embedding model used to generate query embeddings.
@@ -56,7 +60,7 @@ pub struct VectorizeVectorStore<M> {
     client: VectorizeClient,
 }
 
-impl<M> VectorizeVectorStore<M> {
+impl<M: EmbeddingModel> VectorizeVectorStore<M> {
     /// Creates a new Vectorize vector store.
     ///
     /// # Arguments
@@ -77,10 +81,7 @@ impl<M> VectorizeVectorStore<M> {
     }
 }
 
-impl<M> VectorizeVectorStore<M>
-where
-    M: EmbeddingModel + Sync + Send,
-{
+impl<M: EmbeddingModel> VectorizeVectorStore<M> {
     /// Validates the filter, embeds the query, and returns the threshold-filtered matches.
     async fn query_matches(
         &self,
@@ -111,10 +112,7 @@ where
     }
 }
 
-impl<M> VectorStoreIndex for VectorizeVectorStore<M>
-where
-    M: EmbeddingModel + Sync + Send,
-{
+impl<M: EmbeddingModel> VectorStoreIndex for VectorizeVectorStore<M> {
     type Filter = VectorizeFilter;
 
     async fn top_n<T: for<'a> Deserialize<'a> + Send>(
@@ -147,10 +145,7 @@ where
     }
 }
 
-impl<M> InsertDocuments for VectorizeVectorStore<M>
-where
-    M: EmbeddingModel + Sync + Send,
-{
+impl<M: EmbeddingModel> InsertDocuments for VectorizeVectorStore<M> {
     async fn insert_documents<Doc: Serialize + Embed + Send>(
         &self,
         documents: Vec<(Doc, Vec<Embedding>)>,

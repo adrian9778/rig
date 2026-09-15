@@ -19,12 +19,12 @@
 //! Rig trait and are deliberately not wrapped here.
 //!
 //! Set `VENICE_API_KEY` (and optionally `VENICE_BASE_URL`) to use
-//! [`ProviderClient::from_env`](crate::client::ProviderClient::from_env).
+//! `Client::from_env` (via `rig-reqwest`'s `DefaultTransportClient`).
 //!
 //! # Example
-//! ```no_run
+//! ```ignore
 //! use rig_core::{
-//!     client::{CompletionClient, ProviderClient},
+//!     client::CompletionClient,
 //!     completion::CompletionModel,
 //!     providers::venice,
 //! };
@@ -40,8 +40,8 @@
 //! ```
 //!
 //! # Venice-specific request parameters
-//! ```no_run
-//! use rig_core::client::{CompletionClient, ProviderClient};
+//! ```ignore
+//! use rig_core::client::CompletionClient;
 //! use rig_core::completion::CompletionModel;
 //! use rig_core::providers::venice;
 //!
@@ -79,7 +79,7 @@ pub mod transcription;
 
 #[cfg(feature = "audio")]
 pub use audio_generation::*;
-pub use client::{Client, ClientBuilder, VENICE_API_BASE_URL, VeniceExt, VeniceModelLister};
+pub use client::{Client, ClientBuilder, VENICE_API_BASE_URL, Venice, VeniceModelLister};
 pub use completion::*;
 pub use embedding::*;
 #[cfg(feature = "image")]

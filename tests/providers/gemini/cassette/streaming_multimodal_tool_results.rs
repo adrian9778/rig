@@ -10,7 +10,6 @@ use rig::providers::gemini;
 use rig::providers::gemini::completion::gemini_api_types::{
     AdditionalParameters, GenerationConfig,
 };
-use rig::streaming::StreamingPrompt;
 use rig::tool::{Tool, ToolOutput};
 use serde_json::json;
 
@@ -82,12 +81,12 @@ async fn streaming_history_preserves_hybrid_tool_result_image_parts() {
 
     let empty_history: &[Message] = &[];
     let mut stream = agent
-        .stream_prompt(
+        .prompt(
             "Use the tool once, then answer with the dominant color in the returned image.",
         )
         .history(empty_history)
         .max_turns(4)
-        .await;
+        .stream();
 
     let mut final_response = None;
     let mut final_history = None;
@@ -96,7 +95,7 @@ async fn streaming_history_preserves_hybrid_tool_result_image_parts() {
         match item.expect("streaming prompt should succeed") {
             MultiTurnStreamItem::FinalResponse(response) => {
                 final_response = Some(response.output().to_owned());
-                final_history = response.messages().map(|history| history.to_vec());
+                final_history = response.messages().map(<[rig::completion::Message]>::to_vec);
                 break;
             }
             MultiTurnStreamItem::StreamAssistantItem(_)

@@ -23,9 +23,9 @@
 //! - Integrate LLMs in your app with minimal boilerplate
 //!
 //! # Simple example
-//! ```no_run
+//! ```ignore
 //! use rig_core::{
-//!     client::{CompletionClient, ProviderClient},
+//!     client::CompletionClient,
 //!     completion::{AssistantContent, CompletionModel},
 //!     providers::openai,
 //! };
@@ -99,7 +99,7 @@
 //! - Groq
 //! - Hugging Face
 //! - Hyperbolic
-//! - Llamafile
+//! - llama.cpp (`llama-server`, and llamafile)
 //! - MiniMax
 //! - Mira
 //! - Mistral
@@ -149,7 +149,9 @@ extern crate self as rig;
 pub mod audio_generation;
 pub mod client;
 pub mod completion;
+pub mod effect;
 pub mod embeddings;
+pub mod error;
 pub mod http_client;
 pub mod id;
 #[cfg(feature = "image")]
@@ -163,23 +165,30 @@ pub mod loaders;
 pub mod markers;
 pub mod memory;
 pub mod model;
+pub mod observe;
 pub mod prelude;
 pub(crate) mod provider_response;
 pub mod providers;
 pub mod rerank;
+pub mod serve;
 
 pub mod streaming;
 #[cfg(any(test, feature = "test-utils"))]
 #[cfg_attr(docsrs, doc(cfg(feature = "test-utils")))]
 pub mod test_utils;
 pub mod tool;
+pub mod transcript;
 pub mod transcription;
 pub mod vector_store;
 pub mod wasm_compat;
+#[cfg(feature = "websocket")]
+#[cfg_attr(docsrs, doc(cfg(feature = "websocket")))]
+pub mod ws_client;
 
 // Re-export commonly used types and traits
 pub use completion::message;
 pub use embeddings::Embed;
+pub use error::{ErrorKind, ErrorReport};
 pub use provider_response::ProviderResponseError;
 // `schemars`, `serde`, and `serde_json` are re-exported so macro-generated
 // code (and downstream crates) can resolve them through Rig instead of
@@ -188,6 +197,9 @@ pub use schemars;
 pub use serde;
 pub use serde_json;
 
+#[cfg(feature = "derive")]
+#[cfg_attr(docsrs, doc(cfg(feature = "derive")))]
+pub use rig_derive::ContextValue;
 #[cfg(feature = "derive")]
 #[cfg_attr(docsrs, doc(cfg(feature = "derive")))]
 pub use rig_derive::Embed;
@@ -200,3 +212,24 @@ pub use rig_derive::Embed;
 pub use rig_derive::{rig_tool, rig_tool as tool_macro};
 
 pub mod telemetry;
+
+// Compile-time thread-safety contract. These types cross threads in host
+// runtimes (worker pools, ECS resources); on native they must stay
+// `Send + Sync + 'static`, and losing it is an API break that should fail the
+// build here rather than in a downstream crate.
+#[cfg(not(target_family = "wasm"))]
+const _: fn() = || {
+    fn assert_send_sync_static<T: Send + Sync + 'static>() {}
+    fn assert_send_static<T: Send + 'static>() {}
+    assert_send_sync_static::<tool::PortableDynamicTool>();
+    assert_send_sync_static::<tool::ManagedToolToken>();
+    assert_send_sync_static::<streaming::StreamEvent>();
+    // The serializable identity a typed view is resolved from.
+    assert_send_sync_static::<completion::ModelRef>();
+    assert_send_sync_static::<tool::DynamicTool>();
+    // One erased transport shared by every provider client a host builds.
+    assert_send_sync_static::<http_client::BoxedHttpClient>();
+    // A live stream is owned by one poller: `Send` so it can move to a worker,
+    // not `Sync`.
+    assert_send_static::<streaming::StreamingCompletionResponse>();
+};

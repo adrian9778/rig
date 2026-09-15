@@ -14,13 +14,25 @@ use super::envelope::ProviderEnvelope;
 use crate::client::Client;
 use crate::http_client::multipart::Part;
 use crate::http_client::{self, HttpClientExt, MultipartForm};
-use crate::transcription::{self, TranscriptionError, TranscriptionRequest};
+use crate::transcription::{
+    self, NormalizeTranscriptionResponse, TranscriptionError, TranscriptionRequest,
+};
 
 /// Provider-specific request routing for the shared OpenAI-style model.
-pub(crate) trait OpenAiTranscriptionClient: HttpClientExt + Clone {
+#[doc(hidden)]
+pub trait OpenAiTranscriptionClient: HttpClientExt + Clone {
     /// Whether the model is a multipart form field. Azure addresses the model
     /// as a deployment in the request URL instead.
     const MODEL_IN_FORM: bool;
+
+    /// Stable descriptor name of the provider, stamped on every normalized
+    /// response. An input to normalization, never hardcoded in the shared
+    /// conversion: this wire shape is shared by several providers.
+    const PROVIDER_NAME: &'static str;
+
+    /// The provider's transport request-id response header, when it has one
+    /// (OpenAI `x-request-id`). `None` means the provider reports none.
+    const REQUEST_ID_HEADER: Option<&'static str>;
 
     fn transcription_request(&self, model: &str) -> http_client::Result<http_client::Builder>;
 }
@@ -45,21 +57,35 @@ impl<C> OpenAiTranscriptionModel<C> {
     }
 }
 
-impl<C> transcription::TranscriptionModel for OpenAiTranscriptionModel<C>
+impl<C> OpenAiTranscriptionModel<C>
 where
     C: OpenAiTranscriptionClient + 'static,
 {
-    type Response = crate::providers::openai::TranscriptionResponse;
-    type Client = C;
-
-    fn make(client: &Self::Client, model: impl Into<String>) -> Self {
-        Self::new(client.clone(), model)
-    }
-
-    async fn transcription(
+    /// Perform the transcription and return the provider's native response
+    /// instead of the normalized [`transcription::TranscriptionResponse`].
+    /// Same request, transport, parser, and error path as
+    /// [`transcription::TranscriptionModel::transcription`].
+    pub async fn raw_transcription(
         &self,
         request: TranscriptionRequest,
-    ) -> Result<transcription::TranscriptionResponse<Self::Response>, TranscriptionError> {
+    ) -> Result<crate::providers::openai::TranscriptionResponse, TranscriptionError> {
+        self.raw_transcription_with_request_id(request)
+            .await
+            .map(|(response, _)| response)
+    }
+
+    /// [`Self::raw_transcription`] plus the transport request id from the
+    /// provider's request-id response header, when it carries one.
+    pub async fn raw_transcription_with_request_id(
+        &self,
+        request: TranscriptionRequest,
+    ) -> Result<
+        (
+            crate::providers::openai::TranscriptionResponse,
+            Option<String>,
+        ),
+        TranscriptionError,
+    > {
         let form = transcription_form(
             request,
             TranscriptionFields {
@@ -76,6 +102,33 @@ where
             &self.client,
             self.client.transcription_request(&self.model)?,
             form,
+            C::REQUEST_ID_HEADER,
+        )
+        .await
+    }
+}
+
+impl<C> transcription::TranscriptionModel for OpenAiTranscriptionModel<C>
+where
+    C: OpenAiTranscriptionClient + 'static,
+{
+    async fn transcription(
+        &self,
+        request: TranscriptionRequest,
+    ) -> Result<transcription::TranscriptionResponse, TranscriptionError> {
+        crate::telemetry::instrument_modality(
+            C::PROVIDER_NAME,
+            &self.model,
+            crate::telemetry::ModalityOperation::Transcription,
+            async {
+                let (response, provider_request_id) =
+                    self.raw_transcription_with_request_id(request).await?;
+                let captured = serde_json::to_value(&response)?;
+                Ok(response
+                    .normalize(C::PROVIDER_NAME)?
+                    .with_optional_provider_request_id(provider_request_id)
+                    .with_raw(captured))
+            },
         )
         .await
     }
@@ -87,7 +140,7 @@ where
 /// provider keeps its own [`TranscriptionModel`](transcription::TranscriptionModel)
 /// impl on its alias.
 #[derive(Clone)]
-pub struct GenericTranscriptionModel<Ext, H = reqwest::Client> {
+pub struct GenericTranscriptionModel<Ext, H = crate::http_client::BoxedHttpClient> {
     pub(crate) client: Client<Ext, H>,
     /// Name of the model (e.g.: `whisper-1`)
     pub model: String,
@@ -163,7 +216,9 @@ pub(crate) fn transcription_form(
 }
 
 /// Sends an OpenAI-style transcription request and decodes the shared
-/// success-or-error envelope.
+/// success-or-error envelope, returning the provider's typed payload plus the
+/// transport request id read from `request_id_header`, when the provider has
+/// one and the response carried it.
 ///
 /// `builder` is the provider's already-path-built POST request; `A` is the
 /// provider's own response envelope so error-body classification is unchanged.
@@ -173,12 +228,11 @@ pub(crate) async fn send_transcription<C, A>(
     client: &C,
     builder: http_client::Builder,
     form: MultipartForm,
-) -> Result<transcription::TranscriptionResponse<A::Payload>, TranscriptionError>
+    request_id_header: Option<&str>,
+) -> Result<(A::Payload, Option<String>), TranscriptionError>
 where
     C: HttpClientExt,
     A: DeserializeOwned + ProviderEnvelope,
-    A::Payload:
-        TryInto<transcription::TranscriptionResponse<A::Payload>, Error = TranscriptionError>,
 {
     let req = builder
         .body(form)
@@ -186,25 +240,35 @@ where
 
     let response = client.send_multipart::<Bytes>(req).await?;
 
-    let status = response.status();
-    let response_body = response.into_body().into_future().await?;
+    // Taking the response apart hands the headers over already owned, so both
+    // failure paths keep their rate-limit metadata at no cost to the success
+    // path (rig#2210).
+    let (parts, body) = response.into_parts();
+    let status = parts.status;
+    let provider_request_id = super::request_id_from_headers(&parts.headers, request_id_header);
+    let headers = Box::new(parts.headers);
+    let response_body = body.into_future().await?;
 
     if status.is_success() {
         match serde_json::from_slice::<A>(&response_body)?.into_payload() {
-            Ok(response) => response.try_into(),
+            Ok(response) => Ok((response, provider_request_id)),
             Err(message) => {
                 tracing::warn!(message = %message, "provider returned an error response");
                 Err(TranscriptionError::from_http_response(
                     status,
                     String::from_utf8_lossy(&response_body).into_owned(),
-                ))
+                )
+                .with_provider_request_id(provider_request_id)
+                .with_response_headers(Some(headers)))
             }
         }
     } else {
         Err(TranscriptionError::from_http_response(
             status,
             String::from_utf8_lossy(&response_body).into_owned(),
-        ))
+        )
+        .with_provider_request_id(provider_request_id)
+        .with_response_headers(Some(headers)))
     }
 }
 
@@ -216,17 +280,16 @@ where
 /// provider-specific headers) and `body` the serialized JSON payload. On a
 /// 2xx status the raw body is handed to `decode` together with the status so
 /// each provider keeps its own payload decoding, logging and error-envelope
-/// classification; non-2xx statuses preserve the raw body via
-/// [`TranscriptionError::from_http_response`].
+/// classification; the decoded payload is returned with the transport request
+/// id read from `request_id_header`. Non-2xx statuses preserve the raw body
+/// via [`TranscriptionError::from_http_response`].
 pub(crate) async fn send_json_transcription<C, R>(
     client: &C,
     builder: http_client::Builder,
     body: Vec<u8>,
-    decode: impl FnOnce(
-        http::StatusCode,
-        &[u8],
-    ) -> Result<transcription::TranscriptionResponse<R>, TranscriptionError>,
-) -> Result<transcription::TranscriptionResponse<R>, TranscriptionError>
+    request_id_header: Option<&str>,
+    decode: impl FnOnce(http::StatusCode, &[u8]) -> Result<R, TranscriptionError>,
+) -> Result<(R, Option<String>), TranscriptionError>
 where
     C: HttpClientExt,
 {
@@ -235,165 +298,29 @@ where
         .map_err(|e| TranscriptionError::HttpError(e.into()))?;
 
     let response = client.send::<_, Vec<u8>>(req).await?;
-    let status = response.status();
-    let body = response.into_body().await?;
+    let (parts, body) = response.into_parts();
+    let status = parts.status;
+    let provider_request_id = super::request_id_from_headers(&parts.headers, request_id_header);
+    let headers = Box::new(parts.headers);
+    let body = body.await?;
 
     if status.is_success() {
-        decode(status, &body)
+        Ok((decode(status, &body)?, provider_request_id))
     } else {
         Err(TranscriptionError::from_http_response(
             status,
             String::from_utf8_lossy(&body).into_owned(),
-        ))
+        )
+        .with_provider_request_id(provider_request_id)
+        .with_response_headers(Some(headers)))
     }
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
+mod tests;
 
-    fn request() -> TranscriptionRequest {
-        TranscriptionRequest {
-            data: vec![1, 2, 3],
-            filename: "audio.mp3".to_owned(),
-            language: Some("en".to_owned()),
-            prompt: Some("a prompt".to_owned()),
-            temperature: Some(0.5),
-            additional_params: None,
-        }
-    }
-
-    /// Form field names, in the order they are written to the wire.
-    fn field_names(form: &MultipartForm) -> Vec<&str> {
-        form.parts().iter().map(Part::name).collect()
-    }
-
-    /// The encoded body, so assertions cover what is actually sent rather
-    /// than the builder's internal state.
-    fn encoded(form: MultipartForm) -> String {
-        let (_, body) = form.boundary("BOUNDARY").encode();
-        String::from_utf8_lossy(&body).into_owned()
-    }
-
-    /// The wire representation of a text field.
-    fn text_field(name: &str, value: &str) -> String {
-        format!("Content-Disposition: form-data; name=\"{name}\"\r\n\r\n{value}\r\n")
-    }
-
-    /// Each provider's form shape, as a table so a new provider is one row.
-    #[test]
-    fn form_field_shape_per_provider() {
-        let cases = [
-            (
-                "openai/groq: model in body",
-                TranscriptionFields {
-                    model: Some("whisper-1"),
-                },
-                &["model", "file", "language", "prompt", "temperature"][..],
-            ),
-            (
-                "azure: model addressed through the URL",
-                TranscriptionFields { model: None },
-                &["file", "language", "prompt", "temperature"][..],
-            ),
-        ];
-
-        for (case, fields, expected) in cases {
-            let form = transcription_form(request(), fields).expect(case);
-            assert_eq!(field_names(&form), expected, "{case}");
-        }
-    }
-
-    #[test]
-    fn sends_field_values_on_the_wire() {
-        let form = transcription_form(
-            request(),
-            TranscriptionFields {
-                model: Some("whisper-1"),
-            },
-        )
-        .expect("form should build");
-
-        let body = encoded(form);
-        for (name, value) in [
-            ("model", "whisper-1"),
-            ("language", "en"),
-            ("prompt", "a prompt"),
-            ("temperature", "0.5"),
-        ] {
-            assert!(body.contains(&text_field(name, value)), "{name}: {body}");
-        }
-        assert!(
-            body.contains("name=\"file\"; filename=\"audio.mp3\""),
-            "{body}"
-        );
-    }
-
-    #[test]
-    fn omits_unset_optional_fields() {
-        let request = TranscriptionRequest {
-            data: vec![1, 2, 3],
-            filename: "audio.mp3".to_owned(),
-            language: None,
-            prompt: None,
-            temperature: None,
-            additional_params: None,
-        };
-
-        let form = transcription_form(
-            request,
-            TranscriptionFields {
-                model: Some("whisper-1"),
-            },
-        )
-        .expect("form should build");
-
-        assert_eq!(field_names(&form), ["model", "file"]);
-    }
-
-    #[test]
-    fn flattens_additional_params_onto_the_form() {
-        let mut request = request();
-        request.additional_params = Some(serde_json::json!({
-            "response_format": "verbose_json",
-            "timestamp_granularities": ["word"],
-        }));
-
-        let form = transcription_form(
-            request,
-            TranscriptionFields {
-                model: Some("whisper-1"),
-            },
-        )
-        .expect("form should build");
-
-        // String values go on the form verbatim (a JSON-quoted
-        // `"verbose_json"` would be rejected or ignored by the provider);
-        // non-string values stay JSON-encoded.
-        let body = encoded(form);
-        assert!(
-            body.contains(&text_field("response_format", "verbose_json")),
-            "{body}"
-        );
-        assert!(
-            body.contains(&text_field("timestamp_granularities", "[\"word\"]")),
-            "{body}"
-        );
-    }
-
-    #[test]
-    fn rejects_non_object_additional_params() {
-        let mut request = request();
-        request.additional_params = Some(serde_json::json!("not an object"));
-
-        let error = transcription_form(
-            request,
-            TranscriptionFields {
-                model: Some("whisper-1"),
-            },
-        )
-        .expect_err("non-object additional params should be rejected");
-
-        assert!(matches!(error, TranscriptionError::RequestError(_)));
-    }
-}
+/// rig#2210: a failed transcription response keeps its headers on both shared
+/// drivers, so the capability error's `provider_response_headers()` is not a
+/// promise the driver quietly breaks.
+#[cfg(test)]
+mod header_preservation_tests;

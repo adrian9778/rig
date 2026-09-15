@@ -48,22 +48,17 @@ impl CompletionResponse {
 }
 
 impl crate::telemetry::ProviderResponseExt for CompletionResponse {
-    type OutputMessage = Message;
     type Usage = Usage;
 
-    fn get_response_id(&self) -> Option<String> {
-        Some(self.id.clone())
+    fn response_id(&self) -> Option<&str> {
+        Some(self.id.as_str())
     }
 
-    fn get_response_model_name(&self) -> Option<String> {
+    fn response_model_name(&self) -> Option<&str> {
         None
     }
 
-    fn get_output_messages(&self) -> Vec<Self::OutputMessage> {
-        vec![self.message.clone()]
-    }
-
-    fn get_text_response(&self) -> Option<String> {
+    fn text_response(&self) -> Option<String> {
         let Message::Assistant { ref content, .. } = self.message else {
             return None;
         };
@@ -72,7 +67,7 @@ impl crate::telemetry::ProviderResponseExt for CompletionResponse {
             .iter()
             .filter_map(|x| {
                 if let AssistantContent::Text { text } = x {
-                    Some(text.to_string())
+                    Some(text.clone())
                 } else {
                     None
                 }
@@ -83,8 +78,8 @@ impl crate::telemetry::ProviderResponseExt for CompletionResponse {
         if res.is_empty() { None } else { Some(res) }
     }
 
-    fn get_usage(&self) -> Option<Self::Usage> {
-        self.usage.clone()
+    fn usage(&self) -> Option<Self::Usage> {
+        self.usage
     }
 }
 
@@ -117,7 +112,7 @@ pub(crate) fn map_finish_reason(reason: &FinishReason) -> completion::FinishReas
     }
 }
 
-#[derive(Debug, Deserialize, Clone, Serialize)]
+#[derive(Copy, Debug, Deserialize, Clone, Serialize)]
 pub struct Usage {
     #[serde(default)]
     pub billed_units: Option<BilledUnits>,
@@ -153,7 +148,7 @@ impl From<Usage> for crate::completion::Usage {
     }
 }
 
-#[derive(Debug, Deserialize, Clone, Serialize)]
+#[derive(Copy, Debug, Deserialize, Clone, Serialize)]
 pub struct BilledUnits {
     #[serde(default)]
     pub output_tokens: Option<f64>,
@@ -165,7 +160,7 @@ pub struct BilledUnits {
     pub input_tokens: Option<f64>,
 }
 
-#[derive(Debug, Deserialize, Clone, Serialize)]
+#[derive(Copy, Debug, Deserialize, Clone, Serialize)]
 pub struct Tokens {
     #[serde(default)]
     pub input_tokens: Option<f64>,
@@ -179,7 +174,7 @@ impl TryFrom<CompletionResponse> for completion::CompletionResponse {
     fn try_from(response: CompletionResponse) -> Result<Self, Self::Error> {
         let (content, _, tool_calls) = response.message()?;
 
-        let model_response = if !tool_calls.is_empty() {
+        let mut model_response = if !tool_calls.is_empty() {
             crate::message::require_non_empty(
                 tool_calls
                     .into_iter()
@@ -215,6 +210,8 @@ impl TryFrom<CompletionResponse> for completion::CompletionResponse {
             )?
         };
 
+        crate::message::normalize_missing_tool_call_ids(&mut model_response);
+
         let usage = response
             .usage
             .as_ref()
@@ -234,6 +231,17 @@ impl TryFrom<CompletionResponse> for completion::CompletionResponse {
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct Document {
     pub id: String,
+    /// Document metadata plus its `text`.
+    ///
+    /// Serialized in sorted key order: `HashMap` iteration order is randomized
+    /// per instance, and documents sit inside the `messages` block that Cohere's
+    /// prompt cache keys on. An unsorted map therefore gave every request
+    /// carrying a document a different prefix, so the cache could never hit —
+    /// see [`crate::json_utils::serialize_map_sorted`]. Rig already sorts the
+    /// same metadata deliberately when rendering a document into prompt text
+    /// (`crate::completion::Document`'s `Display`); this makes the native
+    /// document block agree with it.
+    #[serde(serialize_with = "crate::json_utils::serialize_map_sorted")]
     pub data: HashMap<String, serde_json::Value>,
 }
 
@@ -410,7 +418,7 @@ impl TryFrom<message::Message> for Vec<Message> {
                         content: vec![UserContent::Text { text }],
                     }),
                     message::UserContent::ToolResult(tool_result) => Ok(Message::Tool {
-                        tool_call_id: tool_result.wire_call_id().to_owned(),
+                        tool_call_id: tool_result.wire_call_id().into_owned(),
                         content: tool_result
                             .content
                             .into_iter()
@@ -461,7 +469,7 @@ impl TryFrom<message::Message> for Vec<Message> {
                             tool_calls.push(ToolCall {
                                 id: Some(match provider {
                                     Some(provider) => provider.call_id,
-                                    None => id.into_string(),
+                                    None => id.wire_hint().into_owned(),
                                 }),
                                 r#type: Some(ToolType::Function),
                                 function: Some(ToolCallFunction {
@@ -539,6 +547,7 @@ impl TryFrom<Message> for message::Message {
                     ))
                 }));
 
+                crate::message::normalize_missing_tool_call_ids(&mut content);
                 let content = crate::message::require_non_empty(content, || {
                     message::MessageError::ConversionError(
                         "Expected either text content or tool calls".to_string(),
@@ -582,7 +591,7 @@ impl TryFrom<Message> for message::Message {
 }
 
 #[derive(Clone)]
-pub struct CompletionModel<T = reqwest::Client> {
+pub struct CompletionModel<T = crate::http_client::BoxedHttpClient> {
     pub(crate) client: Client<T>,
     pub model: String,
 }
@@ -653,19 +662,29 @@ impl TryFrom<(&str, CompletionRequest)> for CohereCompletionRequest {
         let mut partial_history = vec![];
         partial_history.extend(req.chat_history);
 
-        let mut full_history: Vec<Message> = req.preamble.map_or_else(Vec::new, |preamble| {
-            vec![Message::System { content: preamble }]
-        });
+        let mut full_history: Vec<Message> = Vec::new();
 
-        full_history.extend(
-            partial_history
-                .into_iter()
-                .map(message::Message::try_into)
-                .collect::<Result<Vec<Vec<Message>>, _>>()?
-                .into_iter()
-                .flatten()
-                .collect::<Vec<_>>(),
-        );
+        let tool_ids =
+            crate::providers::internal::tool_call_ids::ToolCallIds::new(&partial_history)
+                .map_err(|error| CompletionError::RequestError(Box::new(error)))?;
+        for (position, message) in partial_history.into_iter().enumerate() {
+            let mut messages = Vec::<Message>::try_from(message)?;
+            let slots: Vec<&mut String> = messages
+                .iter_mut()
+                .flat_map(|message| match message {
+                    Message::Assistant { tool_calls, .. } => tool_calls
+                        .iter_mut()
+                        .filter_map(|call| call.id.as_mut())
+                        .collect(),
+                    Message::Tool { tool_call_id, .. } => vec![tool_call_id],
+                    _ => Vec::new(),
+                })
+                .collect();
+            tool_ids
+                .apply(position, slots)
+                .map_err(|error| CompletionError::RequestError(Box::new(error)))?;
+            full_history.extend(messages);
+        }
 
         let tool_choice = req
             .tool_choice
@@ -688,7 +707,7 @@ impl TryFrom<(&str, CompletionRequest)> for CohereCompletionRequest {
         }
 
         Ok(Self {
-            model: model.to_string(),
+            model,
             messages: full_history,
             documents,
             temperature: req.temperature,
@@ -712,16 +731,6 @@ where
     }
 }
 
-impl<T> crate::client::ConstructCompletionModel<Client<T>> for CompletionModel<T>
-where
-    T: HttpClientExt,
-    Client<T>: Clone,
-{
-    fn construct(client: &Client<T>, model: String) -> Self {
-        Self::new(client.clone(), model)
-    }
-}
-
 impl<T> CompletionModel<T>
 where
     T: HttpClientExt + Clone + 'static,
@@ -738,7 +747,17 @@ where
         &self,
         completion_request: completion::CompletionRequest,
     ) -> Result<CompletionResponse, CompletionError> {
-        let system_instructions = completion_request.preamble.clone();
+        self.raw_completion_observed(completion_request, None).await
+    }
+
+    /// [`Self::raw_completion`] with observation context owned by this
+    /// invocation.
+    async fn raw_completion_observed(
+        &self,
+        completion_request: completion::CompletionRequest,
+        observation: Option<crate::observe::AdapterContext>,
+    ) -> Result<CompletionResponse, CompletionError> {
+        let system_instructions = completion_request.system_instructions().map(str::to_owned);
         let record_telemetry_content = completion_request.record_telemetry_content;
         let request = CohereCompletionRequest::try_from((self.model.as_ref(), completion_request))?;
 
@@ -755,14 +774,17 @@ where
 
         let req_body = serde_json::to_vec(&request)?;
 
-        let req = self
+        let mut req = self
             .client
             .post("/v2/chat")?
             .body(req_body)
             .map_err(|e| CompletionError::HttpError(e.into()))?;
+        if let Some(observation) = observation {
+            observation.attach(&mut req, "/v2/chat");
+        }
 
         // Left unboxed so `provider_response_status`/`_body` can read the
-        // status and body straight off `InvalidStatusCodeWithMessage`.
+        // status and body straight off the transport error.
         send_completion::<_, DirectPayload<CompletionResponse>, _>(
             &self.client,
             req,
@@ -796,495 +818,37 @@ where
         &self,
         completion_request: completion::CompletionRequest,
     ) -> Result<completion::CompletionResponse, CompletionError> {
-        self.raw_completion(completion_request).await?.try_into()
+        self.completion_with_context(completion_request, None).await
     }
 
     async fn stream(
         &self,
         request: CompletionRequest,
     ) -> Result<crate::streaming::StreamingCompletionResponse, CompletionError> {
-        CompletionModel::stream(self, request).await
+        self.stream_with_context(request, None).await
+    }
+
+    async fn completion_with_context(
+        &self,
+        completion_request: completion::CompletionRequest,
+        context: Option<crate::observe::AdapterContext>,
+    ) -> Result<completion::CompletionResponse, CompletionError> {
+        // Capture before `try_into` consumes the raw value.
+        let raw = self
+            .raw_completion_observed(completion_request, context)
+            .await?;
+        let captured = serde_json::to_value(&raw)?;
+        let response: completion::CompletionResponse = raw.try_into()?;
+        Ok(response.with_raw(captured))
+    }
+
+    async fn stream_with_context(
+        &self,
+        request: CompletionRequest,
+        context: Option<crate::observe::AdapterContext>,
+    ) -> Result<crate::streaming::StreamingCompletionResponse, CompletionError> {
+        CompletionModel::stream_observed(self, request, context).await
     }
 }
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use serde_path_to_error::deserialize;
-
-    #[test]
-    fn test_deserialize_completion_response() {
-        let json_data = r#"
-        {
-            "id": "abc123",
-            "message": {
-                "role": "assistant",
-                "tool_plan": "I will use the subtract tool to find the difference between 2 and 5.",
-                "tool_calls": [
-                        {
-                            "id": "subtract_sm6ps6fb6y9f",
-                            "type": "function",
-                            "function": {
-                                "name": "subtract",
-                                "arguments": "{\"x\":5,\"y\":2}"
-                            }
-                        }
-                    ]
-                },
-                "finish_reason": "TOOL_CALL",
-                "usage": {
-                "billed_units": {
-                    "input_tokens": 78,
-                    "output_tokens": 27
-                },
-                "tokens": {
-                    "input_tokens": 1028,
-                    "output_tokens": 63
-                }
-            }
-        }
-        "#;
-
-        let mut deserializer = serde_json::Deserializer::from_str(json_data);
-        let result: Result<CompletionResponse, _> = deserialize(&mut deserializer);
-
-        let response = result.unwrap();
-        let (_, citations, tool_calls) = response.message().expect("assistant message");
-        let CompletionResponse {
-            id,
-            finish_reason,
-            usage,
-            ..
-        } = response;
-
-        assert_eq!(id, "abc123");
-        assert_eq!(finish_reason, FinishReason::ToolCall);
-
-        let Usage {
-            billed_units,
-            tokens,
-            ..
-        } = usage.unwrap();
-        let BilledUnits {
-            input_tokens: billed_input_tokens,
-            output_tokens: billed_output_tokens,
-            ..
-        } = billed_units.unwrap();
-        let Tokens {
-            input_tokens,
-            output_tokens,
-        } = tokens.unwrap();
-
-        assert_eq!(billed_input_tokens.unwrap(), 78.0);
-        assert_eq!(billed_output_tokens.unwrap(), 27.0);
-        assert_eq!(input_tokens.unwrap(), 1028.0);
-        assert_eq!(output_tokens.unwrap(), 63.0);
-
-        assert!(citations.is_empty());
-        assert_eq!(tool_calls.len(), 1);
-
-        let ToolCallFunction { name, arguments } = tool_calls[0].function.clone().unwrap();
-
-        assert_eq!(name, "subtract");
-        assert_eq!(arguments, serde_json::json!({"x": 5, "y": 2}));
-    }
-
-    #[test]
-    fn finish_reason_maps_every_documented_wire_value() {
-        assert_eq!(
-            map_finish_reason(&FinishReason::Complete),
-            completion::FinishReason::Stop
-        );
-        assert_eq!(
-            map_finish_reason(&FinishReason::StopSequence),
-            completion::FinishReason::Stop
-        );
-        assert_eq!(
-            map_finish_reason(&FinishReason::MaxTokens),
-            completion::FinishReason::Length
-        );
-        assert_eq!(
-            map_finish_reason(&FinishReason::ToolCall),
-            completion::FinishReason::ToolCalls
-        );
-        assert_eq!(
-            map_finish_reason(&FinishReason::Error),
-            completion::FinishReason::Other("ERROR".to_owned())
-        );
-    }
-
-    #[test]
-    fn unknown_finish_reason_survives_verbatim() {
-        let reason: FinishReason = serde_json::from_str("\"ERROR_TOXIC\"")
-            .expect("unknown reasons must still deserialize");
-        assert_eq!(reason, FinishReason::Other("ERROR_TOXIC".to_owned()));
-        assert_eq!(
-            map_finish_reason(&reason),
-            completion::FinishReason::Other("ERROR_TOXIC".to_owned())
-        );
-    }
-
-    #[test]
-    fn tool_call_response_normalizes_to_tool_calls_finish_reason() {
-        let response: CompletionResponse = serde_json::from_str(
-            r#"{
-                "id": "abc123",
-                "message": {
-                    "role": "assistant",
-                    "tool_calls": [{
-                        "id": "subtract_1",
-                        "type": "function",
-                        "function": {"name": "subtract", "arguments": "{\"x\":5,\"y\":2}"}
-                    }]
-                },
-                "finish_reason": "TOOL_CALL",
-                "usage": {"tokens": {"input_tokens": 10, "output_tokens": 4}}
-            }"#,
-        )
-        .expect("fixture should deserialize");
-
-        let normalized: completion::CompletionResponse =
-            response.try_into().expect("normalization should succeed");
-
-        assert_eq!(normalized.provider, PROVIDER_NAME);
-        assert_eq!(normalized.response_id.as_deref(), Some("abc123"));
-        assert_eq!(normalized.message_id, None);
-        assert_eq!(normalized.model, None);
-        assert_eq!(
-            normalized.finish_reason(),
-            Some(completion::FinishReason::ToolCalls)
-        );
-        assert_eq!(normalized.usage.input_tokens, 10);
-        assert_eq!(normalized.usage.output_tokens, 4);
-        assert_eq!(normalized.usage.total_tokens, 14);
-    }
-
-    #[test]
-    fn test_convert_completion_message_to_message_and_back() {
-        let completion_message = completion::Message::User {
-            content: vec![completion::message::UserContent::Text(
-                completion::message::Text::new("Hello, world!".to_string()),
-            )],
-        };
-
-        let messages: Vec<Message> = completion_message.clone().try_into().unwrap();
-        let _converted_back: Vec<completion::Message> = messages
-            .into_iter()
-            .map(|msg| msg.try_into().unwrap())
-            .collect::<Vec<_>>();
-    }
-
-    #[test]
-    fn test_convert_message_to_completion_message_and_back() {
-        let message = Message::User {
-            content: vec![UserContent::Text {
-                text: "Hello, world!".to_string(),
-            }],
-        };
-
-        let completion_message: completion::Message = message.clone().try_into().unwrap();
-        let _converted_back: Vec<Message> = completion_message.try_into().unwrap();
-    }
-
-    #[test]
-    fn usage_is_mapped_from_tokens_and_carries_cached_input() {
-        let usage: Usage = serde_json::from_str(
-            r#"{
-                "billed_units": {"input_tokens": 135, "output_tokens": 24},
-                "cached_tokens": 112,
-                "tokens": {"input_tokens": 1610, "output_tokens": 56}
-            }"#,
-        )
-        .expect("usage should deserialize");
-
-        let mapped = crate::completion::Usage::from(&usage);
-        assert_eq!(mapped.input_tokens, 1610);
-        assert_eq!(mapped.output_tokens, 56);
-        assert_eq!(mapped.total_tokens, 1666);
-        assert_eq!(mapped.cached_input_tokens, 112);
-    }
-
-    #[test]
-    fn response_usage_matches_the_canonical_mapping() {
-        let response: CompletionResponse = serde_json::from_str(
-            r#"{
-                "id": "abc123",
-                "finish_reason": "COMPLETE",
-                "message": {"role": "assistant", "content": [{"type": "text", "text": "hi"}]},
-                "usage": {
-                    "billed_units": {"input_tokens": 135, "output_tokens": 24},
-                    "cached_tokens": 112,
-                    "tokens": {"input_tokens": 1610, "output_tokens": 56}
-                }
-            }"#,
-        )
-        .expect("response should deserialize");
-
-        let expected = crate::completion::Usage::from(
-            response.usage.as_ref().expect("usage should be present"),
-        );
-        let converted: completion::CompletionResponse =
-            response.try_into().expect("response should convert");
-
-        assert_eq!(converted.usage, expected);
-        assert_eq!(converted.usage.input_tokens, 1610);
-        assert_eq!(converted.usage.cached_input_tokens, 112);
-    }
-
-    #[test]
-    fn usage_without_token_counts_maps_to_zero() {
-        let usage: Usage = serde_json::from_str("{}").expect("usage should deserialize");
-        assert_eq!(
-            crate::completion::Usage::from(&usage),
-            crate::completion::Usage::new()
-        );
-
-        let cached_only: Usage =
-            serde_json::from_str(r#"{"cached_tokens": 512}"#).expect("usage should deserialize");
-        assert_eq!(
-            crate::completion::Usage::from(&cached_only),
-            crate::completion::Usage::new()
-        );
-    }
-
-    #[test]
-    fn tool_result_content_is_type_tagged() {
-        let text = serde_json::to_value(ToolResultContent::Text {
-            text: "-3".to_owned(),
-        })
-        .expect("tool result text content should serialize");
-        assert_eq!(text, serde_json::json!({"type": "text", "text": "-3"}));
-
-        let document = serde_json::to_value(ToolResultContent::Document {
-            document: Document {
-                id: "doc_1".to_owned(),
-                data: HashMap::from([("text".to_owned(), "-3".into())]),
-            },
-        })
-        .expect("tool result document content should serialize");
-        assert_eq!(
-            document,
-            serde_json::json!({
-                "type": "document",
-                "document": {"id": "doc_1", "data": {"text": "-3"}}
-            })
-        );
-
-        let roundtrip: ToolResultContent =
-            serde_json::from_value(text).expect("tool result content should deserialize");
-        assert_eq!(
-            roundtrip,
-            ToolResultContent::Text {
-                text: "-3".to_owned()
-            }
-        );
-    }
-
-    #[test]
-    fn cohere_builder_request_serializes_documents_in_cohere_shape() {
-        let request = crate::completion::CompletionRequestBuilder::new(
-            crate::test_utils::MockCompletionModel::default(),
-            "What is glarb-glarb?",
-        )
-        .document(crate::completion::request::Document {
-            id: "doc_1".to_string(),
-            text: "Definition of glarb-glarb: an ancient tool.".to_string(),
-            additional_props: HashMap::from([("source".to_string(), "field-notes".to_string())]),
-        })
-        .build();
-
-        let request = CohereCompletionRequest::try_from(("command-a-03-2025", request))
-            .expect("request conversion should succeed");
-
-        assert_eq!(request.documents.len(), 1);
-        assert_eq!(request.documents[0].id, "doc_1");
-
-        let documents = serde_json::to_value(&request.documents)
-            .expect("documents should serialize")
-            .as_array()
-            .cloned()
-            .expect("documents should serialize as an array");
-        assert_eq!(
-            documents[0],
-            serde_json::json!({
-                "id": "doc_1",
-                "data": {
-                    "text": "Definition of glarb-glarb: an ancient tool.",
-                    "source": "field-notes"
-                }
-            })
-        );
-    }
-
-    #[test]
-    fn tool_choice_serializes_as_a_bare_cohere_string() {
-        assert_eq!(
-            serde_json::to_value(CohereToolChoice::Required).expect("serialize"),
-            serde_json::json!("REQUIRED")
-        );
-        assert_eq!(
-            serde_json::to_value(CohereToolChoice::None).expect("serialize"),
-            serde_json::json!("NONE")
-        );
-
-        assert_eq!(
-            CohereToolChoice::try_from(ToolChoice::Required).expect("required is supported"),
-            CohereToolChoice::Required
-        );
-        assert_eq!(
-            CohereToolChoice::try_from(ToolChoice::None).expect("none is supported"),
-            CohereToolChoice::None
-        );
-    }
-
-    #[test]
-    fn unsupported_tool_choices_are_rejected_before_the_request_is_sent() {
-        for unsupported in [
-            ToolChoice::Auto,
-            ToolChoice::Specific {
-                function_names: vec!["subtract".to_string()],
-            },
-        ] {
-            let error = CohereToolChoice::try_from(unsupported.clone())
-                .expect_err("Cohere has no encoding for this tool choice");
-            assert!(
-                matches!(error, CompletionError::RequestError(_)),
-                "expected a request error for {unsupported:?}, got {error:?}"
-            );
-        }
-    }
-
-    /// Invalid REQUIRED requests cannot produce a cassette because validation
-    /// must stop them before the HTTP boundary.
-    #[tokio::test]
-    async fn required_tool_choice_without_tools_is_rejected_before_the_request_is_sent() {
-        use crate::client::CompletionClient;
-        use crate::completion::CompletionModel as _;
-        use crate::test_utils::RecordingHttpClient;
-
-        let http_client = RecordingHttpClient::new("{}");
-        let client = crate::providers::cohere::Client::builder()
-            .api_key("test-key")
-            .http_client(http_client.clone())
-            .build()
-            .expect("build client");
-        let model = client.completion_model(crate::providers::cohere::COMMAND_A_03_2025);
-        let request = model
-            .completion_request("hello")
-            .tool_choice(ToolChoice::Required)
-            .build();
-
-        let error = model
-            .completion(request)
-            .await
-            .expect_err("REQUIRED without tools should fail locally");
-
-        assert!(matches!(error, CompletionError::RequestError(_)));
-        let message = error.to_string();
-        assert!(
-            message.contains("at least one tool") && message.contains("REQUIRED"),
-            "unexpected error: {error:?}"
-        );
-        assert!(
-            http_client.requests().is_empty(),
-            "invalid requests must fail before reaching the HTTP client"
-        );
-    }
-
-    /// This internal unit test protects the raw provider-parameter escape hatch;
-    /// cassette coverage exercises the public typed-tool path instead.
-    #[test]
-    fn required_tool_choice_accepts_raw_tools_from_additional_params() {
-        let request = crate::completion::CompletionRequestBuilder::new(
-            crate::test_utils::MockCompletionModel::default(),
-            "hello",
-        )
-        .tool_choice(ToolChoice::Required)
-        .additional_params(serde_json::json!({
-            "tools": [{
-                "type": "function",
-                "function": {
-                    "name": "ping",
-                    "description": "Return pong",
-                    "parameters": {"type": "object", "properties": {}}
-                }
-            }]
-        }))
-        .build();
-
-        let request = CohereCompletionRequest::try_from(("command-a-03-2025", request))
-            .expect("raw Cohere tools should satisfy REQUIRED");
-        let body = serde_json::to_value(request).expect("request should serialize");
-
-        assert_eq!(body["tool_choice"], serde_json::json!("REQUIRED"));
-        assert_eq!(body["tools"].as_array().map(Vec::len), Some(1));
-    }
-
-    #[test]
-    fn max_tokens_is_forwarded_and_omitted_when_unset() {
-        let capped = crate::completion::CompletionRequestBuilder::new(
-            crate::test_utils::MockCompletionModel::default(),
-            "hello",
-        )
-        .max_tokens(64)
-        .build();
-        let capped = CohereCompletionRequest::try_from(("command-a-03-2025", capped))
-            .expect("request conversion should succeed");
-        let body = serde_json::to_value(&capped).expect("request should serialize");
-        assert_eq!(body["max_tokens"], serde_json::json!(64));
-
-        let uncapped = crate::completion::CompletionRequestBuilder::new(
-            crate::test_utils::MockCompletionModel::default(),
-            "hello",
-        )
-        .build();
-        let uncapped = CohereCompletionRequest::try_from(("command-a-03-2025", uncapped))
-            .expect("request conversion should succeed");
-        let body = serde_json::to_value(&uncapped).expect("request should serialize");
-        assert!(body.get("max_tokens").is_none());
-    }
-
-    #[test]
-    fn tool_choice_is_omitted_when_unset() {
-        let request = crate::completion::CompletionRequestBuilder::new(
-            crate::test_utils::MockCompletionModel::default(),
-            "hello",
-        )
-        .build();
-
-        let request = CohereCompletionRequest::try_from(("command-a-03-2025", request))
-            .expect("request conversion should succeed");
-        let body = serde_json::to_value(&request).expect("request should serialize");
-
-        assert!(body.get("tool_choice").is_none());
-    }
-
-    #[tokio::test]
-    async fn completion_non_success_preserves_status_and_body() {
-        use crate::client::CompletionClient;
-        use crate::completion::CompletionModel as _;
-        use crate::test_utils::RecordingHttpClient;
-
-        let body = r#"{"error":{"message":"boom"}}"#;
-        let http_client =
-            RecordingHttpClient::with_error_response(http::StatusCode::SERVICE_UNAVAILABLE, body);
-        let client = crate::providers::cohere::Client::builder()
-            .api_key("test-key")
-            .http_client(http_client)
-            .build()
-            .expect("build client");
-        let model = client.completion_model(crate::providers::cohere::COMMAND_A_03_2025);
-        let request = model.completion_request("hello").build();
-
-        let error = model
-            .completion(request)
-            .await
-            .expect_err("should fail with non-success status");
-
-        assert!(matches!(error, CompletionError::HttpError(_)));
-        assert_eq!(
-            error.provider_response_status(),
-            Some(http::StatusCode::SERVICE_UNAVAILABLE)
-        );
-        assert_eq!(error.provider_response_body(), Some(body));
-    }
-}
+mod tests;

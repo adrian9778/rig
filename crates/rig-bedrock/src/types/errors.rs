@@ -8,19 +8,26 @@ use aws_sdk_bedrockruntime::operation::invoke_model::InvokeModelError;
 use aws_sdk_bedrockruntime::types::error::ConverseStreamOutputError;
 use rig_core::completion::CompletionError;
 use rig_core::embeddings::EmbeddingError;
+use rig_core::http_client::StatusCode;
 use rig_core::image_generation::ImageGenerationError;
 
-/// Emit a `fn(err) -> (Option<String>, String)` that extracts the
-/// provider-supplied message from an AWS service error.
+/// What a service error said about itself: the provider's message when it
+/// supplied one, Rig's fallback prose otherwise, and the exception type as
+/// the provider's own code (`ThrottlingException`).
+type Classified = (Option<String>, String, Option<String>);
+
+/// Emit a `fn(err) -> Classified` that extracts the provider-supplied
+/// message and exception type from an AWS service error.
 ///
-/// Each generated fn returns `(Some(message), _)` when the service supplied a
-/// genuine error message (which should be surfaced as a provider response
-/// body), otherwise `(None, fallback)` where `fallback` is Rig-authored
-/// diagnostic prose. The caller decides which arm to surface (see [`gated`])
-/// so that Rig prose never leaks into `provider_response_body()`.
+/// Each generated fn returns `(Some(message), _, Some(type))` when the
+/// service supplied a genuine error message (which should be surfaced as a
+/// provider response body), otherwise `(None, fallback, type)` where
+/// `fallback` is Rig-authored diagnostic prose. The caller decides which arm
+/// to surface (see [`gated`]) so that Rig prose never leaks into
+/// `provider_response_body()`.
 macro_rules! service_error_message {
     ($fn_name:ident, $err_ty:ty, $default:expr, { $($variant:ident => $msg:expr),+ $(,)? }) => {
-        fn $fn_name(err: $err_ty) -> (Option<String>, String) {
+        fn $fn_name(err: $err_ty) -> Classified {
             type E = $err_ty;
             // The catch-all arm is not only "an exception we chose not to
             // name": `SdkError::into_service_error` funnels *every*
@@ -33,9 +40,14 @@ macro_rules! service_error_message {
             let metadata_message =
                 ::aws_smithy_types::error::metadata::ProvideErrorMetadata::message(&err)
                     .map(str::to_string);
+            // The exception type is the provider's code: the service's
+            // `x-amzn-errortype` when this SDK version does not model it.
+            let metadata_code =
+                ::aws_smithy_types::error::metadata::ProvideErrorMetadata::code(&err)
+                    .map(str::to_string);
             match err {
-                $(E::$variant(e) => (e.message, $msg.into()),)+
-                _ => (metadata_message, $default.into()),
+                $(E::$variant(e) => (e.message, $msg.into(), Some(stringify!($variant).to_string())),)+
+                _ => (metadata_message, $default.into(), metadata_code),
             }
         }
     };
@@ -72,24 +84,126 @@ impl RawResponseBody for HttpResponse {
 
 /// Prefer the exception's own message; fall back to the raw provider body for
 /// the failures this SDK version cannot classify.
-fn with_raw_body(
-    (message, fallback): (Option<String>, String),
-    raw_body: Option<String>,
-) -> (Option<String>, String) {
-    (message.or(raw_body), fallback)
+fn with_raw_body((message, fallback, code): Classified, raw_body: Option<String>) -> Classified {
+    (message.or(raw_body), fallback, code)
 }
 
-/// Route a `(provider_message, fallback)` pair into an error type: a genuine
-/// provider message becomes a provider response body, otherwise the
-/// Rig-authored fallback becomes a plain provider error.
-fn gated<E>(
-    (message, fallback): (Option<String>, String),
+/// The HTTP status the SDK saw beside the exception, when it kept the raw
+/// response: then the reply classifies by status like any HTTP reply.
+fn raw_response_status<E, R>(error: &SdkError<E, R>) -> Option<StatusCode>
+where
+    R: RawResponseStatus,
+{
+    StatusCode::from_u16(error.raw_response()?.status_u16()).ok()
+}
+
+/// The raw-status accessor for the response type an `SdkError` carries.
+trait RawResponseStatus {
+    fn status_u16(&self) -> u16;
+}
+
+impl RawResponseStatus for HttpResponse {
+    fn status_u16(&self) -> u16 {
+        self.status().as_u16()
+    }
+}
+
+/// Whether a Bedrock exception type is one the same call may reasonably be
+/// retried on when no HTTP status is at hand: the service was busy, not
+/// ready, or timed out. Everything else says the request itself is wrong.
+fn transient_exception(code: &str) -> bool {
+    matches!(
+        code,
+        "ThrottlingException"
+            | "ServiceUnavailableException"
+            | "InternalServerException"
+            | "ModelNotReadyException"
+            | "ModelTimeoutException"
+            | "ModelStreamErrorException"
+    )
+}
+
+/// The facts an SDK error carries beside its message, for [`gated`] to
+/// stamp on the provider's reply.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct Transport {
+    status: Option<StatusCode>,
+    /// The SDK's own classification: a timeout or a dispatch failure never
+    /// reached the service, so the same call may be retried.
+    transient: Option<bool>,
+}
+
+impl Transport {
+    fn of<E, R: RawResponseStatus>(error: &SdkError<E, R>) -> Self {
+        Self {
+            status: raw_response_status(error),
+            transient: matches!(
+                error,
+                SdkError::TimeoutError(_) | SdkError::DispatchFailure(_)
+            )
+            .then_some(true),
+        }
+    }
+}
+
+/// The funnel's setters, so [`gated`] can stamp any capability error, and
+/// its transport variant for a failure that never produced a reply.
+trait ProviderReply: Sized {
+    fn stamp(
+        self,
+        status: Option<StatusCode>,
+        code: Option<String>,
+        transient: Option<bool>,
+    ) -> Self;
+    fn transport_failure(message: String) -> Self;
+}
+
+macro_rules! provider_reply {
+    ($($error:ty),+ $(,)?) => {$(
+        impl ProviderReply for $error {
+            fn stamp(
+                self,
+                status: Option<StatusCode>,
+                code: Option<String>,
+                transient: Option<bool>,
+            ) -> Self {
+                self.with_provider_status(status)
+                    .with_provider_code(code)
+                    .with_transient(transient)
+            }
+            fn transport_failure(message: String) -> Self {
+                Self::HttpError(rig_core::http_client::Error::instance(
+                    std::io::Error::other(message),
+                ))
+            }
+        }
+    )+};
+}
+provider_reply!(CompletionError, EmbeddingError, ImageGenerationError);
+
+/// Route a classified service error into an error type. A genuine provider
+/// message becomes a provider response body carrying the HTTP status the SDK
+/// saw (then the status classifies it), the exception type as its code, and
+/// — without a status — the exception type's own retry verdict. Without a
+/// message: a status the SDK saw is still the provider's reply (an empty
+/// body under that status); a timeout or dispatch failure is a transport
+/// failure, retryable like any response-less one; anything else is the
+/// Rig-authored fallback as a plain provider error.
+fn gated<E: ProviderReply>(
+    (message, fallback, code): Classified,
+    transport: Transport,
     from_body: impl FnOnce(String) -> E,
     provider_error: impl FnOnce(String) -> E,
 ) -> E {
-    match message {
-        Some(msg) => from_body(msg),
-        None => provider_error(fallback),
+    let transient = code
+        .as_deref()
+        .map(transient_exception)
+        .or(transport.transient);
+    match (message, transport.status) {
+        (Some(body), status) => from_body(body).stamp(status, code, transient),
+        (None, Some(status)) => from_body(String::new()).stamp(Some(status), code, transient),
+        (None, None) if transport.transient == Some(true) => E::transport_failure(fallback),
+        (None, None) => provider_error(fallback),
     }
 }
 
@@ -151,8 +265,10 @@ pub struct AwsSdkInvokeModelError(pub SdkError<InvokeModelError, HttpResponse>);
 impl From<AwsSdkInvokeModelError> for ImageGenerationError {
     fn from(value: AwsSdkInvokeModelError) -> Self {
         let raw_body = raw_response_body(&value.0);
+        let transport = Transport::of(&value.0);
         gated(
             with_raw_body(invoke_model_message(value.0.into_service_error()), raw_body),
+            transport,
             ImageGenerationError::from_provider_body,
             ImageGenerationError::ProviderError,
         )
@@ -162,8 +278,10 @@ impl From<AwsSdkInvokeModelError> for ImageGenerationError {
 impl From<AwsSdkInvokeModelError> for EmbeddingError {
     fn from(value: AwsSdkInvokeModelError) -> Self {
         let raw_body = raw_response_body(&value.0);
+        let transport = Transport::of(&value.0);
         gated(
             with_raw_body(invoke_model_message(value.0.into_service_error()), raw_body),
+            transport,
             EmbeddingError::from_provider_body,
             EmbeddingError::ProviderError,
         )
@@ -188,11 +306,13 @@ fn attach_request_id(error: CompletionError, request_id: Option<String>) -> Comp
 impl From<AwsSdkConverseError> for CompletionError {
     fn from(value: AwsSdkConverseError) -> Self {
         let raw_body = raw_response_body(&value.0);
+        let transport = Transport::of(&value.0);
         let request_id =
             aws_sdk_bedrockruntime::operation::RequestId::request_id(&value.0).map(str::to_string);
         attach_request_id(
             gated(
                 with_raw_body(converse_message(value.0.into_service_error()), raw_body),
+                transport,
                 CompletionError::from_provider_body,
                 CompletionError::ProviderError,
             ),
@@ -206,6 +326,7 @@ pub(crate) fn converse_stream_output_completion_error(
 ) -> CompletionError {
     gated(
         converse_stream_output_message(err),
+        Transport::default(),
         CompletionError::from_provider_body,
         CompletionError::ProviderError,
     )
@@ -215,6 +336,7 @@ pub struct AwsSdkConverseStreamError(pub SdkError<ConverseStreamError, HttpRespo
 impl From<AwsSdkConverseStreamError> for CompletionError {
     fn from(value: AwsSdkConverseStreamError) -> Self {
         let raw_body = raw_response_body(&value.0);
+        let transport = Transport::of(&value.0);
         let request_id =
             aws_sdk_bedrockruntime::operation::RequestId::request_id(&value.0).map(str::to_string);
         attach_request_id(
@@ -223,6 +345,7 @@ impl From<AwsSdkConverseStreamError> for CompletionError {
                     converse_stream_message(value.0.into_service_error()),
                     raw_body,
                 ),
+                transport,
                 CompletionError::from_provider_body,
                 CompletionError::ProviderError,
             ),
@@ -256,249 +379,7 @@ impl From<std::convert::Infallible> for TypeConversionError {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use aws_sdk_bedrockruntime::types::error::{
-        InternalServerException, ModelTimeoutException, ValidationException,
-    };
-
-    // NOTE: These tests construct the *extracted* service-error enum variants
-    // directly via the AWS-provided builders and drive the gating helpers plus
-    // the `From` conversions. The `SdkError` wrapper (and thus the public
-    // `AwsSdk*Error` newtypes) cannot be constructed in a unit test, so the
-    // `From` contract is asserted on the helper + builder-routed error type
-    // rather than on the newtype. None of these paths are feature-gated in
-    // `rig-bedrock` (the crate exposes no `image`/`audio` features; the
-    // completion/embedding/image/streaming modules are always compiled), so the
-    // tests only need `#[cfg(test)]`.
-
-    /// Recorded, then replayed: a Bedrock 404 whose exception this SDK version
-    /// does not classify arrives as `Unhandled`, whose `meta()` is empty and
-    /// whose message hides in its source. Before the raw-body fallback, that
-    /// surfaced as `ProviderError("… Verify Internet connection or AWS keys")`
-    /// and the operator never saw "This model version has reached the end of
-    /// its life". Cassette replay covers the classified path; this covers the
-    /// unclassified one, which no cassette can produce once the transport
-    /// preserves `x-amzn-errortype`.
-    #[test]
-    fn unclassified_error_falls_back_to_the_raw_provider_body() {
-        let raw_body = Some(
-            r#"{"message":"This model version has reached the end of its life."}"#.to_string(),
-        );
-        let unclassified = (None, UNEXPECTED.to_string());
-
-        let error: CompletionError = gated(
-            with_raw_body(unclassified, raw_body.clone()),
-            CompletionError::from_provider_body,
-            CompletionError::ProviderError,
-        );
-
-        assert_eq!(error.provider_response_body(), raw_body.as_deref());
-    }
-
-    /// The exception's own message still wins: the raw body is a fallback, not
-    /// a replacement, so classified errors keep their existing wording.
-    #[test]
-    fn classified_error_message_wins_over_the_raw_body() {
-        let classified = (Some("boom".to_string()), UNEXPECTED.to_string());
-
-        let (message, _fallback) =
-            with_raw_body(classified, Some(r#"{"message":"ignored"}"#.to_string()));
-
-        assert_eq!(message, Some("boom".to_string()));
-    }
-
-    /// With neither a classified message nor a body, Rig prose is still the
-    /// fallback — and it must not masquerade as a provider response body.
-    #[test]
-    fn absent_message_and_body_yields_rig_prose_not_a_provider_body() {
-        let error: CompletionError = gated(
-            with_raw_body((None, UNEXPECTED.to_string()), None),
-            CompletionError::from_provider_body,
-            CompletionError::ProviderError,
-        );
-
-        assert_eq!(error.provider_response_body(), None);
-        assert!(matches!(error, CompletionError::ProviderError(_)));
-    }
-
-    #[test]
-    fn invoke_model_message_returns_provider_message_when_present() {
-        let err = InvokeModelError::ModelTimeoutException(
-            ModelTimeoutException::builder().message("boom").build(),
-        );
-        let (message, _fallback) = invoke_model_message(err);
-        assert_eq!(message, Some("boom".to_string()));
-    }
-
-    #[test]
-    fn invoke_model_message_returns_none_when_message_absent() {
-        let err =
-            InvokeModelError::InternalServerException(InternalServerException::builder().build());
-        let (message, fallback) = invoke_model_message(err);
-        assert_eq!(message, None);
-        assert_eq!(fallback, "An internal server error occurred.".to_string());
-    }
-
-    #[test]
-    fn image_generation_with_provider_message_yields_provider_response() {
-        let err = InvokeModelError::ValidationException(
-            ValidationException::builder().message("boom").build(),
-        );
-        let error: ImageGenerationError = match invoke_model_message(err) {
-            (Some(msg), _) => ImageGenerationError::from_provider_body(msg),
-            (None, fallback) => ImageGenerationError::ProviderError(fallback),
-        };
-        assert_eq!(error.provider_response_body(), Some("boom"));
-        assert_eq!(error.provider_response_status(), None);
-    }
-
-    #[test]
-    fn image_generation_without_provider_message_yields_provider_error() {
-        // A matched variant with no message -> `(None, fallback)` -> `ProviderError`,
-        // which must NOT surface Rig prose through `provider_response_body()`.
-        let err = InvokeModelError::ValidationException(ValidationException::builder().build());
-        let error: ImageGenerationError = match invoke_model_message(err) {
-            (Some(msg), _) => ImageGenerationError::from_provider_body(msg),
-            (None, fallback) => ImageGenerationError::ProviderError(fallback),
-        };
-        assert_eq!(error.provider_response_body(), None);
-        assert_eq!(error.provider_response_status(), None);
-    }
-
-    #[test]
-    fn embedding_with_provider_message_yields_provider_response() {
-        let err = InvokeModelError::ValidationException(
-            ValidationException::builder().message("boom").build(),
-        );
-        let error: EmbeddingError = match invoke_model_message(err) {
-            (Some(msg), _) => EmbeddingError::from_provider_body(msg),
-            (None, fallback) => EmbeddingError::ProviderError(fallback),
-        };
-        assert_eq!(error.provider_response_body(), Some("boom"));
-        assert_eq!(error.provider_response_status(), None);
-    }
-
-    #[test]
-    fn embedding_without_provider_message_yields_provider_error() {
-        let err =
-            InvokeModelError::InternalServerException(InternalServerException::builder().build());
-        let error: EmbeddingError = match invoke_model_message(err) {
-            (Some(msg), _) => EmbeddingError::from_provider_body(msg),
-            (None, fallback) => EmbeddingError::ProviderError(fallback),
-        };
-        assert_eq!(error.provider_response_body(), None);
-    }
-
-    #[test]
-    fn converse_message_returns_provider_message_when_present() {
-        let err = ConverseError::ModelTimeoutException(
-            ModelTimeoutException::builder().message("boom").build(),
-        );
-        let (message, _fallback) = converse_message(err);
-        assert_eq!(message, Some("boom".to_string()));
-    }
-
-    #[test]
-    fn converse_with_provider_message_yields_provider_response() {
-        let err = ConverseError::ModelTimeoutException(
-            ModelTimeoutException::builder().message("boom").build(),
-        );
-        let error: CompletionError = match converse_message(err) {
-            (Some(msg), _) => CompletionError::from_provider_body(msg),
-            (None, fallback) => CompletionError::ProviderError(fallback),
-        };
-        assert_eq!(error.provider_response_body(), Some("boom"));
-        assert_eq!(error.provider_response_status(), None);
-    }
-
-    #[test]
-    fn converse_without_provider_message_yields_provider_error() {
-        let err = ConverseError::ModelTimeoutException(ModelTimeoutException::builder().build());
-        let error: CompletionError = match converse_message(err) {
-            (Some(msg), _) => CompletionError::from_provider_body(msg),
-            (None, fallback) => CompletionError::ProviderError(fallback),
-        };
-        assert_eq!(error.provider_response_body(), None);
-        assert_eq!(error.provider_response_status(), None);
-    }
-
-    #[test]
-    fn converse_stream_message_returns_provider_message_when_present() {
-        let err = ConverseStreamError::ModelTimeoutException(
-            ModelTimeoutException::builder().message("boom").build(),
-        );
-        let (message, _fallback) = converse_stream_message(err);
-        assert_eq!(message, Some("boom".to_string()));
-    }
-
-    #[test]
-    fn converse_stream_with_provider_message_yields_provider_response() {
-        let err = ConverseStreamError::ValidationException(
-            ValidationException::builder().message("boom").build(),
-        );
-        let error: CompletionError = match converse_stream_message(err) {
-            (Some(msg), _) => CompletionError::from_provider_body(msg),
-            (None, fallback) => CompletionError::ProviderError(fallback),
-        };
-        assert_eq!(error.provider_response_body(), Some("boom"));
-        assert_eq!(error.provider_response_status(), None);
-    }
-
-    #[test]
-    fn converse_stream_without_provider_message_yields_provider_error() {
-        let err = ConverseStreamError::ValidationException(ValidationException::builder().build());
-        let error: CompletionError = match converse_stream_message(err) {
-            (Some(msg), _) => CompletionError::from_provider_body(msg),
-            (None, fallback) => CompletionError::ProviderError(fallback),
-        };
-        assert_eq!(error.provider_response_body(), None);
-        assert_eq!(error.provider_response_status(), None);
-    }
-
-    #[test]
-    fn converse_stream_output_with_provider_message_yields_provider_response() {
-        let err = ConverseStreamOutputError::ValidationException(
-            ValidationException::builder().message("boom").build(),
-        );
-        let error = converse_stream_output_completion_error(err);
-        assert_eq!(error.provider_response_body(), Some("boom"));
-        assert_eq!(error.provider_response_status(), None);
-    }
-
-    #[test]
-    fn converse_stream_output_without_provider_message_yields_provider_error() {
-        let err =
-            ConverseStreamOutputError::ValidationException(ValidationException::builder().build());
-        let error = converse_stream_output_completion_error(err);
-        assert_eq!(error.provider_response_body(), None);
-        assert_eq!(error.provider_response_status(), None);
-    }
-}
+mod tests;
 
 #[cfg(test)]
-mod request_id_tests {
-    use super::*;
-    use rig_core::ProviderResponseError;
-
-    /// rig#2314: the AWS request id attaches to preserved provider bodies and
-    /// leaves Rig-authored diagnostics untouched.
-    #[test]
-    fn attach_request_id_targets_provider_responses_only() {
-        let attached = attach_request_id(
-            CompletionError::ProviderResponse(ProviderResponseError::without_status("aws said no")),
-            Some("aws-req-1".to_string()),
-        );
-        assert_eq!(attached.provider_request_id(), Some("aws-req-1"));
-        assert!(
-            attached.to_string().contains("request id: aws-req-1"),
-            "the id appears in the logged message: {attached}"
-        );
-
-        let untouched = attach_request_id(
-            CompletionError::ProviderError("rig diagnostic".to_string()),
-            Some("aws-req-1".to_string()),
-        );
-        assert_eq!(untouched.provider_request_id(), None);
-    }
-}
+mod request_id_tests;

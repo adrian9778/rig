@@ -7,8 +7,8 @@
 //! The [Agent] struct is highly configurable, allowing the user to define anything from
 //! a simple bot with a specific system prompt to a complex RAG system.
 //!
-//! The [Agent] struct implements the runner-backed [crate::completion::Prompt],
-//! [crate::completion::TypedPrompt], and [crate::completion::Chat] traits. All
+//! The [Agent] struct exposes the runner-backed [Agent::prompt],
+//! [Agent::prompt_typed], and [Agent::chat] methods. All
 //! agent execution goes through [AgentRunner], so hooks and lifecycle policies
 //! cannot be bypassed through a raw agent request builder.
 //!
@@ -19,7 +19,8 @@
 //! # Example
 //! ```no_run
 //! use rig_agent::prelude::*;
-//! use rig_core::{client::ProviderClient, providers::openai};
+//! use rig_core::providers::openai;
+//! use rig_reqwest::prelude::*;
 //!
 //! # async fn run() -> Result<(), Box<dyn std::error::Error>> {
 //! let openai = openai::Client::from_env()?;
@@ -40,7 +41,7 @@
 //! let prompt_response = agent.prompt("Prompt").await?;
 //!
 //! // Per-run overrides stay inside the hook-aware runner.
-//! let response = agent.runner("Prompt").temperature(0.9).run().await?;
+//! let response = agent.prompt("Prompt").temperature(0.9).run().await?;
 //! # Ok(())
 //! # }
 //! ```
@@ -54,9 +55,10 @@
 //!
 //! Passive RAG agent example
 //! ```no_run
-//! use rig_agent::{completion::Prompt, prelude::*};
+//! use rig_agent::prelude::*;
+//! use rig_reqwest::prelude::*;
 //! use rig_core::{
-//!     client::{EmbeddingsClient, ProviderClient},
+//!     client::EmbeddingsClient,
 //!     embeddings::EmbeddingsBuilder,
 //!     providers::openai,
 //!     vector_store::in_memory_store::InMemoryVectorStore,
@@ -101,35 +103,46 @@
 //! ```
 mod builder;
 mod completion;
+pub(crate) mod drive;
+mod engine;
+pub(crate) use engine::streaming_error_into_prompt;
 pub mod hook;
-pub mod model;
-pub(crate) mod prompt_request;
 pub mod run;
 pub mod runner;
+mod streaming;
+mod telemetry;
 mod tool;
+mod typed;
 
 /// Fallback display name used in telemetry spans and logs when an agent has no
 /// configured name.
 pub(crate) const UNKNOWN_AGENT_NAME: &str = "Unnamed Agent";
 
+pub use crate::bus::ModelHandle;
+pub use crate::run::response::{CompletionCall, MemoryAppend, PromptResponse};
+pub use crate::run::spec::RunSpec;
 pub use builder::{AgentBuilder, NoToolConfig, WithBuilderTools, WithToolServerHandle};
-pub use completion::Agent;
+pub use completion::{Agent, AgentParts};
 pub use hook::CompletionCall as CompletionCallEvent;
 pub use hook::{
-    AgentHook, CompletionCallAction, CompletionResponse as CompletionResponseEvent, HookContext,
-    HookStack, InvalidToolCallAction, InvalidToolCallContext, ModelSelection, ModelSelectionAction,
-    ModelTurnAction, ModelTurnFinished, ObservationAction, ReasoningDelta, RequestPatch,
-    RetryRequest, RunId, Scratchpad, StepEventKind, StreamResponseFinish, TextDelta, ToolCall,
-    ToolCallAction, ToolCallDelta, ToolResultAction, ToolResultEvent,
+    AgentHook, CompletionCallAction, HookContext, HookStack, InvalidToolCallAction,
+    InvalidToolCallContext, ModelSelection, ModelSelectionAction, ModelTurnAction,
+    ModelTurnFinished, ObservationAction, ReasoningDelta, RequestPatch, RetryRequest, RunEntry,
+    RunHandle, RunId, RunSettled, RunStart, RunStartAction, Scratchpad, SettledOutcome,
+    StepEventKind, TextDelta, ToolCallDelta,
 };
-pub use model::ModelHandle;
-pub use prompt_request::streaming::{
-    MultiTurnStreamItem, StreamingError, StreamingPromptRequest, StreamingResult, stream_to_stdout,
-};
-pub use prompt_request::{
-    CompletionCall, Extended, PromptRequest, PromptResponse, PromptType, ResponseIdentity,
-    Standard, TypedPromptRequest, TypedPromptResponse,
-};
+pub use hook::{DispatchAction, DispatchEvent, OutcomeAction, OutcomeEvent};
+pub use rig_core::completion::ModelRef;
+/// The provider-neutral identity carrier, re-exported from rig-core so agent
+/// callers name one type across core responses, stream terminals, completion
+/// calls, and hook events.
+pub use rig_core::completion::ResponseIdentity;
 pub use rig_core::message::Text;
+pub use run::TurnTools;
 pub use run::{AgentRun, AgentRunStep, ModelTurn, ModelTurnOutcome, OutputMode, PendingToolCall};
 pub use runner::AgentRunner;
+pub use streaming::{
+    MultiTurnStreamItem, RUN_EVENTS_CAPACITY, RunEvents, StreamingError, StreamingResult,
+    stream_to_stdout,
+};
+pub use typed::{TypedPromptResponse, TypedRun};
