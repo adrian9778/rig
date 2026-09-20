@@ -16,20 +16,14 @@
 //! | the witness changes nothing about the program | `a_witness_changes_nothing` |
 //! | a full sink is incomplete, never silently equal | `a_full_sink_reports_incompleteness` |
 
-#![allow(
-    clippy::expect_used,
-    clippy::unwrap_used,
-    clippy::panic,
-    clippy::indexing_slicing,
-    clippy::type_complexity
-)]
-
 use crate::bus_support;
 
 use std::sync::Arc;
 
 use bevy_ecs::prelude::*;
 use bus_support::*;
+use rig_cassette::ecs::EffectLogResource;
+use rig_cassette::effect_log::EffectLogRecorder;
 use rig_core::test_utils::observations::{Comparison, compare};
 use rig_core::{
     effect::{EffectFamily, EffectId, EffectKind, Outcome},
@@ -41,10 +35,9 @@ use rig_core::{
     serve::{Decision, Dispatch, ErasedHandler, Intercept, Reply, Serve, ServingPolicy, Verdict},
 };
 use rig_ecs::bus::{
-    BusSet, EffectLogResource, EffectOutcome, Handlers, Held, InFlight, Issued, PendingEffect,
-    RigSchedule, Scope, Witnessing, WorldOutcome,
+    BusSet, EffectOutcome, Handlers, Held, InFlight, Issued, PendingEffect, RigSchedule, Scope,
+    Witnessing, WorldOutcome,
 };
-use rig_effect_log::EffectLogRecorder;
 
 fn witnessed(app: &mut bevy_app::App) -> Arc<ObservationLog> {
     let log = Arc::new(ObservationLog::default());
@@ -133,8 +126,8 @@ fn empty_and_error_first_streams_keep_error_outcomes() {
 #[test]
 fn explicit_operations_keep_retry_identity_and_current_dispatch_subjects() {
     use rig_core::{
-        client::CompletionClient,
         completion::CompletionModel as _,
+        driver::Bind,
         observe::{AdapterContext, AdapterEvent},
         serve::adapters::CompletionAdapter,
         test_utils::RecordingHttpClient,
@@ -144,12 +137,9 @@ fn explicit_operations_keep_retry_identity_and_current_dispatch_subjects() {
     let http = RecordingHttpClient::new(
         r#"{"candidates":[{"content":{"parts":[{"text":"pong"}],"role":"model"},"finishReason":"STOP"}]}"#,
     );
-    let client = rig_core::providers::gemini::Client::builder()
-        .api_key("test-key")
-        .http_client(http.clone())
-        .build()
-        .unwrap();
-    let model = client.completion_model("test-model");
+    let model = rig_core::providers::gemini::Gemini::new("test-key")
+        .bind(http.clone())
+        .completion("test-model");
     let request = model.completion_request("identical call").build();
     register(
         &mut app,
@@ -209,9 +199,25 @@ fn explicit_operations_keep_retry_identity_and_current_dispatch_subjects() {
                 Some(observation)
             })
             .collect();
-        assert_eq!(facts.len(), 4);
+        // The driver's unary path frames the whole reply and drives it
+        // through the same decoder a stream would, so a buffered reply
+        // reports its EOF too: Started, Response, the provider's verdict,
+        // TransportEof over the one frame, Finished.
+        assert_eq!(
+            facts.len(),
+            5,
+            "{:#?}",
+            facts.iter().map(|f| &f.event).collect::<Vec<_>>()
+        );
         assert!(matches!(facts[0].event, AdapterEvent::Started { .. }));
-        assert!(matches!(facts[3].event, AdapterEvent::Finished { .. }));
+        assert!(matches!(
+            facts[3].event,
+            AdapterEvent::TransportEof {
+                after: 1,
+                partial_bytes: 0
+            }
+        ));
+        assert!(matches!(facts[4].event, AdapterEvent::Finished { .. }));
     }
     let parallel: Vec<_> = ["duplicate/1", "duplicate/2"]
         .into_iter()
@@ -256,7 +262,7 @@ fn explicit_operations_keep_retry_identity_and_current_dispatch_subjects() {
                 (o.subject.effect == Some(id)).then_some(observation)
             })
             .collect();
-        assert_eq!(facts.len(), 4);
+        assert_eq!(facts.len(), 5);
         assert!(facts.iter().all(|f| f.operation == name
             && f.attempt == Some(1)
             && f.host_attempt == Some(1.try_into().unwrap())));
@@ -307,12 +313,10 @@ fn deny_model_calls(
 
 #[test]
 fn a_gate_denial_is_witnessed_with_its_reason_and_leaves_no_record() {
-    let counters = Arc::new(Counters::default());
-    let mut app = app();
+    let (mut app, _, counters) = served();
     let recorder = EffectLogRecorder::new();
     EffectLogResource::install(app.world_mut(), recorder.clone());
     let log = witnessed(&mut app);
-    register(&mut app, "model", MockModel::new(&counters));
     app.add_systems(RigSchedule, deny_model_calls.in_set(BusSet::Gate));
     let scope = app.world_mut().spawn(Scope("app/run#1".into())).id();
     let effect = app
@@ -355,10 +359,8 @@ fn a_gate_denial_is_witnessed_with_its_reason_and_leaves_no_record() {
 
 #[test]
 fn hold_release_and_hold_deny_are_distinct_sequences() {
-    let counters = Arc::new(Counters::default());
-    let mut app = app();
+    let (mut app, ..) = served();
     let log = witnessed(&mut app);
-    register(&mut app, "model", MockModel::new(&counters));
     let released = app
         .world_mut()
         .spawn((PendingEffect::new("model", completion()), Held))
@@ -541,19 +543,24 @@ fn hold_lifecycle_observers_preserve_owners_and_fact_order() {
 
 #[test]
 fn restored_hold_is_unknown_until_the_host_reevaluates_it() {
-    use rig_ecs::bus::{HoldOwners, acquire_hold, release_hold, scene::Scene};
+    use rig_ecs::{
+        bus::{HoldOwners, acquire_hold, release_hold},
+        checkpoint::load_world,
+    };
     let mut original = app();
     let effect = original
         .world_mut()
         .spawn(PendingEffect::new("model", completion()))
         .id();
     original.world_mut().entity_mut(effect).insert(Held);
-    let scene = Scene::save(original.world_mut());
+    let saved = checkpoint(&mut original);
     let mut restored = app();
     let log = witnessed(&mut restored);
     let counters = Arc::new(Counters::default());
     register(&mut restored, "model", MockModel::new(&counters));
-    let effect = scene.load(restored.world_mut()).unwrap()[0];
+    let effect = load_world(&saved, restored.world_mut())
+        .unwrap()
+        .with::<PendingEffect>(restored.world())[0];
     tick(&mut restored, 2);
     assert!(restored.world().get::<Held>(effect).is_some());
     assert!(restored.world().get::<HoldOwners>(effect).is_none());
@@ -591,10 +598,8 @@ fn named_owners_release_independently_without_changing_dispatch() {
     use rig_ecs::bus::{HoldOwners, HoldRefused, acquire_hold, release_hold};
     for enabled in [false, true] {
         for first in ["policy/a", "policy/b"] {
-            let counters = Arc::new(Counters::default());
-            let mut app = app();
+            let (mut app, ..) = served();
             let log = enabled.then(|| witnessed(&mut app));
-            register(&mut app, "model", MockModel::new(&counters));
             let entity = app
                 .world_mut()
                 .spawn(PendingEffect::new("model", completion()))
@@ -726,12 +731,10 @@ fn replace_answers(
 
 #[test]
 fn a_judge_replacement_exposes_both_answers() {
-    let counters = Arc::new(Counters::default());
-    let mut app = app();
+    let (mut app, ..) = served();
     let recorder = EffectLogRecorder::new();
     EffectLogResource::install(app.world_mut(), recorder.clone());
     let log = witnessed(&mut app);
-    register(&mut app, "model", MockModel::new(&counters));
     app.add_systems(RigSchedule, replace_answers.in_set(BusSet::Judge));
     let effect = app
         .world_mut()
@@ -1103,11 +1106,9 @@ fn driver_refusals_are_witnessed_under_intake_limits() {
 
 #[test]
 fn cancelling_in_flight_is_witnessed() {
-    let counters = Arc::new(Counters::default());
+    let (mut app, _, counters) = served();
     counters.hold.hold();
-    let mut app = app();
     let log = witnessed(&mut app);
-    register(&mut app, "model", MockModel::new(&counters));
     let effect = app
         .world_mut()
         .spawn(PendingEffect::new("model", completion()))
@@ -1199,7 +1200,7 @@ fn answer_open(
                         vec![rig_core::message::AssistantContent::text(
                             "served by a system",
                         )],
-                        rig_core::completion::Usage::new(),
+                        rig_core::completion::Usage::default(),
                         "open",
                     ),
                 ))));
@@ -1210,16 +1211,14 @@ fn answer_open(
 fn program(
     with_witness: bool,
 ) -> (
-    rig_effect_log::EffectLog,
+    rig_cassette::effect_log::EffectLog,
     Vec<String>,
     Option<ObservationTrace>,
 ) {
-    let counters = Arc::new(Counters::default());
-    let mut app = app();
+    let (mut app, ..) = served();
     let recorder = EffectLogRecorder::new();
     EffectLogResource::install(app.world_mut(), recorder.clone());
     let log = with_witness.then(|| witnessed(&mut app));
-    register(&mut app, "model", MockModel::new(&counters));
     app.add_systems(RigSchedule, deny_model_calls.in_set(BusSet::Gate));
     Handlers::with(app.world_mut(), |handlers| {
         handlers.register_open(
@@ -1288,18 +1287,10 @@ fn a_witness_changes_nothing() {
 
 #[test]
 fn a_full_sink_reports_incompleteness() {
-    let counters = Arc::new(Counters::default());
-    let mut app = app();
+    let (mut app, ..) = served();
     let log = Arc::new(ObservationLog::with_capacity(1));
     Witnessing::install(app.world_mut(), log.clone());
-    register(&mut app, "model", MockModel::new(&counters));
-    let effect = app
-        .world_mut()
-        .spawn(PendingEffect::new("model", completion()))
-        .id();
-    tick_until(&mut app, "answered", |world| {
-        world.get::<EffectOutcome>(effect).is_some()
-    });
+    answered(&mut app, "answered");
     tick(&mut app, 2);
     let trace = log.trace();
     assert_eq!(trace.observations.len(), 1);
@@ -1322,10 +1313,8 @@ fn a_full_sink_reports_incompleteness() {
 
 #[test]
 fn despawning_a_held_intent_is_a_cancellation_not_a_release() {
-    let counters = Arc::new(Counters::default());
-    let mut app = app();
+    let (mut app, ..) = served();
     let log = witnessed(&mut app);
-    register(&mut app, "model", MockModel::new(&counters));
     let held = app
         .world_mut()
         .spawn((PendingEffect::new("model", completion()), Held))
@@ -1346,21 +1335,13 @@ fn despawning_a_held_intent_is_a_cancellation_not_a_release() {
         panic!("matched above")
     };
     assert_eq!(reason.code, "despawned_before_dispatch");
-    // The despawn bookkeeping does not outlive the despawn.
-    assert!(
-        format!(
-            "{:?}",
-            app.world().resource::<rig_ecs::bus::witness::Despawning>()
-        )
-        .contains("Despawning({})")
-    );
 }
 
 #[test]
 fn same_pass_parent_is_kept_in_fallback_adapter_and_layer_facts() {
     use rig_core::{
-        client::CompletionClient, completion::CompletionModel as _,
-        serve::adapters::CompletionAdapter, test_utils::RecordingHttpClient,
+        completion::CompletionModel as _, driver::Bind, serve::adapters::CompletionAdapter,
+        test_utils::RecordingHttpClient,
     };
     let mut app = app();
     let log = witnessed(&mut app);
@@ -1369,12 +1350,9 @@ fn same_pass_parent_is_kept_in_fallback_adapter_and_layer_facts() {
     let http = RecordingHttpClient::new(
         r#"{"candidates":[{"content":{"parts":[{"text":"pong"}],"role":"model"},"finishReason":"STOP"}]}"#,
     );
-    let client = rig_core::providers::gemini::Client::builder()
-        .api_key("test-key")
-        .http_client(http)
-        .build()
-        .unwrap();
-    let model = client.completion_model("test-model");
+    let model = rig_core::providers::gemini::Gemini::new("test-key")
+        .bind(http)
+        .completion("test-model");
     let request = model.completion_request("same pass").build();
     register(
         &mut app,
@@ -1432,9 +1410,7 @@ fn same_pass_parent_is_kept_in_fallback_adapter_and_layer_facts() {
 #[test]
 fn a_hold_after_dispatch_is_refused_as_issued_or_settled_not_already_held() {
     use rig_ecs::bus::{HoldRefused, acquire_hold};
-    let counters = Arc::new(Counters::default());
-    let mut app = app();
-    register(&mut app, "model", MockModel::new(&counters));
+    let (mut app, ..) = served();
     let entity = app
         .world_mut()
         .spawn(PendingEffect::new("model", completion()))
@@ -1458,10 +1434,8 @@ fn a_hold_after_dispatch_is_refused_as_issued_or_settled_not_already_held() {
     );
 
     // A handler parked on the gate never answers, which pins the `Issued` refusal exactly.
-    let counters = Arc::new(Counters::default());
-    let mut pending_app = bus_support::app();
+    let (mut pending_app, _, counters) = served();
     counters.hold.hold();
-    register(&mut pending_app, "model", MockModel::new(&counters));
     let entity = pending_app
         .world_mut()
         .spawn(PendingEffect::new("model", completion()))

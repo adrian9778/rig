@@ -2,13 +2,6 @@
 //! and a wall-clock tick guard. Nothing agent-shaped.
 
 #![allow(dead_code, reason = "each suite uses the part of the support it needs")]
-#![allow(
-    clippy::expect_used,
-    clippy::unwrap_used,
-    clippy::indexing_slicing,
-    clippy::panic,
-    reason = "test support fails immediately when a fixture invariant is violated"
-)]
 
 use std::{
     sync::{
@@ -18,7 +11,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use bevy_app::{App, Update};
+use bevy_app::App;
 use bevy_ecs::{prelude::*, schedule::LogLevel};
 use rig_core::{
     completion::{
@@ -30,10 +23,19 @@ use rig_core::{
     serve::{Dispatch, Reply, Serve, ServingPolicy},
     streaming::StreamFinal,
 };
-use rig_ecs::bus::{Bus, run_to_quiescence};
+use rig_ecs::{
+    bus::{BusPlugin, EffectOutcome, PendingEffect},
+    checkpoint::{Checkpoint, save_world},
+};
 
 /// A hang is a failure, never a wait.
 pub const GUARD: Duration = Duration::from_secs(10);
+
+/// The world's checkpoint, taken through its wire form.
+pub fn checkpoint(app: &mut App) -> Checkpoint {
+    let saved = save_world(app.world_mut()).expect("the world saves");
+    Checkpoint::from_json(&saved.to_json().expect("serde")).expect("serde")
+}
 
 /// What a scripted model observed.
 #[derive(Default)]
@@ -152,7 +154,7 @@ impl Serve for MockModel {
                 self.counters.unary_served.fetch_add(1, Ordering::SeqCst);
                 Reply::Outcome(Ok(Outcome::Completion(CompletionResponse::new(
                     vec![AssistantContent::text(&self.text)],
-                    Usage::new(),
+                    Usage::default(),
                     "mock",
                 ))))
             }
@@ -172,7 +174,7 @@ impl Serve for MockModel {
                         let sent = counters.stream_sends.fetch_add(1, Ordering::SeqCst) + 1;
                         if sent >= cap {
                             guard.finished = out
-                                .finish(StreamFinal::new("mock", Usage::new()))
+                                .finish(StreamFinal::new("mock", Usage::default()))
                                 .await
                                 .is_ok();
                             return;
@@ -235,13 +237,13 @@ pub fn streaming() -> EffectKind {
 }
 
 /// An app with the bus installed under `policy`, ambiguity detection at
-/// error level, the runner in `Update`.
+/// error level, the runner in `Update`, and the crate's types registered so
+/// a checkpoint covers the bus.
 pub fn app_with(policy: ServingPolicy) -> App {
     let mut app = App::new();
-    Bus::with_policy(policy)
-        .ambiguity_detection(LogLevel::Error)
-        .install(app.world_mut());
-    app.add_systems(Update, run_to_quiescence);
+    app.add_plugins(BusPlugin::with_policy(policy).ambiguity_detection(LogLevel::Error));
+    app.add_plugins(rig_cassette::ecs::ReplayPlugin);
+    rig_ecs::checkpoint::register_types(app.world_mut());
     app.finish();
     app.cleanup();
     app
@@ -304,4 +306,26 @@ pub fn text_of(outcome: &Result<Outcome, ErrorReport>) -> String {
             .collect(),
         other => panic!("not a completion: {other:?}"),
     }
+}
+
+/// An app serving `model` with a scripted handler, and its counters: the
+/// prologue of most bus suites.
+pub fn served() -> (App, Entity, std::sync::Arc<Counters>) {
+    let counters = std::sync::Arc::new(Counters::default());
+    let mut app = app();
+    let model = register(&mut app, "model", MockModel::new(&counters));
+    (app, model, counters)
+}
+
+/// Spawn a unary completion effect on `model`'s key and tick until it is
+/// answered. Returns the effect entity.
+pub fn answered(app: &mut App, what: &str) -> Entity {
+    let effect = app
+        .world_mut()
+        .spawn(PendingEffect::new("model", completion()))
+        .id();
+    tick_until(app, what, |world| {
+        world.get::<EffectOutcome>(effect).is_some()
+    });
+    effect
 }

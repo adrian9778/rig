@@ -1,30 +1,23 @@
 //! Reconstruct and verify the actual replay world from serialized metadata.
 
-#![allow(
-    clippy::expect_used,
-    clippy::unwrap_used,
-    clippy::indexing_slicing,
-    clippy::panic
-)]
-
 use crate::run_support;
 
 use bevy_ecs::prelude::*;
+use rig_cassette::ecs::EffectLogResource;
+use rig_cassette::ecs::Replay;
+use rig_cassette::ecs::identity::{check_replayable, stamp_run};
+use rig_cassette::effect_log::{EffectLog, EffectLogRecorder};
 use rig_core::{
     completion::{ModelRef, ProviderCapabilities},
     effect::{EffectKind, FamilyDescriptor, HandlerDescriptor, HandlerKey},
     serve::{Dispatch, Serve},
 };
 use rig_ecs::{
-    agent::{
-        Failed, Grant, Order, Output, OutputKind, PolicyVersion, Settled, Temperature,
-        scene::RunScene,
-    },
-    bus::{Bound, EffectLogResource, EffectOutcome, Handlers, PendingEffect, Replay},
-    replay::{check_replayable, stamp_run},
+    agent::{Failed, Grant, Output, OutputKind, PolicyVersion, Settled, Temperature},
+    bus::{Bound, EffectOutcome, Handlers, PendingEffect},
+    checkpoint::{Checkpoint, load_world, save_world},
     systems::RunCommands,
 };
-use rig_effect_log::{EffectLog, EffectLogRecorder};
 use run_support::*;
 
 const MODEL: &str = "t/model:default";
@@ -53,7 +46,7 @@ fn program(world: &mut World, model: Entity, tool: Entity) -> Entity {
         mode: OutputKind::Auto,
         schema: Some(serde_json::json!({"type": "object", "properties": {"a": {"type": "integer"}}, "required": ["a"]})),
     }));
-    world.spawn((Grant(tool), Order(0), ChildOf(agent)));
+    world.spawn((Grant(tool), ChildOf(agent)));
     agent
 }
 
@@ -64,6 +57,13 @@ fn bound(world: &mut World, key: &str) -> Entity {
         .find(|(_, bound)| bound.key == HandlerKey::from(key))
         .unwrap()
         .0
+}
+
+/// Edit an immutable `Bound`: take it, change it, put it back.
+fn rebind(world: &mut World, entity: Entity, edit: impl FnOnce(&mut Bound)) {
+    let mut bound = world.entity_mut(entity).take::<Bound>().unwrap();
+    edit(&mut bound);
+    world.entity_mut(entity).insert(bound);
 }
 
 #[test]
@@ -97,11 +97,9 @@ fn serialized_log_reconstructs_capabilities_identity_and_uncalled_grants() {
     );
 
     let mut replay = app();
-    Handlers::with(replay.world_mut(), |handlers| {
-        Replay::default().register(handlers, &log)
-    })
-    .unwrap()
-    .unwrap();
+    Replay::default()
+        .register(replay.world_mut(), &log)
+        .unwrap();
     let model = bound(replay.world_mut(), MODEL);
     let tool = bound(replay.world_mut(), TOOL);
     let agent = program(replay.world_mut(), model, tool);
@@ -124,19 +122,14 @@ fn serialized_log_reconstructs_capabilities_identity_and_uncalled_grants() {
             capabilities: ProviderCapabilities::default(),
         },
     ] {
-        replay
-            .world_mut()
-            .get_mut::<Bound>(model)
-            .unwrap()
-            .descriptor
-            .family = family;
+        rebind(replay.world_mut(), model, |bound| {
+            bound.descriptor.family = family
+        });
         assert!(check_replayable(replay.world_mut(), run, &log).is_err());
     }
-    replay
-        .world_mut()
-        .get_mut::<Bound>(model)
-        .unwrap()
-        .descriptor = original;
+    rebind(replay.world_mut(), model, |bound| {
+        bound.descriptor = original
+    });
     replay
         .world_mut()
         .entity_mut(run)
@@ -149,42 +142,28 @@ fn serialized_log_reconstructs_capabilities_identity_and_uncalled_grants() {
         .insert(PolicyVersion("changed".into()));
     assert!(check_replayable(replay.world_mut(), run, &log).is_err());
     replay.world_mut().entity_mut(run).remove::<PolicyVersion>();
-    replay
-        .world_mut()
-        .get_mut::<Bound>(model)
-        .unwrap()
-        .descriptor
-        .layers
-        .push("different-layer".into());
+    rebind(replay.world_mut(), model, |bound| {
+        bound.descriptor.layers.push("different-layer".into())
+    });
     assert!(check_replayable(replay.world_mut(), run, &log).is_err());
-    replay
-        .world_mut()
-        .get_mut::<Bound>(model)
-        .unwrap()
-        .descriptor
-        .layers
-        .clear();
+    rebind(replay.world_mut(), model, |bound| {
+        bound.descriptor.layers.clear()
+    });
     let tool_descriptor = replay
         .world()
         .get::<Bound>(tool)
         .unwrap()
         .descriptor
         .clone();
-    if let FamilyDescriptor::Tool { parameters, .. } = &mut replay
-        .world_mut()
-        .get_mut::<Bound>(tool)
-        .unwrap()
-        .descriptor
-        .family
-    {
-        *parameters = serde_json::json!({"type": "object", "required": ["new_argument"]});
-    }
+    rebind(replay.world_mut(), tool, |bound| {
+        if let FamilyDescriptor::Tool { parameters, .. } = &mut bound.descriptor.family {
+            *parameters = serde_json::json!({"type": "object", "required": ["new_argument"]});
+        }
+    });
     assert!(check_replayable(replay.world_mut(), run, &log).is_err());
-    replay
-        .world_mut()
-        .get_mut::<Bound>(tool)
-        .unwrap()
-        .descriptor = tool_descriptor;
+    rebind(replay.world_mut(), tool, |bound| {
+        bound.descriptor = tool_descriptor
+    });
     check_replayable(replay.world_mut(), run, &log).unwrap();
     tick_until(&mut replay, "replay terminal", |world| {
         world.get::<Settled>(run).is_some() || world.get::<Failed>(run).is_some()
@@ -192,16 +171,13 @@ fn serialized_log_reconstructs_capabilities_identity_and_uncalled_grants() {
     assert!(replay.world().get::<Failed>(run).is_none());
     assert!(replay.world().get::<Settled>(run).is_some());
 
-    let scene = RunScene::save(live.world_mut()).unwrap();
-    let scene: RunScene = serde_json::from_str(&serde_json::to_string(&scene).unwrap()).unwrap();
+    let checkpoint = save_world(live.world_mut()).unwrap();
+    let checkpoint = Checkpoint::from_json(&checkpoint.to_json().unwrap()).unwrap();
     let mut restored = app();
-    Handlers::with(restored.world_mut(), |handlers| {
-        Replay::default().register(handlers, &log)
-    })
-    .unwrap()
-    .unwrap();
-    scene
-        .load(restored.world_mut())
+    Replay::default()
+        .register(restored.world_mut(), &log)
+        .unwrap();
+    load_world(&checkpoint, restored.world_mut())
         .expect("all scope dependencies were reconstructed");
     let unexpected = restored
         .world_mut()
@@ -292,7 +268,9 @@ fn a_layered_program_replays_under_the_same_layer_and_refuses_another() {
     for (layer, accepted) in [(Some("audit"), true), (Some("other"), false), (None, false)] {
         let mut replay = app();
         Handlers::with(replay.world_mut(), |handlers| {
-            for replayer in rig_effect_log::EffectLogReplayer::for_log_by_id(&log).unwrap() {
+            for replayer in
+                rig_cassette::effect_log::EffectLogReplayer::for_log_by_id(&log).unwrap()
+            {
                 let key = replayer.key().clone();
                 let handler = match layer {
                     Some(name) if key == HandlerKey::from(MODEL) => {

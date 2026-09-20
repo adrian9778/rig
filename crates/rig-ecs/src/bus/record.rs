@@ -101,25 +101,13 @@ impl Recording {
     }
 }
 
-/// The current delivery batch. Advances once per schedule pass, including
-/// passes run directly by a host rather than through the Update runner.
+/// The current delivery batch. Advances once per schedule pass.
 #[derive(Resource, Default)]
 pub struct DeliveryBatch(pub u64);
 
-/// Begin the next pass's observation group. A pass the host runs itself
-/// (outside [`run_to_quiescence`](super::run_to_quiescence)) is that
-/// host's tick: its stream budget and its intake bound start afresh here,
-/// as the runner starts them at the top of each of its ticks.
-pub fn begin_delivery_pass(
-    mut batch: ResMut<DeliveryBatch>,
-    mut budget: ResMut<super::collect::CollectionBudget>,
-    mut intake: ResMut<super::plugin::Intake>,
-) {
+/// Begin the next pass's observation group.
+pub fn begin_delivery_pass(mut batch: ResMut<DeliveryBatch>) {
     batch.0 += 1;
-    if !budget.in_runner {
-        budget.remaining = super::collect::STREAM_WORK_PER_TICK;
-        intake.0 = 0;
-    }
 }
 
 /// Record visibility when the outcome is inserted, not later when a query
@@ -341,16 +329,6 @@ impl rig_core::serve::Observe for WorldObserver {
     }
 }
 
-/// State needed to record cancellation and any output published before it.
-pub type CancellationView = (
-    &'static Issued,
-    Option<&'static EffectOutcome>,
-    Has<super::collect::CollectedOutcome>,
-    Option<&'static super::effect::Publishing>,
-    Option<&'static super::effect::ToolOutputs>,
-    Option<&'static Observed>,
-);
-
 /// An in-flight effect losing `InFlight` without an outcome — a despawn,
 /// its own or an ancestor's — is a cancelled dispatch: the record says so,
 /// as it does when a consumer drops its `Pending` on rig-bus.
@@ -362,7 +340,14 @@ pub type CancellationView = (
 /// the handler gave, as `settle` would have closed it.
 pub fn record_cancelled(
     removed: On<Remove, InFlight>,
-    effects: Query<CancellationView>,
+    effects: Query<(
+        &Issued,
+        Option<&EffectOutcome>,
+        Has<super::collect::CollectedOutcome>,
+        Option<&super::effect::Publishing>,
+        Option<&super::effect::ToolOutputs>,
+        Option<&Observed>,
+    )>,
     recording: Option<Res<Recording>>,
     batch: Res<DeliveryBatch>,
 ) {
@@ -456,5 +441,5 @@ pub fn record_bound(
     }
 }
 
-#[cfg(all(test, feature = "replay"))]
+#[cfg(test)]
 mod tests;

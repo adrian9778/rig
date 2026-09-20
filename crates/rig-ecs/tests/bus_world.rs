@@ -11,20 +11,14 @@
 //! | — an open key of the tool family, answered by a system that nests a completion under it | `a_system_serves_an_open_tool_key_and_nests_a_completion_under_it` |
 //! | — a layered handler: a layer's denial is no record, its patch is the record's request, its replacement never reaches the record | `a_layers_decisions_reach_the_record_through_the_sinks_observer` |
 
-#![allow(
-    clippy::expect_used,
-    clippy::unwrap_used,
-    clippy::panic,
-    clippy::indexing_slicing,
-    clippy::type_complexity
-)]
-
 use crate::bus_support;
 
 use std::sync::{Arc, atomic::Ordering};
 
 use bevy_ecs::prelude::*;
 use bus_support::*;
+use rig_cassette::ecs::EffectLogResource;
+use rig_cassette::effect_log::EffectLogRecorder;
 use rig_core::{
     completion::Message,
     effect::{CustomEffect, EffectId, EffectKind, FamilyDescriptor, HandlerKey, Outcome},
@@ -33,10 +27,9 @@ use rig_core::{
     tool::{ToolOutput, ToolResult},
 };
 use rig_ecs::bus::{
-    Answer, Asked, BusSet, EffectLogResource, EffectOutcome, Handlers, Held, InFlight, Issued,
-    PendingEffect, RigSchedule,
+    Answer, Asked, BusSet, EffectOutcome, Handlers, Held, InFlight, Issued, PendingEffect,
+    RigSchedule,
 };
-use rig_effect_log::EffectLogRecorder;
 
 /// A question the world answers.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -58,31 +51,14 @@ fn answer_asks(asked: Query<(Entity, &Asked<Ask>), Without<Answer<Ask>>>, mut co
     }
 }
 
-fn add_after_judge<M>(
+/// Add `system` to the bus schedule, ordered by the caller.
+fn schedule<M>(
     app: &mut bevy_app::App,
     system: impl IntoScheduleConfigs<bevy_ecs::system::ScheduleSystem, M>,
 ) {
     app.world_mut()
         .resource_mut::<bevy_ecs::schedule::Schedules>()
-        .add_systems(RigSchedule, system.after(BusSet::Judge));
-}
-
-fn add_in_gate<M>(
-    app: &mut bevy_app::App,
-    system: impl IntoScheduleConfigs<bevy_ecs::system::ScheduleSystem, M>,
-) {
-    app.world_mut()
-        .resource_mut::<bevy_ecs::schedule::Schedules>()
-        .add_systems(RigSchedule, system.in_set(BusSet::Gate));
-}
-
-fn add_in_judge<M>(
-    app: &mut bevy_app::App,
-    system: impl IntoScheduleConfigs<bevy_ecs::system::ScheduleSystem, M>,
-) {
-    app.world_mut()
-        .resource_mut::<bevy_ecs::schedule::Schedules>()
-        .add_systems(RigSchedule, system.in_set(BusSet::Judge));
+        .add_systems(RigSchedule, system);
 }
 
 #[test]
@@ -130,7 +106,7 @@ fn a_system_answers_an_asked_effect_and_the_key_waits_for_it() {
     tick(&mut app, 3);
     assert!(app.world().get::<InFlight>(second).is_none());
 
-    add_after_judge(&mut app, answer_asks);
+    schedule(&mut app, answer_asks.after(BusSet::Judge));
     tick_until(&mut app, "both answered", |world| {
         world.get::<EffectOutcome>(first).is_some() && world.get::<EffectOutcome>(second).is_some()
     });
@@ -194,12 +170,10 @@ fn gate(
 
 #[test]
 fn a_held_effect_is_denied_or_approved_from_a_system_next_tick() {
-    let counters = Arc::new(Counters::default());
-    let mut app = app();
+    let (mut app, _, counters) = served();
     EffectLogResource::install(app.world_mut(), EffectLogRecorder::new());
-    register(&mut app, "model", MockModel::new(&counters));
     app.init_resource::<Decisions>();
-    add_in_gate(&mut app, gate);
+    schedule(&mut app, gate.in_set(BusSet::Gate));
 
     let denied = app
         .world_mut()
@@ -265,19 +239,11 @@ fn replace_answer(mut landed: Query<&mut EffectOutcome, Added<EffectOutcome>>) {
 
 #[test]
 fn gate_patches_and_judge_replaces_but_the_record_keeps_the_answer() {
-    let counters = Arc::new(Counters::default());
-    let mut app = app();
+    let (mut app, ..) = served();
     EffectLogResource::install(app.world_mut(), EffectLogRecorder::new());
-    register(&mut app, "model", MockModel::new(&counters));
-    add_in_gate(&mut app, patch_greeting);
-    add_in_judge(&mut app, replace_answer);
-    let effect = app
-        .world_mut()
-        .spawn(PendingEffect::new("model", completion()))
-        .id();
-    tick_until(&mut app, "answered", |world| {
-        world.get::<EffectOutcome>(effect).is_some()
-    });
+    schedule(&mut app, patch_greeting.in_set(BusSet::Gate));
+    schedule(&mut app, replace_answer.in_set(BusSet::Judge));
+    let effect = answered(&mut app, "answered");
     let world = app.world();
     let seen = world.get::<EffectOutcome>(effect).expect("answered");
     assert_eq!(
@@ -361,7 +327,7 @@ fn a_child_effect_records_its_parent_and_a_reentrant_one_is_refused() {
             .expect("a fresh key")
     })
     .expect("a bus");
-    add_after_judge(&mut app, (nest, finish_nested).chain());
+    schedule(&mut app, (nest, finish_nested).chain().after(BusSet::Judge));
 
     let ask = app
         .world_mut()
@@ -450,7 +416,7 @@ fn despawning_a_parent_cancels_its_children_in_flight_and_never_serves_the_queue
             .expect("a fresh key")
     })
     .expect("a bus");
-    add_after_judge(&mut app, (nest, finish_nested).chain());
+    schedule(&mut app, (nest, finish_nested).chain().after(BusSet::Judge));
 
     let ask = app
         .world_mut()
@@ -579,7 +545,10 @@ fn a_system_serves_an_open_tool_key_and_nests_a_completion_under_it() {
             .expect("a fresh key")
     })
     .expect("a bus");
-    add_after_judge(&mut app, (serve_lookup, finish_lookup).chain());
+    schedule(
+        &mut app,
+        (serve_lookup, finish_lookup).chain().after(BusSet::Judge),
+    );
     let descriptor = Handlers::with(app.world_mut(), |handlers| {
         handlers.descriptor(&HandlerKey::from("tool:lookup"))
     })

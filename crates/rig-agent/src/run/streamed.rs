@@ -42,6 +42,7 @@ use rig_core::message::{
 };
 use rig_core::streaming::BlockId;
 
+use super::policy::InvalidToolCallReason;
 use super::transcript::{TOOL_NOT_EXECUTED_DUE_TO_INVALID_PEER, tool_result_message};
 use rig_core::completion::{CompletionError, Message, Usage};
 use rig_core::json_utils;
@@ -123,7 +124,9 @@ pub fn assistant_text_items_from_choice(choice: &[AssistantContent]) -> Vec<Assi
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StreamedInvalidToolCall {
     /// The rejected tool call. For a name delta this is a diagnostic call
-    /// assembled from the streamed name and any buffered argument deltas.
+    /// assembled from the streamed name and any buffered argument deltas;
+    /// for malformed arguments its `arguments` is `Null` — no object was
+    /// ever parsed, and fabricating one would misrepresent the wire.
     pub tool_call: ToolCall,
     /// Rig-generated identifier correlating this call's stream items.
     pub block_id: BlockId,
@@ -133,6 +136,9 @@ pub struct StreamedInvalidToolCall {
     pub executable_tool_names: BTreeSet<String>,
     /// Tools allowed by the active tool choice for this turn.
     pub allowed_tool_names: BTreeSet<String>,
+    /// Why the call was rejected.
+    #[serde(default)]
+    pub reason: InvalidToolCallReason,
 }
 
 /// Snapshot of a streamed turn at the moment an invalid tool call appeared.
@@ -271,8 +277,8 @@ pub enum StreamedResolution {
     /// `AgentRun::next_step`.
     TurnAbandoned {
         /// For a skipped call, the synthetic tool result to surface to the
-        /// consumer stream. Boxed: the result dwarfs the other variant.
-        skipped_tool_result: Option<Box<ToolResult>>,
+        /// consumer stream.
+        skipped_tool_result: Option<ToolResult>,
     },
     /// The invalid call is dropped and the turn goes on without it: the
     /// runner's `UnhandledInvalidToolCall::Ignore` on the streaming
@@ -303,15 +309,15 @@ pub enum StreamedTurnEvent {
     /// `AgentRun::resolve_streamed_invalid_tool_call`,
     /// then apply the outcome with
     /// [`StreamedTurnAssembler::resolve_pending_invalid`].
-    InvalidToolCall(Box<StreamedInvalidToolCall>),
+    InvalidToolCall(StreamedInvalidToolCall),
     /// The provider supplied its typed final payload. Record its usage (see
     /// `AgentRun::record_streamed_completion_call`);
     /// this does not establish that the provider stream reached EOF. When
     /// `emit_final` is set, the turn streamed text and the driver should buffer
     /// the final item until EOF finalizes the turn.
     Completed {
-        /// Provider-reported usage for this call. Zero-valued usage means the
-        /// provider reported no usage metrics.
+        /// Provider-reported usage for this call. Usage whose counters are
+        /// all `None` means the provider reported no usage metrics.
         usage: Usage,
         /// Whether the ingested final item should be forwarded to the
         /// consumer (set when the turn streamed text).
@@ -419,11 +425,15 @@ fn group_reasoning(parts: impl Iterator<Item = ReasoningPart>) -> Vec<Reasoning>
 enum PendingInvalid {
     /// A complete tool call with a disallowed name.
     FullCall {
-        tool_call: Box<ToolCall>,
+        tool_call: ToolCall,
         block_id: BlockId,
     },
     /// A streamed tool-name delta with a disallowed name.
     NameDelta { block_id: BlockId },
+    /// A complete tool call whose arguments were not JSON. The provider's
+    /// accumulator already finalized the block; nothing is buffered here
+    /// to replay, so the only resolutions are abandon or fail.
+    MalformedArgs { tool_call: ToolCall },
 }
 
 /// Sans-IO accumulator that assembles one streamed model turn. See the
@@ -855,9 +865,10 @@ impl StreamedTurnAssembler {
                             &tool_call.function.arguments,
                         )),
                         PendingInvalid::FullCall {
-                            tool_call: Box::new(tool_call.clone()),
+                            tool_call: tool_call.clone(),
                             block_id: block_id.clone(),
                         },
+                        InvalidToolCallReason::UnknownTool,
                     ));
                 }
 
@@ -895,6 +906,7 @@ impl StreamedTurnAssembler {
                                 PendingInvalid::NameDelta {
                                     block_id: block_id.clone(),
                                 },
+                                InvalidToolCallReason::UnknownTool,
                             ));
                         }
 
@@ -986,7 +998,7 @@ impl StreamedTurnAssembler {
                 },
             ) => {
                 tool_call.function.name.clone_from(tool_name);
-                self.pending_tool_calls.push((*tool_call, block_id));
+                self.pending_tool_calls.push((tool_call, block_id));
                 Vec::new()
             }
             (
@@ -999,7 +1011,18 @@ impl StreamedTurnAssembler {
                 self.delta_states.remove(&block_id);
                 Vec::new()
             }
-            (StreamedResolution::TurnAbandoned { .. }, PendingInvalid::FullCall { .. }) => {
+            (
+                StreamedResolution::TurnAbandoned { .. },
+                PendingInvalid::FullCall { .. } | PendingInvalid::MalformedArgs { .. },
+            ) => Vec::new(),
+            // Repair is rejected upstream for malformed arguments (the run
+            // fails closed); reaching here would be a protocol violation, so
+            // the call is simply not resurrected.
+            (StreamedResolution::Repaired { .. }, PendingInvalid::MalformedArgs { .. }) => {
+                Vec::new()
+            }
+            (StreamedResolution::Ignored, PendingInvalid::MalformedArgs { tool_call }) => {
+                self.ignored_calls.push(tool_call.id.clone());
                 Vec::new()
             }
             (StreamedResolution::Ignored, PendingInvalid::FullCall { tool_call, .. }) => {
@@ -1099,6 +1122,7 @@ impl StreamedTurnAssembler {
         block_id: BlockId,
         args: Option<String>,
         pending: PendingInvalid,
+        reason: InvalidToolCallReason,
     ) -> Vec<StreamedTurnEvent> {
         let invalid = StreamedInvalidToolCall {
             tool_call,
@@ -1106,9 +1130,51 @@ impl StreamedTurnAssembler {
             args,
             executable_tool_names: self.executable_tool_names.clone(),
             allowed_tool_names: self.allowed_tool_names.clone(),
+            reason,
         };
         self.pending_invalid = Some(pending);
-        vec![StreamedTurnEvent::InvalidToolCall(Box::new(invalid))]
+        vec![StreamedTurnEvent::InvalidToolCall(invalid)]
+    }
+
+    /// Surface a tool call whose complete arguments were not JSON
+    /// (rig#2447), as reported by the provider stream's accumulator.
+    ///
+    /// The provider already finalized the block, so the call is parked for
+    /// resolution with no deltas to replay. The diagnostic call carries the
+    /// accumulator's durable id and provider handle — the same ones a
+    /// parseable call would have had — and `Null` arguments.
+    pub fn surface_malformed_input(
+        &mut self,
+        detail: &rig_core::error::MalformedToolInput,
+    ) -> Vec<StreamedTurnEvent> {
+        let tool_call = ToolCall {
+            id: detail.id.clone(),
+            provider: detail.provider.clone(),
+            function: rig_core::message::ToolFunction {
+                name: detail.name.clone(),
+                arguments: serde_json::Value::Null,
+            },
+            signature: None,
+            additional_params: None,
+        };
+        let block_id = detail
+            .provider
+            .as_ref()
+            .map(|provider| BlockId::wire(provider.call_id.as_str()))
+            .or_else(|| detail.id.generated().cloned())
+            .unwrap_or_else(|| BlockId::wire(detail.id.wire_hint().as_ref()));
+        // The accumulator's block is closed; any delta bookkeeping this
+        // assembler kept for it must not trip the pending-delta check.
+        self.delta_states.remove(&block_id);
+        self.surface_invalid_call(
+            tool_call.clone(),
+            block_id,
+            Some(detail.raw.clone()),
+            PendingInvalid::MalformedArgs { tool_call },
+            InvalidToolCallReason::MalformedArguments {
+                error: detail.error.clone(),
+            },
+        )
     }
 
     fn name_delta_diagnostic_tool_call(

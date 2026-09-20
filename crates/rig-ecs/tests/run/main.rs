@@ -1,5 +1,15 @@
 //! Run integration suites with shared support compiled once.
 
+#![allow(
+    clippy::expect_used,
+    clippy::unwrap_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::indexing_slicing,
+    dead_code,
+    reason = "test suites assert directly and share support each uses part of"
+)]
+
 #[path = "../bus_support/mod.rs"]
 mod bus_support;
 #[path = "../memory_graph.rs"]
@@ -30,8 +40,6 @@ mod run_graph;
 mod run_identity;
 #[path = "../run_lifetime.rs"]
 mod run_lifetime;
-#[path = "../run_message_cache.rs"]
-mod run_message_cache;
 #[path = "../run_missing_model.rs"]
 mod run_missing_model;
 #[path = "../run_output_tool_config.rs"]

@@ -1,0 +1,170 @@
+when:
+  path: /v1/responses
+  method: POST
+  query_param: []
+  header:
+  - name: accept
+    value: '*/*'
+  - name: content-type
+    value: application/json
+  body: '{"input":[{"content":[{"text":"You are an AI assistant whose purpose is to extract structured data from the provided text.\nYou will have access to a `submit` function that defines the structure of the data to extract from the provided text.\nUse the `submit` function to submit the structured data.\nBe sure to fill out every field and ALWAYS CALL THE `submit` function, even with default values!!!.\n                \n\n=============== ADDITIONAL INSTRUCTIONS ===============\nExtract sentiment and confidence from the given text. Return sentiment normalized to the range [-1.0, 1.0] and confidence normalized to [0.0, 1.0].","type":"input_text"}],"role":"system","type":"message"},{"content":[{"text":"Ada Lovelace discussed analytical engines and early programming with Charles Babbage.","type":"input_text"}],"role":"user","type":"message"}],"model":"grok-3-mini","tool_choice":"required","tools":[{"description":"Submit the structured data you extracted from the provided text.","name":"submit","parameters":{"$schema":"https://json-schema.org/draft/2020-12/schema","properties":{"confidence":{"format":"double","type":"number"},"sentiment":{"format":"double","type":"number"}},"required":["sentiment","confidence"],"title":"Sentiment","type":"object"},"strict":false,"type":"function"}]}'
+then:
+  status: 200
+  header:
+  - name: content-type
+    value: application/json
+  - name: x-request-id
+    value: req_REDACTED_1
+  body: '{"background":false,"completed_at":0,"created_at":0,"error":null,"frequency_penalty":0.0,"id":"req_REDACTED_1","incomplete_details":null,"instructions":null,"max_output_tokens":null,"max_tool_calls":null,"metadata":{"system_fingerprint":"fp_REDACTED_1"},"model":"grok-4.3","object":"response","output":[{"id":"rs_REDACTED_1","status":"completed","summary":[{"text":"The task is to extract structured data from the provided text: \"Ada Lovelace discussed analytical engines and early programming with Charles Babbage.\"\n","type":"summary_text"}],"type":"reasoning"},{"arguments":"{\"sentiment\":0.0,\"confidence\":1.0}","call_id":"call_REDACTED_1","id":"fc_REDACTED_1","name":"submit","status":"completed","type":"function_call"}],"parallel_tool_calls":true,"presence_penalty":0.0,"previous_response_id":null,"prompt_cache_key":null,"reasoning":{"effort":"low","summary":"detailed"},"safety_identifier":null,"service_tier":"default","status":"completed","store":true,"temperature":0.7,"text":{"format":{"type":"text"}},"tool_choice":"required","tools":[{"description":"Submit the structured data you extracted from the provided text.","name":"submit","parameters":{"$schema":"https://json-schema.org/draft/2020-12/schema","properties":{"confidence":{"format":"double","type":"number"},"sentiment":{"format":"double","type":"number"}},"required":["sentiment","confidence"],"title":"Sentiment","type":"object"},"strict":false,"type":"function"}],"top_logprobs":0,"top_p":0.95,"truncation":"disabled","usage":{"context_details":{"input_tokens":434,"output_tokens":263},"cost_in_usd_ticks":9984000,"input_tokens":434,"input_tokens_details":{"cached_tokens":192},"num_server_side_tools_used":0,"num_sources_used":0,"output_tokens":263,"output_tokens_details":{"reasoning_tokens":260},"total_tokens":697},"user":null}'
+---
+when:
+  path: /v1/responses
+  method: POST
+  query_param: []
+  header:
+  - name: accept
+    value: '*/*'
+  - name: content-type
+    value: application/json
+  body: '{"input":[{"content":[{"text":"You are an AI assistant whose purpose is to extract structured data from the provided text.\nYou will have access to a `submit` function that defines the structure of the data to extract from the provided text.\nUse the `submit` function to submit the structured data.\nBe sure to fill out every field and ALWAYS CALL THE `submit` function, even with default values!!!.\n                \n\n=============== ADDITIONAL INSTRUCTIONS ===============\nExtract names from the given text.","type":"input_text"}],"role":"system","type":"message"},{"content":[{"text":"Ada Lovelace discussed analytical engines and early programming with Charles Babbage.","type":"input_text"}],"role":"user","type":"message"}],"model":"grok-3-mini","tool_choice":"required","tools":[{"description":"Submit the structured data you extracted from the provided text.","name":"submit","parameters":{"$schema":"https://json-schema.org/draft/2020-12/schema","properties":{"names":{"items":{"type":"string"},"type":"array"}},"required":["names"],"title":"Names","type":"object"},"strict":false,"type":"function"}]}'
+then:
+  status: 200
+  header:
+  - name: content-type
+    value: application/json
+  - name: x-request-id
+    value: req_REDACTED_2
+  body: '{"background":false,"completed_at":0,"created_at":0,"error":null,"frequency_penalty":0.0,"id":"req_REDACTED_2","incomplete_details":null,"instructions":null,"max_output_tokens":null,"max_tool_calls":null,"metadata":{"system_fingerprint":"fp_REDACTED_1"},"model":"grok-4.3","object":"response","output":[{"id":"rs_REDACTED_2","status":"completed","summary":[{"text":"The task is: \"Extract names from the given text.\" The text is: \"Ada Lovelace discussed analytical engines and early programming with Charles Babbage.\"\n","type":"summary_text"}],"type":"reasoning"},{"arguments":"{\"names\":[\"Ada Lovelace\",\"Charles Babbage\"]}","call_id":"call_REDACTED_2","id":"fc_REDACTED_2","name":"submit","status":"completed","type":"function_call"}],"parallel_tool_calls":true,"presence_penalty":0.0,"previous_response_id":null,"prompt_cache_key":null,"reasoning":{"effort":"low","summary":"detailed"},"safety_identifier":null,"service_tier":"default","status":"completed","store":true,"temperature":0.7,"text":{"format":{"type":"text"}},"tool_choice":"required","tools":[{"description":"Submit the structured data you extracted from the provided text.","name":"submit","parameters":{"$schema":"https://json-schema.org/draft/2020-12/schema","properties":{"names":{"items":{"type":"string"},"type":"array"}},"required":["names"],"title":"Names","type":"object"},"strict":false,"type":"function"}],"top_logprobs":0,"top_p":0.95,"truncation":"disabled","usage":{"context_details":{"input_tokens":399,"output_tokens":329},"cost_in_usd_ticks":11171500,"input_tokens":399,"input_tokens_details":{"cached_tokens":192},"num_server_side_tools_used":0,"num_sources_used":0,"output_tokens":328,"output_tokens_details":{"reasoning_tokens":325},"total_tokens":727},"user":null}'
+---
+when:
+  path: /v1/responses
+  method: POST
+  query_param: []
+  header:
+  - name: accept
+    value: '*/*'
+  - name: content-type
+    value: application/json
+  body: '{"input":[{"content":[{"text":"You are an AI assistant whose purpose is to extract structured data from the provided text.\nYou will have access to a `submit` function that defines the structure of the data to extract from the provided text.\nUse the `submit` function to submit the structured data.\nBe sure to fill out every field and ALWAYS CALL THE `submit` function, even with default values!!!.\n                \n\n=============== ADDITIONAL INSTRUCTIONS ===============\nExtract sentiment and confidence from the given text. Return sentiment normalized to the range [-1.0, 1.0] and confidence normalized to [0.0, 1.0].","type":"input_text"}],"role":"system","type":"message"},{"content":[{"text":"Linus is going to the store to buy milk and bread for dinner.","type":"input_text"}],"role":"user","type":"message"}],"model":"grok-3-mini","tool_choice":"required","tools":[{"description":"Submit the structured data you extracted from the provided text.","name":"submit","parameters":{"$schema":"https://json-schema.org/draft/2020-12/schema","properties":{"confidence":{"format":"double","type":"number"},"sentiment":{"format":"double","type":"number"}},"required":["sentiment","confidence"],"title":"Sentiment","type":"object"},"strict":false,"type":"function"}]}'
+then:
+  status: 200
+  header:
+  - name: content-type
+    value: application/json
+  - name: x-request-id
+    value: req_REDACTED_3
+  body: '{"background":false,"completed_at":0,"created_at":0,"error":null,"frequency_penalty":0.0,"id":"req_REDACTED_3","incomplete_details":null,"instructions":null,"max_output_tokens":null,"max_tool_calls":null,"metadata":{"system_fingerprint":"fp_REDACTED_1"},"model":"grok-4.3","object":"response","output":[{"id":"rs_REDACTED_3","status":"completed","summary":[{"text":"The task is to extract sentiment and confidence from the given text. The text is: \"Linus is going to the store to buy milk and bread for dinner.\"\n","type":"summary_text"}],"type":"reasoning"},{"arguments":"{\"sentiment\":0.0,\"confidence\":0.9}","call_id":"call_REDACTED_3","id":"fc_REDACTED_3","name":"submit","status":"completed","type":"function_call"}],"parallel_tool_calls":true,"presence_penalty":0.0,"previous_response_id":null,"prompt_cache_key":null,"reasoning":{"effort":"low","summary":"detailed"},"safety_identifier":null,"service_tier":"default","status":"completed","store":true,"temperature":0.7,"text":{"format":{"type":"text"}},"tool_choice":"required","tools":[{"description":"Submit the structured data you extracted from the provided text.","name":"submit","parameters":{"$schema":"https://json-schema.org/draft/2020-12/schema","properties":{"confidence":{"format":"double","type":"number"},"sentiment":{"format":"double","type":"number"}},"required":["sentiment","confidence"],"title":"Sentiment","type":"object"},"strict":false,"type":"function"}],"top_logprobs":0,"top_p":0.95,"truncation":"disabled","usage":{"context_details":{"input_tokens":435,"output_tokens":252},"cost_in_usd_ticks":9721500,"input_tokens":435,"input_tokens_details":{"cached_tokens":192},"num_server_side_tools_used":0,"num_sources_used":0,"output_tokens":252,"output_tokens_details":{"reasoning_tokens":249},"total_tokens":687},"user":null}'
+---
+when:
+  path: /v1/responses
+  method: POST
+  query_param: []
+  header:
+  - name: accept
+    value: '*/*'
+  - name: content-type
+    value: application/json
+  body: '{"input":[{"content":[{"text":"You are an AI assistant whose purpose is to extract structured data from the provided text.\nYou will have access to a `submit` function that defines the structure of the data to extract from the provided text.\nUse the `submit` function to submit the structured data.\nBe sure to fill out every field and ALWAYS CALL THE `submit` function, even with default values!!!.\n                \n\n=============== ADDITIONAL INSTRUCTIONS ===============\nExtract topics from the given text.","type":"input_text"}],"role":"system","type":"message"},{"content":[{"text":"Ada Lovelace discussed analytical engines and early programming with Charles Babbage.","type":"input_text"}],"role":"user","type":"message"}],"model":"grok-3-mini","tool_choice":"required","tools":[{"description":"Submit the structured data you extracted from the provided text.","name":"submit","parameters":{"$schema":"https://json-schema.org/draft/2020-12/schema","properties":{"topics":{"items":{"type":"string"},"type":"array"}},"required":["topics"],"title":"Topics","type":"object"},"strict":false,"type":"function"}]}'
+then:
+  status: 200
+  header:
+  - name: content-type
+    value: application/json
+  - name: x-request-id
+    value: req_REDACTED_4
+  body: '{"background":false,"completed_at":0,"created_at":0,"error":null,"frequency_penalty":0.0,"id":"req_REDACTED_4","incomplete_details":null,"instructions":null,"max_output_tokens":null,"max_tool_calls":null,"metadata":{"system_fingerprint":"fp_REDACTED_1"},"model":"grok-4.3","object":"response","output":[{"id":"rs_REDACTED_4","status":"completed","summary":[{"text":"The task is: \"Extract topics from the given text.\" The text is: \"Ada Lovelace discussed analytical engines and early programming with Charles Babbage.\"\n","type":"summary_text"}],"type":"reasoning"},{"arguments":"{\"topics\":[\"Ada Lovelace\",\"analytical engines\",\"early programming\",\"Charles Babbage\"]}","call_id":"call_REDACTED_4","id":"fc_REDACTED_4","name":"submit","status":"completed","type":"function_call"}],"parallel_tool_calls":true,"presence_penalty":0.0,"previous_response_id":null,"prompt_cache_key":null,"reasoning":{"effort":"low","summary":"detailed"},"safety_identifier":null,"service_tier":"default","status":"completed","store":true,"temperature":0.7,"text":{"format":{"type":"text"}},"tool_choice":"required","tools":[{"description":"Submit the structured data you extracted from the provided text.","name":"submit","parameters":{"$schema":"https://json-schema.org/draft/2020-12/schema","properties":{"topics":{"items":{"type":"string"},"type":"array"}},"required":["topics"],"title":"Topics","type":"object"},"strict":false,"type":"function"}],"top_logprobs":0,"top_p":0.95,"truncation":"disabled","usage":{"context_details":{"input_tokens":399,"output_tokens":403},"cost_in_usd_ticks":13046500,"input_tokens":399,"input_tokens_details":{"cached_tokens":192},"num_server_side_tools_used":0,"num_sources_used":0,"output_tokens":403,"output_tokens_details":{"reasoning_tokens":400},"total_tokens":802},"user":null}'
+---
+when:
+  path: /v1/responses
+  method: POST
+  query_param: []
+  header:
+  - name: accept
+    value: '*/*'
+  - name: content-type
+    value: application/json
+  body: '{"input":[{"content":[{"text":"You are an AI assistant whose purpose is to extract structured data from the provided text.\nYou will have access to a `submit` function that defines the structure of the data to extract from the provided text.\nUse the `submit` function to submit the structured data.\nBe sure to fill out every field and ALWAYS CALL THE `submit` function, even with default values!!!.\n                \n\n=============== ADDITIONAL INSTRUCTIONS ===============\nExtract names from the given text.","type":"input_text"}],"role":"system","type":"message"},{"content":[{"text":"Linus is going to the store to buy milk and bread for dinner.","type":"input_text"}],"role":"user","type":"message"}],"model":"grok-3-mini","tool_choice":"required","tools":[{"description":"Submit the structured data you extracted from the provided text.","name":"submit","parameters":{"$schema":"https://json-schema.org/draft/2020-12/schema","properties":{"names":{"items":{"type":"string"},"type":"array"}},"required":["names"],"title":"Names","type":"object"},"strict":false,"type":"function"}]}'
+then:
+  status: 200
+  header:
+  - name: content-type
+    value: application/json
+  - name: x-request-id
+    value: req_REDACTED_5
+  body: '{"background":false,"completed_at":0,"created_at":0,"error":null,"frequency_penalty":0.0,"id":"req_REDACTED_5","incomplete_details":null,"instructions":null,"max_output_tokens":null,"max_tool_calls":null,"metadata":{"system_fingerprint":"fp_REDACTED_1"},"model":"grok-4.3","object":"response","output":[{"id":"rs_REDACTED_5","status":"completed","summary":[{"text":"The task is: \"Extract names from the given text.\" The text is: \"Linus is going to the store to buy milk and bread for dinner.\"\n","type":"summary_text"}],"type":"reasoning"},{"arguments":"{\"names\":[\"Linus\"]}","call_id":"call_REDACTED_5","id":"fc_REDACTED_5","name":"submit","status":"completed","type":"function_call"}],"parallel_tool_calls":true,"presence_penalty":0.0,"previous_response_id":null,"prompt_cache_key":null,"reasoning":{"effort":"low","summary":"detailed"},"safety_identifier":null,"service_tier":"default","status":"completed","store":true,"temperature":0.7,"text":{"format":{"type":"text"}},"tool_choice":"required","tools":[{"description":"Submit the structured data you extracted from the provided text.","name":"submit","parameters":{"$schema":"https://json-schema.org/draft/2020-12/schema","properties":{"names":{"items":{"type":"string"},"type":"array"}},"required":["names"],"title":"Names","type":"object"},"strict":false,"type":"function"}],"top_logprobs":0,"top_p":0.95,"truncation":"disabled","usage":{"context_details":{"input_tokens":400,"output_tokens":361},"cost_in_usd_ticks":12009000,"input_tokens":400,"input_tokens_details":{"cached_tokens":192},"num_server_side_tools_used":0,"num_sources_used":0,"output_tokens":361,"output_tokens_details":{"reasoning_tokens":358},"total_tokens":761},"user":null}'
+---
+when:
+  path: /v1/responses
+  method: POST
+  query_param: []
+  header:
+  - name: accept
+    value: '*/*'
+  - name: content-type
+    value: application/json
+  body: '{"input":[{"content":[{"text":"You are an AI assistant whose purpose is to extract structured data from the provided text.\nYou will have access to a `submit` function that defines the structure of the data to extract from the provided text.\nUse the `submit` function to submit the structured data.\nBe sure to fill out every field and ALWAYS CALL THE `submit` function, even with default values!!!.\n                \n\n=============== ADDITIONAL INSTRUCTIONS ===============\nExtract topics from the given text.","type":"input_text"}],"role":"system","type":"message"},{"content":[{"text":"Linus is going to the store to buy milk and bread for dinner.","type":"input_text"}],"role":"user","type":"message"}],"model":"grok-3-mini","tool_choice":"required","tools":[{"description":"Submit the structured data you extracted from the provided text.","name":"submit","parameters":{"$schema":"https://json-schema.org/draft/2020-12/schema","properties":{"topics":{"items":{"type":"string"},"type":"array"}},"required":["topics"],"title":"Topics","type":"object"},"strict":false,"type":"function"}]}'
+then:
+  status: 200
+  header:
+  - name: content-type
+    value: application/json
+  - name: x-request-id
+    value: req_REDACTED_6
+  body: '{"background":false,"completed_at":0,"created_at":0,"error":null,"frequency_penalty":0.0,"id":"req_REDACTED_6","incomplete_details":null,"instructions":null,"max_output_tokens":null,"max_tool_calls":null,"metadata":{"system_fingerprint":"fp_REDACTED_1"},"model":"grok-4.3","object":"response","output":[{"id":"rs_REDACTED_6","status":"completed","summary":[{"text":"The task is: \"Extract topics from the given text.\" The text is: \"Linus is going to the store to buy milk and bread for dinner.\"\n","type":"summary_text"}],"type":"reasoning"},{"arguments":"{\"topics\":[\"shopping\",\"groceries\",\"dinner\"]}","call_id":"call_REDACTED_6","id":"fc_REDACTED_6","name":"submit","status":"completed","type":"function_call"}],"parallel_tool_calls":true,"presence_penalty":0.0,"previous_response_id":null,"prompt_cache_key":null,"reasoning":{"effort":"low","summary":"detailed"},"safety_identifier":null,"service_tier":"default","status":"completed","store":true,"temperature":0.7,"text":{"format":{"type":"text"}},"tool_choice":"required","tools":[{"description":"Submit the structured data you extracted from the provided text.","name":"submit","parameters":{"$schema":"https://json-schema.org/draft/2020-12/schema","properties":{"topics":{"items":{"type":"string"},"type":"array"}},"required":["topics"],"title":"Topics","type":"object"},"strict":false,"type":"function"}],"top_logprobs":0,"top_p":0.95,"truncation":"disabled","usage":{"context_details":{"input_tokens":400,"output_tokens":484},"cost_in_usd_ticks":15084000,"input_tokens":400,"input_tokens_details":{"cached_tokens":192},"num_server_side_tools_used":0,"num_sources_used":0,"output_tokens":484,"output_tokens_details":{"reasoning_tokens":481},"total_tokens":884},"user":null}'
+---
+when:
+  path: /v1/responses
+  method: POST
+  query_param: []
+  header:
+  - name: accept
+    value: '*/*'
+  - name: content-type
+    value: application/json
+  body: '{"input":[{"content":[{"text":"You are an AI assistant whose purpose is to extract structured data from the provided text.\nYou will have access to a `submit` function that defines the structure of the data to extract from the provided text.\nUse the `submit` function to submit the structured data.\nBe sure to fill out every field and ALWAYS CALL THE `submit` function, even with default values!!!.\n                \n\n=============== ADDITIONAL INSTRUCTIONS ===============\nExtract topics from the given text.","type":"input_text"}],"role":"system","type":"message"},{"content":[{"text":"Grace said she hates rainy weather but still walked her dog to the park.","type":"input_text"}],"role":"user","type":"message"}],"model":"grok-3-mini","tool_choice":"required","tools":[{"description":"Submit the structured data you extracted from the provided text.","name":"submit","parameters":{"$schema":"https://json-schema.org/draft/2020-12/schema","properties":{"topics":{"items":{"type":"string"},"type":"array"}},"required":["topics"],"title":"Topics","type":"object"},"strict":false,"type":"function"}]}'
+then:
+  status: 200
+  header:
+  - name: content-type
+    value: application/json
+  - name: x-request-id
+    value: req_REDACTED_7
+  body: '{"background":false,"completed_at":0,"created_at":0,"error":null,"frequency_penalty":0.0,"id":"req_REDACTED_7","incomplete_details":null,"instructions":null,"max_output_tokens":null,"max_tool_calls":null,"metadata":{"system_fingerprint":"fp_REDACTED_1"},"model":"grok-4.3","object":"response","output":[{"id":"rs_REDACTED_7","status":"completed","summary":[{"text":"The task is: \"Extract topics from the given text.\" The text is: \"Grace said she hates rainy weather but still walked her dog to the park.\"\n","type":"summary_text"}],"type":"reasoning"},{"arguments":"{\"topics\":[\"rainy weather\",\"dog walking\",\"park\"]}","call_id":"call_REDACTED_7","id":"fc_REDACTED_7","name":"submit","status":"completed","type":"function_call"}],"parallel_tool_calls":true,"presence_penalty":0.0,"previous_response_id":null,"prompt_cache_key":null,"reasoning":{"effort":"low","summary":"detailed"},"safety_identifier":null,"service_tier":"default","status":"completed","store":true,"temperature":0.7,"text":{"format":{"type":"text"}},"tool_choice":"required","tools":[{"description":"Submit the structured data you extracted from the provided text.","name":"submit","parameters":{"$schema":"https://json-schema.org/draft/2020-12/schema","properties":{"topics":{"items":{"type":"string"},"type":"array"}},"required":["topics"],"title":"Topics","type":"object"},"strict":false,"type":"function"}],"top_logprobs":0,"top_p":0.95,"truncation":"disabled","usage":{"context_details":{"input_tokens":400,"output_tokens":397},"cost_in_usd_ticks":12909000,"input_tokens":400,"input_tokens_details":{"cached_tokens":192},"num_server_side_tools_used":0,"num_sources_used":0,"output_tokens":397,"output_tokens_details":{"reasoning_tokens":394},"total_tokens":797},"user":null}'
+---
+when:
+  path: /v1/responses
+  method: POST
+  query_param: []
+  header:
+  - name: accept
+    value: '*/*'
+  - name: content-type
+    value: application/json
+  body: '{"input":[{"content":[{"text":"You are an AI assistant whose purpose is to extract structured data from the provided text.\nYou will have access to a `submit` function that defines the structure of the data to extract from the provided text.\nUse the `submit` function to submit the structured data.\nBe sure to fill out every field and ALWAYS CALL THE `submit` function, even with default values!!!.\n                \n\n=============== ADDITIONAL INSTRUCTIONS ===============\nExtract names from the given text.","type":"input_text"}],"role":"system","type":"message"},{"content":[{"text":"Grace said she hates rainy weather but still walked her dog to the park.","type":"input_text"}],"role":"user","type":"message"}],"model":"grok-3-mini","tool_choice":"required","tools":[{"description":"Submit the structured data you extracted from the provided text.","name":"submit","parameters":{"$schema":"https://json-schema.org/draft/2020-12/schema","properties":{"names":{"items":{"type":"string"},"type":"array"}},"required":["names"],"title":"Names","type":"object"},"strict":false,"type":"function"}]}'
+then:
+  status: 200
+  header:
+  - name: content-type
+    value: application/json
+  - name: x-request-id
+    value: req_REDACTED_8
+  body: '{"background":false,"completed_at":0,"created_at":0,"error":null,"frequency_penalty":0.0,"id":"req_REDACTED_8","incomplete_details":null,"instructions":null,"max_output_tokens":null,"max_tool_calls":null,"metadata":{"system_fingerprint":"fp_REDACTED_1"},"model":"grok-4.3","object":"response","output":[{"id":"rs_REDACTED_8","status":"completed","summary":[{"text":"The task is: \"Extract names from the given text.\" The text is: \"Grace said she hates rainy weather but still walked her dog to the park.\"\n","type":"summary_text"}],"type":"reasoning"},{"arguments":"{\"names\":[\"Grace\"]}","call_id":"call_REDACTED_8","id":"fc_REDACTED_8","name":"submit","status":"completed","type":"function_call"}],"parallel_tool_calls":true,"presence_penalty":0.0,"previous_response_id":null,"prompt_cache_key":null,"reasoning":{"effort":"low","summary":"detailed"},"safety_identifier":null,"service_tier":"default","status":"completed","store":true,"temperature":0.7,"text":{"format":{"type":"text"}},"tool_choice":"required","tools":[{"description":"Submit the structured data you extracted from the provided text.","name":"submit","parameters":{"$schema":"https://json-schema.org/draft/2020-12/schema","properties":{"names":{"items":{"type":"string"},"type":"array"}},"required":["names"],"title":"Names","type":"object"},"strict":false,"type":"function"}],"top_logprobs":0,"top_p":0.95,"truncation":"disabled","usage":{"context_details":{"input_tokens":400,"output_tokens":445},"cost_in_usd_ticks":14084000,"input_tokens":400,"input_tokens_details":{"cached_tokens":192},"num_server_side_tools_used":0,"num_sources_used":0,"output_tokens":444,"output_tokens_details":{"reasoning_tokens":441},"total_tokens":844},"user":null}'
+---
+when:
+  path: /v1/responses
+  method: POST
+  query_param: []
+  header:
+  - name: accept
+    value: '*/*'
+  - name: content-type
+    value: application/json
+  body: '{"input":[{"content":[{"text":"You are an AI assistant whose purpose is to extract structured data from the provided text.\nYou will have access to a `submit` function that defines the structure of the data to extract from the provided text.\nUse the `submit` function to submit the structured data.\nBe sure to fill out every field and ALWAYS CALL THE `submit` function, even with default values!!!.\n                \n\n=============== ADDITIONAL INSTRUCTIONS ===============\nExtract sentiment and confidence from the given text. Return sentiment normalized to the range [-1.0, 1.0] and confidence normalized to [0.0, 1.0].","type":"input_text"}],"role":"system","type":"message"},{"content":[{"text":"Grace said she hates rainy weather but still walked her dog to the park.","type":"input_text"}],"role":"user","type":"message"}],"model":"grok-3-mini","tool_choice":"required","tools":[{"description":"Submit the structured data you extracted from the provided text.","name":"submit","parameters":{"$schema":"https://json-schema.org/draft/2020-12/schema","properties":{"confidence":{"format":"double","type":"number"},"sentiment":{"format":"double","type":"number"}},"required":["sentiment","confidence"],"title":"Sentiment","type":"object"},"strict":false,"type":"function"}]}'
+then:
+  status: 200
+  header:
+  - name: content-type
+    value: application/json
+  - name: x-request-id
+    value: req_REDACTED_9
+  body: '{"background":false,"completed_at":0,"created_at":0,"error":null,"frequency_penalty":0.0,"id":"req_REDACTED_9","incomplete_details":null,"instructions":null,"max_output_tokens":null,"max_tool_calls":null,"metadata":{"system_fingerprint":"fp_REDACTED_1"},"model":"grok-4.3","object":"response","output":[{"id":"rs_REDACTED_9","status":"completed","summary":[{"text":"The task is to extract sentiment and confidence from the text: \"Grace said she hates rainy weather but still walked her dog to the park.\"\n","type":"summary_text"}],"type":"reasoning"},{"arguments":"{\"sentiment\":-0.7,\"confidence\":0.8}","call_id":"call_REDACTED_9","id":"fc_REDACTED_9","name":"submit","status":"completed","type":"function_call"}],"parallel_tool_calls":true,"presence_penalty":0.0,"previous_response_id":null,"prompt_cache_key":null,"reasoning":{"effort":"low","summary":"detailed"},"safety_identifier":null,"service_tier":"default","status":"completed","store":true,"temperature":0.7,"text":{"format":{"type":"text"}},"tool_choice":"required","tools":[{"description":"Submit the structured data you extracted from the provided text.","name":"submit","parameters":{"$schema":"https://json-schema.org/draft/2020-12/schema","properties":{"confidence":{"format":"double","type":"number"},"sentiment":{"format":"double","type":"number"}},"required":["sentiment","confidence"],"title":"Sentiment","type":"object"},"strict":false,"type":"function"}],"top_logprobs":0,"top_p":0.95,"truncation":"disabled","usage":{"context_details":{"input_tokens":435,"output_tokens":522},"cost_in_usd_ticks":16446500,"input_tokens":435,"input_tokens_details":{"cached_tokens":192},"num_server_side_tools_used":0,"num_sources_used":0,"output_tokens":521,"output_tokens_details":{"reasoning_tokens":518},"total_tokens":956},"user":null}'

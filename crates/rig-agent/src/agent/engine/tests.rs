@@ -292,10 +292,10 @@ fn no_identity() -> &'static rig_core::completion::ResponseIdentity {
 
 fn canonical_usage() -> Usage {
     Usage {
-        input_tokens: 11,
-        output_tokens: 7,
-        total_tokens: 18,
-        ..Usage::new()
+        input_tokens: Some(11),
+        output_tokens: Some(7),
+        total_tokens: Some(18),
+        ..Usage::default()
     }
 }
 
@@ -457,7 +457,7 @@ impl AgentHook for TurnIdentityHook {
 
 fn stream_final_with_ids(request_id: &str, response_id: &str) -> MockStreamEvent {
     MockStreamEvent::FinalResponse(
-        rig_core::streaming::StreamFinal::new("mock", Usage::new())
+        rig_core::streaming::StreamFinal::new("mock", Usage::default())
             .with_response_id(response_id)
             .with_provider_request_id(request_id),
     )
@@ -718,8 +718,10 @@ fn raw_payload(attempt: &str) -> serde_json::Value {
 /// The mock's terminal type is `StreamFinal` itself, so the terminal's
 /// `raw` is exactly this record serialized.
 fn stream_final_for_attempt(attempt: &str, total_tokens: u64) -> rig_core::streaming::StreamFinal {
-    let mut usage = Usage::new();
-    usage.total_tokens = total_tokens;
+    let usage = Usage {
+        total_tokens: Some(total_tokens),
+        ..Default::default()
+    };
     rig_core::streaming::StreamFinal::new("mock", usage)
         .with_response_id(format!("resp-{attempt}"))
         .with_provider_request_id(format!("req-{attempt}"))
@@ -1203,7 +1205,7 @@ async fn streaming_completion_response_stop_preserves_provider_final() {
         error,
         Some(StreamingError::Prompt(error))
             if matches!(
-                error.as_ref(),
+                &error,
                 PromptError::PromptCancelled { chat_history, reason }
                     if chat_history == &[prompt] && reason == "stop at stream EOF"
             )
@@ -1257,7 +1259,7 @@ async fn streaming_model_turn_stop_preserves_completed_provider_final() {
         error,
         Some(StreamingError::Prompt(error))
             if matches!(
-                error.as_ref(),
+                &error,
                 PromptError::PromptCancelled { reason, .. }
                     if reason == "stop completed model turn"
             )
@@ -1622,7 +1624,7 @@ async fn prompt_surfaces_reject_second_tool_roundtrip_request_at_budget_one() {
     }
     match streaming_err {
         Some(StreamingError::Prompt(err)) => assert!(matches!(
-            *err,
+            err,
             PromptError::MaxTurnsError { max_turns: 1, .. }
         )),
         other => panic!("expected streaming max-turns error, got {other:?}"),
@@ -2636,9 +2638,9 @@ mod span_safety_net {
 
     fn usage(input: u64, output: u64) -> Usage {
         Usage {
-            input_tokens: input,
-            output_tokens: output,
-            ..Usage::new()
+            input_tokens: Some(input),
+            output_tokens: Some(output),
+            ..Usage::default()
         }
     }
 
@@ -2798,7 +2800,7 @@ mod span_safety_net {
                         error,
                         super::StreamingError::Prompt(error)
                             if matches!(
-                                error.as_ref(),
+                                &error,
                                 PromptError::PromptCancelled { reason, .. }
                                     if reason == "stop completed model turn"
                             )
@@ -7044,7 +7046,7 @@ async fn dynamic_context_retrieval_failure_stops_before_provider_io_on_both_surf
         error,
         StreamingError::Prompt(prompt_error)
             if matches!(
-                prompt_error.as_ref(),
+                &prompt_error,
                 PromptError::PromptCancelled { reason, .. }
                     if reason.contains("context index unavailable")
             )
@@ -8605,10 +8607,10 @@ impl AgentHook for BoundedResponseRetry {
 
 fn retry_usage(input_tokens: u64, output_tokens: u64) -> Usage {
     Usage {
-        input_tokens,
-        output_tokens,
-        total_tokens: input_tokens + output_tokens,
-        ..Usage::new()
+        input_tokens: Some(input_tokens),
+        output_tokens: Some(output_tokens),
+        total_tokens: Some(input_tokens + output_tokens),
+        ..Usage::default()
     }
 }
 
@@ -8736,7 +8738,7 @@ async fn model_turn_finished_reports_termination_and_effective_max_tokens_stream
     let model = MockCompletionModel::from_stream_turns([[
         MockStreamEvent::Text("a partial ans".to_string()),
         MockStreamEvent::FinalResponse(
-            mock_final(Usage::new()).with_finish_reason(FinishReason::Length),
+            mock_final(Usage::default()).with_finish_reason(FinishReason::Length),
         ),
     ]]);
 
@@ -8819,12 +8821,12 @@ async fn model_turn_finished_reports_tool_calls_for_a_mislabelled_streamed_tool_
         vec![
             MockStreamEvent::tool_call("call-1", "add", json!({ "x": 1, "y": 2 })),
             MockStreamEvent::FinalResponse(
-                mock_final(Usage::new()).with_finish_reason(FinishReason::Stop),
+                mock_final(Usage::default()).with_finish_reason(FinishReason::Stop),
             ),
         ],
         vec![
             MockStreamEvent::Text("3".to_string()),
-            MockStreamEvent::FinalResponse(mock_final(Usage::new())),
+            MockStreamEvent::FinalResponse(mock_final(Usage::default())),
         ],
     ]);
 
@@ -8888,13 +8890,13 @@ async fn streaming_retry_reports_the_second_attempts_own_effective_max_tokens() 
         [
             MockStreamEvent::Text("rejected".to_string()),
             MockStreamEvent::FinalResponse(
-                mock_final(Usage::new()).with_finish_reason(FinishReason::Length),
+                mock_final(Usage::default()).with_finish_reason(FinishReason::Length),
             ),
         ],
         [
             MockStreamEvent::Text("accepted".to_string()),
             MockStreamEvent::FinalResponse(
-                mock_final(Usage::new()).with_finish_reason(FinishReason::Stop),
+                mock_final(Usage::default()).with_finish_reason(FinishReason::Stop),
             ),
         ],
     ]);
@@ -9453,7 +9455,7 @@ async fn streaming_model_turn_retry_respects_max_turns() {
     assert!(matches!(
         error,
         Some(StreamingError::Prompt(error))
-            if matches!(error.as_ref(), PromptError::MaxTurnsError { max_turns: 1, .. })
+            if matches!(error, PromptError::MaxTurnsError { max_turns: 1, .. })
     ));
 }
 
@@ -9552,7 +9554,7 @@ async fn streaming_model_turn_retry_rejects_tool_turn_without_committed_executio
     let PromptError::PromptCancelled {
         chat_history,
         reason,
-    } = error.as_ref()
+    } = error
     else {
         panic!("tool-bearing streaming retry should return PromptCancelled");
     };
@@ -9629,7 +9631,7 @@ async fn retry_scratchpad_state_is_isolated_by_run_and_hook_instance() {
     let first_event = ModelTurnFinished {
         turn: 1,
         content: &content,
-        usage: Usage::new(),
+        usage: Usage::default(),
         identity: no_identity(),
         // These cases exercise hook dispatch, not termination metadata.
         finish_reason: None,
@@ -9662,7 +9664,7 @@ async fn retry_scratchpad_state_is_isolated_by_run_and_hook_instance() {
             ModelTurnFinished {
                 turn: 1,
                 content: &first_content,
-                usage: Usage::new(),
+                usage: Usage::default(),
                 identity: no_identity(),
                 finish_reason: None,
                 max_tokens: None,
@@ -9676,7 +9678,7 @@ async fn retry_scratchpad_state_is_isolated_by_run_and_hook_instance() {
             ModelTurnFinished {
                 turn: 2,
                 content: &second_content,
-                usage: Usage::new(),
+                usage: Usage::default(),
                 identity: no_identity(),
                 finish_reason: None,
                 max_tokens: None,
@@ -9711,7 +9713,7 @@ async fn model_turn_action_short_circuits_flat_and_nested_hook_stacks() {
     let event = ModelTurnFinished {
         turn: 1,
         content: &content,
-        usage: Usage::new(),
+        usage: Usage::default(),
         identity: no_identity(),
         // These cases exercise hook dispatch, not termination metadata.
         finish_reason: None,
@@ -9902,7 +9904,7 @@ mod run_lifecycle {
         assert!(matches!(
             first,
             Err(StreamingError::Prompt(ref err))
-                if matches!(**err, PromptError::PromptCancelled { .. })
+                if matches!(err, PromptError::PromptCancelled { .. })
         ));
         assert!(stream.next().await.is_none());
 

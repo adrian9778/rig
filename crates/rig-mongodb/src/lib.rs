@@ -16,8 +16,9 @@ use rig_core::{
         InsertDocuments, VectorStoreError, VectorStoreIndex,
         request::{DynamicSearchFilter, Filter, FilterError, SearchFilter, VectorSearchRequest},
     },
+    wasm_compat::WasmCompatSend,
 };
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -69,7 +70,7 @@ struct Field {
 /// # Example
 /// ```no_run
 /// use rig_mongodb::{MongoDbVectorIndex, SearchParams};
-/// use rig_core::{providers::openai, vector_store::{VectorStoreIndex, VectorSearchRequest}, client::EmbeddingsClient};
+/// use rig_core::{providers::openai::{self, wire::OpenAI}, vector_store::{VectorStoreIndex, VectorSearchRequest}};
 /// use rig_reqwest::prelude::*;
 ///
 /// # async fn example() -> anyhow::Result<()> {
@@ -82,11 +83,11 @@ struct Field {
 /// }
 ///
 /// let mongodb_client = mongodb::Client::with_uri_str("mongodb://localhost:27017").await?; // <-- replace with your mongodb uri.
-/// let openai_client = openai::Client::from_env()?;
+/// let openai = OpenAI::from_env()?.bound()?;
 ///
 /// let collection = mongodb_client.database("db").collection::<WordDefinition>(""); // <-- replace with your mongodb collection.
 ///
-/// let model = openai_client.embedding_model(openai::TEXT_EMBEDDING_ADA_002); // <-- replace with your embedding model.
+/// let model = openai.embedding(openai::TEXT_EMBEDDING_ADA_002, None); // <-- replace with your embedding model.
 /// let index = MongoDbVectorIndex::new(
 ///     collection,
 ///     model,
@@ -201,8 +202,8 @@ where
             let id = doc
                 .get("_id")
                 .ok_or_else(|| {
-                    VectorStoreError::DatastoreError(
-                        "MongoDB vector search result missing _id".into(),
+                    VectorStoreError::MissingIdError(
+                        "MongoDB vector search result missing _id".to_string(),
                     )
                 })?
                 .to_string();
@@ -355,7 +356,6 @@ impl MongoDbSearchFilter {
         Self(doc! { key: { "$lte": value } })
     }
 
-    #[allow(clippy::should_implement_trait)]
     pub fn not(self) -> Self {
         Self(doc! { "$nor": [self.0] })
     }
@@ -404,7 +404,7 @@ where
     /// Implement the `top_n` method of the `VectorStoreIndex` trait for `MongoDbVectorIndex`.
     ///
     /// `VectorSearchRequest` similarity search threshold filter gets ignored here because it is already present and can already be added in the MongoDB vector store struct.
-    async fn top_n<T: for<'a> Deserialize<'a> + Send>(
+    async fn top_n<T: DeserializeOwned + WasmCompatSend>(
         &self,
         req: VectorSearchRequest<MongoDbSearchFilter>,
     ) -> Result<Vec<(f64, String, T)>, VectorStoreError> {
@@ -449,7 +449,7 @@ impl<C, M: EmbeddingModel> InsertDocuments for MongoDbVectorIndex<C, M>
 where
     C: Send + Sync,
 {
-    async fn insert_documents<Doc: Serialize + Embed + Send>(
+    async fn insert_documents<Doc: Serialize + Embed + WasmCompatSend>(
         &self,
         documents: Vec<(Doc, Vec<Embedding>)>,
     ) -> Result<(), VectorStoreError> {

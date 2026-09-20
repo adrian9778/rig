@@ -13,19 +13,13 @@
 //! | `Resolution::Repair` written by a system renames the call and dispatches it | `a_system_repairs_an_invalid_call_to_a_granted_tool` |
 //! | `Resolution::Retry` retries the turn with feedback and the invalid-peer notice | `a_system_retries_an_invalid_call_with_feedback` |
 
-#![allow(
-    clippy::expect_used,
-    clippy::unwrap_used,
-    clippy::panic,
-    clippy::indexing_slicing,
-    clippy::type_complexity
-)]
-
 use crate::run_support;
 
 use std::sync::{Arc, atomic::Ordering};
 
 use bevy_ecs::prelude::*;
+use rig_cassette::ecs::EffectLogResource;
+use rig_cassette::effect_log::EffectLogRecorder;
 use rig_core::{
     effect::{EffectKind, HandlerKey, Outcome},
     error::{ErrorKind, ErrorReport},
@@ -34,13 +28,12 @@ use rig_core::{
 };
 use rig_ecs::{
     agent::{
-        Failed, Failure, Grant, InvalidCall, InvalidCalls, Order, Resolution, RunResult, Settled,
+        Failed, Failure, Grant, InvalidCall, InvalidCalls, Resolution, RunResult, Settled,
         ToolPolicy,
     },
-    bus::{BusSet, EffectLogResource, EffectOutcome, Issued, PendingEffect, RigSchedule},
+    bus::{BusSet, EffectOutcome, Issued, PendingEffect, RigSchedule},
     systems::{RigSet, RunCommands},
 };
-use rig_effect_log::EffectLogRecorder;
 use run_support::*;
 
 const MODEL: &str = "t/model:default";
@@ -59,20 +52,15 @@ fn add_system<M>(
 fn tooling(turns: Vec<Vec<AssistantContent>>) -> (bevy_app::App, Entity, Arc<Adder>, RequestsSeen) {
     let mut app = app();
     EffectLogResource::install(app.world_mut(), EffectLogRecorder::new());
-    let (model, requests) = Scripted::new(MODEL, turns);
-    let model = register(&mut app, MODEL, model);
+    let (agent, requests) = scripted_agent(&mut app, MODEL, turns);
     let adder = Arc::new(Adder::new(ADD));
     let tool = register(&mut app, ADD, Arc::clone(&adder));
-    let agent = spawn_agent(app.world_mut(), "t", model);
     app.world_mut()
         .entity_mut(agent)
         .insert(rig_ecs::agent::MaxTurns(4));
-    app.world_mut()
-        .spawn((Grant(tool), Order(0), ChildOf(agent)));
+    app.world_mut().spawn((Grant(tool), ChildOf(agent)));
     (app, agent, adder, requests)
 }
-
-type RequestsSeen = Arc<std::sync::Mutex<Vec<rig_core::completion::CompletionRequest>>>;
 
 fn two_calls_then_text() -> Vec<Vec<AssistantContent>> {
     vec![
@@ -82,12 +70,6 @@ fn two_calls_then_text() -> Vec<Vec<AssistantContent>> {
         ],
         vec![AssistantContent::text("3 and 7")],
     ]
-}
-
-fn ended(app: &mut bevy_app::App, run: Entity, what: &str) {
-    tick_until(app, what, |world| {
-        world.get::<Settled>(run).is_some() || world.get::<Failed>(run).is_some()
-    });
 }
 
 fn tool_results(request: &rig_core::completion::CompletionRequest) -> Vec<(String, String)> {
@@ -160,8 +142,7 @@ fn assert_active_tools(allowed: &[&str], executable: bool) {
             name: "other".into(),
         },
     );
-    app.world_mut()
-        .spawn((Grant(other), Order(1), ChildOf(agent)));
+    app.world_mut().spawn((Grant(other), ChildOf(agent)));
     app.insert_resource(ActiveTools(
         allowed.iter().map(|name| (*name).to_owned()).collect(),
     ));
@@ -823,8 +804,7 @@ fn repair_keeps_same_spelling_identity_namespaces_distinct() {
             "t/tool:peer_add",
             PeerAdder(Adder::new("t/tool:peer_add")),
         );
-        app.world_mut()
-            .spawn((Grant(peer), Order(1), ChildOf(agent)));
+        app.world_mut().spawn((Grant(peer), ChildOf(agent)));
         add_system(&mut app, repair_to_add.in_set(RigSet::Judge));
         let run =
             app.world_mut()
@@ -1033,10 +1013,11 @@ fn retry_feedback_targets_only_the_invalid_identity_namespace() {
 #[test]
 fn concurrency_and_independent_holds_survive_mid_batch_checkpoints() {
     use rig_ecs::{
-        agent::scene::{load_world, save_world},
         bus::{Held, acquire_hold, release_hold},
+        checkpoint::{Checkpoint, load_world, save_world},
         systems::BatchHeld,
     };
+    use std::any::type_name;
     for concurrency in [1, 2] {
         for policy_held in [false, true] {
             let turns = vec![
@@ -1076,34 +1057,31 @@ fn concurrency_and_independent_holds_survive_mid_batch_checkpoints() {
             }
             let saved = save_world(original.world_mut()).unwrap();
             // Exercise the wire format, not just an in-memory clone.
-            let saved: rig_ecs::agent::scene::WorldScene =
-                serde_json::from_str(&serde_json::to_string(&saved).unwrap()).unwrap();
+            let saved = Checkpoint::from_json(&saved.to_json().unwrap()).unwrap();
             // Both halves of the scheduling barrier are required. Reject an
             // inconsistent checkpoint before leaving a partially loaded world.
-            for missing_marker in [false, true] {
-                let mut malformed: rig_ecs::agent::scene::WorldScene = saved.clone();
-                if missing_marker {
-                    malformed.batch_held.clear();
-                } else {
-                    let index = malformed.batch_held[0];
-                    malformed.effects.effects[index].hold_owners = None;
-                }
+            for missing in [type_name::<BatchHeld>(), type_name::<Held>()] {
+                let mut malformed = saved.clone();
+                let held = malformed
+                    .entities
+                    .iter_mut()
+                    .find(|entity| entity.contains_key(type_name::<BatchHeld>()))
+                    .expect("a batch-held call is in the checkpoint");
+                held.remove(missing).unwrap();
                 let (mut destination, _, _, _) = tooling(vec![]);
                 let before = destination.world().entities().len();
-                assert!(load_world(&malformed, destination.world_mut()).is_err());
+                assert!(
+                    load_world(&malformed, destination.world_mut()).is_err(),
+                    "accepted a batch hold without {missing}"
+                );
                 assert_eq!(destination.world().entities().len(), before);
             }
             let (mut restored, _, adder, _) = tooling(vec![vec![AssistantContent::text("done")]]);
             let loaded = load_world(&saved, restored.world_mut()).unwrap();
-            let run = loaded
-                .graph
-                .iter()
-                .copied()
-                .find(|e| restored.world().get::<rig_ecs::agent::Run>(*e).is_some())
-                .unwrap();
+            let run = loaded.with::<rig_ecs::agent::Run>(restored.world())[0];
+            let effects = loaded.with::<PendingEffect>(restored.world());
             if policy_held {
-                let held = loaded
-                    .effects
+                let held = effects
                     .iter()
                     .copied()
                     .find(|e| {
@@ -1135,8 +1113,7 @@ fn concurrency_and_independent_holds_survive_mid_batch_checkpoints() {
             assert!(restored.world().get::<Settled>(run).is_some());
             assert!(adder.peak.load(Ordering::SeqCst) <= concurrency);
             assert!(
-                loaded
-                    .effects
+                effects
                     .iter()
                     .all(|e| restored.world().get::<Held>(*e).is_none())
             );
@@ -1189,9 +1166,9 @@ fn approving_a_batch_held_call_by_any_route_keeps_the_batch_and_the_scene_consis
         );
         ended(&mut app, run, "the run lands after the approval");
         assert!(app.world().get::<Settled>(run).is_some(), "{route}");
-        let saved = rig_ecs::agent::scene::save_world(app.world_mut()).expect("saves");
+        let saved = rig_ecs::checkpoint::save_world(app.world_mut()).expect("saves");
         let (mut fresh, _, _, _) = tooling(vec![vec![AssistantContent::text("done")]]);
-        rig_ecs::agent::scene::load_world(&saved, fresh.world_mut())
-            .unwrap_or_else(|error| panic!("{route}: the scene loads: {error}"));
+        rig_ecs::checkpoint::load_world(&saved, fresh.world_mut())
+            .unwrap_or_else(|error| panic!("{route}: the checkpoint loads: {error}"));
     }
 }

@@ -1,13 +1,4 @@
 //! Concurrent live delivery must reproduce the same effect identities on replay.
-#![allow(
-    clippy::unwrap_used,
-    clippy::expect_used,
-    clippy::panic,
-    clippy::unreachable,
-    clippy::type_complexity,
-    clippy::indexing_slicing,
-    dead_code
-)]
 use crate::run_support;
 
 use rig_core::serve::Dispatch;
@@ -15,6 +6,10 @@ use std::sync::{Arc, Mutex};
 
 use bevy_ecs::prelude::*;
 use futures::channel::oneshot;
+use rig_cassette::ecs::EffectLogResource;
+use rig_cassette::ecs::Replay;
+use rig_cassette::ecs::identity::stamp_run;
+use rig_cassette::effect_log::EffectLogRecorder;
 use rig_core::{
     completion::{CompletionRequest, CompletionResponse, ModelRef, ProviderCapabilities, Usage},
     effect::{EffectKind, FamilyDescriptor, HandlerDescriptor, HandlerKey, Outcome},
@@ -23,12 +18,10 @@ use rig_core::{
     tool::{ToolOutput, ToolResult},
 };
 use rig_ecs::{
-    agent::{Failed, Grant, MaxTurns, Order, PolicyVersion, RunResult, Settled},
-    bus::{Bound, EffectLogResource, Handlers, Replay},
-    replay::stamp_run,
+    agent::{Failed, Grant, MaxTurns, PolicyVersion, RunResult},
+    bus::{Bound, Handlers},
     systems::RunCommands,
 };
-use rig_effect_log::EffectLogRecorder;
 use run_support::*;
 
 const MODEL: &str = "t/model:default";
@@ -64,12 +57,6 @@ fn bound_entity(world: &mut World, key: &str) -> Entity {
         .find(|(_, b)| b.key == HandlerKey::from(key))
         .map(|(e, _)| e)
         .expect("key bound")
-}
-
-fn ended(app: &mut bevy_app::App, run: Entity, what: &str) {
-    tick_until(app, what, |world| {
-        world.get::<Settled>(run).is_some() || world.get::<Failed>(run).is_some()
-    });
 }
 
 fn ending(world: &World, run: Entity) -> String {
@@ -123,7 +110,7 @@ impl Serve for Latched {
         };
         rig_core::serve::Reply::Outcome(Ok(Outcome::Completion(CompletionResponse::new(
             choice,
-            Usage::new(),
+            Usage::default(),
             "latched",
         ))))
     }
@@ -169,8 +156,7 @@ fn two_run_agent(app: &mut bevy_app::App, model: Entity, tool: Entity) -> Entity
     app.world_mut()
         .entity_mut(agent)
         .insert((MaxTurns(2), PolicyVersion("probe/v1".into())));
-    app.world_mut()
-        .spawn((Grant(tool), Order(0), ChildOf(agent)));
+    app.world_mut().spawn((Grant(tool), ChildOf(agent)));
     agent
 }
 
@@ -202,7 +188,7 @@ fn concurrent_runs_replay_the_live_tool_identities() {
     stamp_run(live.world_mut(), two, &recorder).expect("the run stamps its program identity");
     ended(&mut live, one, "run one");
     ended(&mut live, two, "run two");
-    let log: rig_effect_log::EffectLog =
+    let log: rig_cassette::effect_log::EffectLog =
         serde_json::from_str(&serde_json::to_string(&recorder.log()).unwrap()).unwrap();
     assert_eq!(ending(live.world(), one), "Settled(\"done\")");
     assert_eq!(ending(live.world(), two), "Settled(\"done\")");
@@ -221,8 +207,8 @@ fn concurrent_runs_replay_the_live_tool_identities() {
 
     // Replay the same program, unchanged, over by-id replayers.
     let mut replay = app();
-    Handlers::with(replay.world_mut(), |h| Replay::default().register(h, &log))
-        .unwrap()
+    Replay::default()
+        .register(replay.world_mut(), &log)
         .unwrap();
     let model = bound_entity(replay.world_mut(), MODEL);
     let tool = bound_entity(replay.world_mut(), ADD);
@@ -267,7 +253,7 @@ fn answer_coincident_models(
         commands
             .entity(entity)
             .insert(rig_ecs::bus::WorldOutcome::new(Ok(Outcome::Completion(
-                CompletionResponse::new(choice, Usage::new(), "coincident"),
+                CompletionResponse::new(choice, Usage::default(), "coincident"),
             ))));
     }
 }
@@ -327,11 +313,9 @@ fn coincident_model_answers_ignore_irrelevant_turn_archetypes() {
     ended(&mut live, two, "live two");
     let log = recorder.log();
     let mut replay = app();
-    Handlers::with(replay.world_mut(), |handlers| {
-        Replay::policy_visible().register(handlers, &log)
-    })
-    .unwrap()
-    .unwrap();
+    Replay::policy_visible()
+        .register(replay.world_mut(), &log)
+        .unwrap();
     replay.world_mut().resource_mut::<Schedules>().add_systems(
         RigSchedule,
         change_turn_archetype

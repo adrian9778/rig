@@ -1,16 +1,12 @@
 //! Replay preserves outcome visibility and stream collection batches.
 
-#![allow(
-    clippy::expect_used,
-    clippy::unwrap_used,
-    clippy::indexing_slicing,
-    clippy::panic
-)]
-
 use crate::bus_support;
 
 use bevy_ecs::prelude::*;
 use futures::channel::oneshot;
+use rig_cassette::ecs::EffectLogResource;
+use rig_cassette::ecs::Replay;
+use rig_cassette::effect_log::{EffectLog, EffectLogRecorder};
 use rig_core::{
     completion::{ModelRef, ProviderCapabilities, Usage},
     effect::{EffectKind, FamilyDescriptor, HandlerDescriptor, HandlerKey, Outcome},
@@ -18,10 +14,8 @@ use rig_core::{
     streaming::StreamFinal,
 };
 use rig_ecs::bus::{
-    BusSet, EffectLogResource, EffectOutcome, Handlers, InFlight, PendingEffect, Replay,
-    RigSchedule, Streamed,
+    BusSet, EffectOutcome, Handlers, InFlight, PendingEffect, RigSchedule, Streamed,
 };
-use rig_effect_log::{EffectLog, EffectLogRecorder};
 use std::{
     collections::VecDeque,
     sync::{
@@ -30,6 +24,28 @@ use std::{
     },
     time::Instant,
 };
+
+/// Register `log` for replay on `app` under `mode`.
+fn replaying_with(app: &mut bevy_app::App, mode: Replay, log: &EffectLog) {
+    mode.register(app.world_mut(), log).unwrap();
+}
+
+/// [`replaying_with`] under policy-visible replay.
+fn replaying(app: &mut bevy_app::App, log: &EffectLog) {
+    replaying_with(app, Replay::policy_visible(), log);
+}
+
+/// The descriptor of a completion handler bound to `key`, serving `model`.
+fn completion_descriptor(key: &str, model: &str) -> HandlerDescriptor {
+    HandlerDescriptor {
+        key: key.into(),
+        family: FamilyDescriptor::Completion {
+            model: ModelRef::new(model),
+            capabilities: ProviderCapabilities::default(),
+        },
+        layers: Vec::new(),
+    }
+}
 
 #[derive(Resource, Default)]
 struct First(Option<String>);
@@ -40,14 +56,15 @@ struct ContinuationStarted(u8);
 fn continue_after_collect(
     mut started: ResMut<ContinuationStarted>,
     mut commands: Commands,
-    mut progress: ResMut<rig_ecs::bus::Progress>,
+    wake: Res<rig_ecs::bus::Wake>,
 ) {
     if started.0 == 2 {
         return;
     }
     started.0 += 1;
-    progress.mark();
     if started.0 == 1 {
+        // Still deliberating: the next pass is ours, not a diagnosis.
+        wake.signal();
         return;
     }
     for key in ["a", "b"] {
@@ -59,7 +76,6 @@ fn continue_after_collect(
             },
         ));
     }
-    progress.mark();
 }
 
 #[test]
@@ -67,18 +83,14 @@ fn replay_allows_a_continuation_after_collect_to_mint_its_first_effect() {
     let (log, _) = ordered_live(false);
     let mut app = bus_support::app();
     app.init_resource::<ContinuationStarted>();
-    Handlers::with(app.world_mut(), |handlers| {
-        Replay::policy_visible().register(handlers, &log)
-    })
-    .unwrap()
-    .unwrap();
+    replaying(&mut app, &log);
     app.world_mut()
         .resource_mut::<Schedules>()
         .add_systems(RigSchedule, continue_after_collect.in_set(BusSet::Judge));
     bus_support::tick_until(&mut app, "continued replay", |world| {
         assert!(
             world
-                .get_resource::<rig_ecs::bus::ReplayFailure>()
+                .get_resource::<rig_cassette::ecs::ReplayFailure>()
                 .is_none(),
             "later policy sets must run before diagnosing an absent future effect"
         );
@@ -90,15 +102,11 @@ fn replay_allows_a_continuation_after_collect_to_mint_its_first_effect() {
 fn replay_failure_stays_terminal_for_effects_created_after_the_refusal() {
     let (log, _) = ordered_live(false);
     let mut app = bus_support::app();
-    Handlers::with(app.world_mut(), |handlers| {
-        Replay::policy_visible().register(handlers, &log)
-    })
-    .unwrap()
-    .unwrap();
+    replaying(&mut app, &log);
     app.update();
     assert!(
         app.world()
-            .get_resource::<rig_ecs::bus::ReplayFailure>()
+            .get_resource::<rig_cassette::ecs::ReplayFailure>()
             .is_some(),
         "a missing program must fail finitely"
     );
@@ -214,11 +222,7 @@ fn opposite_answer_orders_have_distinct_logs_and_replay_their_own_winner() {
     for (log, expected) in [(forward, first_forward), (reverse, first_reverse)] {
         let mut app = bus_support::app();
         app.init_resource::<First>().add_observer(first_answer);
-        Handlers::with(app.world_mut(), |handlers| {
-            Replay::policy_visible().register(handlers, &log)
-        })
-        .unwrap()
-        .unwrap();
+        replaying(&mut app, &log);
         let loaded = Replay::load(app.world_mut(), &log);
         bus_support::tick_until(&mut app, "both replayed", |world| {
             loaded
@@ -235,11 +239,7 @@ fn a_recorded_divergence_is_delivered_without_overwriting_other_results() {
         let (log, first) = ordered_live_with_error(reverse, true);
         let mut replay = bus_support::app();
         replay.init_resource::<First>().add_observer(first_answer);
-        Handlers::with(replay.world_mut(), |handlers| {
-            Replay::policy_visible().register(handlers, &log)
-        })
-        .unwrap()
-        .unwrap();
+        replaying(&mut replay, &log);
         let loaded = Replay::load(replay.world_mut(), &log);
         bus_support::tick_until(
             &mut replay,
@@ -253,7 +253,7 @@ fn a_recorded_divergence_is_delivered_without_overwriting_other_results() {
         assert!(
             replay
                 .world()
-                .get_resource::<rig_ecs::bus::ReplayFailure>()
+                .get_resource::<rig_cassette::ecs::ReplayFailure>()
                 .is_none()
         );
         assert_eq!(replay.world().resource::<First>().0.as_ref(), Some(&first));
@@ -276,11 +276,7 @@ fn bounded_intake_preserves_deliveries_for_reserved_and_new_effects() {
             .resource_mut::<rig_ecs::bus::Policy>()
             .0
             .command_capacity = 1;
-        Handlers::with(app.world_mut(), |handlers| {
-            Replay::policy_visible().register(handlers, &log)
-        })
-        .unwrap()
-        .unwrap();
+        replaying(&mut app, &log);
         let effects: Vec<_> = if reserved {
             Replay::load(app.world_mut(), &log)
         } else {
@@ -304,7 +300,7 @@ fn bounded_intake_preserves_deliveries_for_reserved_and_new_effects() {
         );
         assert!(
             !app.world()
-                .contains_resource::<rig_ecs::bus::ReplayFailure>()
+                .contains_resource::<rig_cassette::ecs::ReplayFailure>()
         );
         assert!(
             effects.iter().all(|entity| app
@@ -339,11 +335,7 @@ fn serial_serving_replays_two_streams_on_the_same_key() {
     let log: EffectLog =
         serde_json::from_str(&serde_json::to_string(&recorder.log()).unwrap()).unwrap();
     let mut replay = bus_support::serial_app();
-    Handlers::with(replay.world_mut(), |handlers| {
-        Replay::policy_visible().register(handlers, &log)
-    })
-    .unwrap()
-    .unwrap();
+    replaying(&mut replay, &log);
     let loaded: Vec<_> = (0..2)
         .map(|_| {
             replay
@@ -360,7 +352,7 @@ fn serial_serving_replays_two_streams_on_the_same_key() {
     assert!(
         !replay
             .world()
-            .contains_resource::<rig_ecs::bus::ReplayFailure>()
+            .contains_resource::<rig_cassette::ecs::ReplayFailure>()
     );
     for (before, after) in effects.into_iter().zip(loaded) {
         assert_eq!(
@@ -381,22 +373,18 @@ fn serial_serving_replays_two_streams_on_the_same_key() {
         delivery.batch = 1;
     }
     let mut replay = bus_support::serial_app();
-    Handlers::with(replay.world_mut(), |handlers| {
-        Replay::policy_visible().register(handlers, &impossible)
-    })
-    .unwrap()
-    .unwrap();
+    replaying(&mut replay, &impossible);
     // The loaded effects are found by query below; their handles are not needed.
     let _ = Replay::load(replay.world_mut(), &impossible);
     bus_support::tick_until(
         &mut replay,
         "impossible serial batch is diagnosed",
-        |world| world.contains_resource::<rig_ecs::bus::ReplayFailure>(),
+        |world| world.contains_resource::<rig_cassette::ecs::ReplayFailure>(),
     );
     assert!(
         replay
             .world()
-            .resource::<rig_ecs::bus::ReplayFailure>()
+            .resource::<rig_cassette::ecs::ReplayFailure>()
             .0
             .message
             .contains("serial key")
@@ -417,7 +405,6 @@ fn observe_visible(effects: Query<&PendingEffect, With<EffectOutcome>>, mut seen
     }
 }
 
-#[allow(clippy::type_complexity)]
 fn world_answer<const LATE: bool>(
     effects: Query<
         (Entity, &PendingEffect),
@@ -491,11 +478,7 @@ fn world_answers_on_either_side_of_collect_preserve_policy_observations() {
         RigSchedule,
         observe_visible.after(BusSet::Collect).before(BusSet::Judge),
     );
-    Handlers::with(replay.world_mut(), |handlers| {
-        Replay::policy_visible().register(handlers, &log)
-    })
-    .unwrap()
-    .unwrap();
+    replaying(&mut replay, &log);
     // The loaded effects are found by query below; their handles are not needed.
     let _ = Replay::load(replay.world_mut(), &log);
     bus_support::tick_until(&mut replay, "same observed answer sets", |world| {
@@ -541,17 +524,11 @@ fn direct_in_flight_outcomes_refuse_policy_delivery_claims() {
     live.update();
     let log = recorder.log();
     let mut replay = bus_support::app();
-    let error = Handlers::with(replay.world_mut(), |handlers| {
-        Replay::policy_visible().register(handlers, &log)
-    })
-    .unwrap()
-    .unwrap_err();
+    let error = Replay::policy_visible()
+        .register(replay.world_mut(), &log)
+        .unwrap_err();
     assert!(error.message.contains("WorldOutcome"));
-    Handlers::with(replay.world_mut(), |handlers| {
-        Replay::default().register(handlers, &log)
-    })
-    .unwrap()
-    .unwrap();
+    replaying_with(&mut replay, Replay::default(), &log);
 }
 
 struct BatchedStream {
@@ -563,14 +540,7 @@ struct BatchedStream {
 impl Serve for BatchedStream {
     type Family = rig_core::effect::family::Completion;
     fn descriptor(&self) -> HandlerDescriptor {
-        HandlerDescriptor {
-            key: HandlerKey::from("model"),
-            family: FamilyDescriptor::Completion {
-                model: ModelRef::new("batched"),
-                capabilities: ProviderCapabilities::default(),
-            },
-            layers: vec![],
-        }
+        completion_descriptor("model", "batched")
     }
     async fn serve(&self, _kind: EffectKind, _dispatch: Dispatch) -> Reply {
         let mut gates = std::mem::take(&mut *self.gates.lock().unwrap());
@@ -592,7 +562,7 @@ impl Serve for BatchedStream {
                         drop(writer);
                     } else {
                         writer
-                            .finish(StreamFinal::new("batched", Usage::new()))
+                            .finish(StreamFinal::new("batched", Usage::default()))
                             .await
                             .unwrap();
                     }
@@ -717,11 +687,7 @@ fn kept_streams_replay_single_and_multi_event_policy_batches() {
         assert_eq!(live.last().map(String::as_str), Some("abc"));
         assert_eq!(live, recorded_text_snapshots(&log));
         let mut app = observing_app();
-        Handlers::with(app.world_mut(), |handlers| {
-            Replay::policy_visible().register(handlers, &log)
-        })
-        .unwrap()
-        .unwrap();
+        replaying(&mut app, &log);
         let effect = Replay::load(app.world_mut(), &log)[0];
         bus_support::tick_until(&mut app, "replayed stream", |world| {
             world.get::<EffectOutcome>(effect).is_some()
@@ -753,11 +719,7 @@ fn kept_streams_replay_single_and_multi_event_policy_batches() {
         });
         legacy.header.deliveries = Some(deliveries);
         let mut replay = observing_app();
-        Handlers::with(replay.world_mut(), |handlers| {
-            Replay::policy_visible().register(handlers, &legacy)
-        })
-        .unwrap()
-        .unwrap();
+        replaying(&mut replay, &legacy);
         let effect = Replay::load(replay.world_mut(), &legacy)[0];
         bus_support::tick_until(&mut replay, "historical batches", |world| {
             world.get::<EffectOutcome>(effect).is_some()
@@ -771,17 +733,11 @@ fn folded_stream_refuses_policy_mode_but_replays_a_final_answer() {
     let (log, live) = live_stream(vec![vec!["a"], vec!["b"], vec!["c"]], false);
     assert_eq!(live.last().map(String::as_str), Some("abc"));
     let mut app = observing_app();
-    let error = Handlers::with(app.world_mut(), |handlers| {
-        Replay::policy_visible().register(handlers, &log)
-    })
-    .unwrap()
-    .expect_err("the recording omitted event bytes");
+    let error = Replay::policy_visible()
+        .register(app.world_mut(), &log)
+        .expect_err("the recording omitted event bytes");
     assert!(error.message.contains("kept stream events"));
-    Handlers::with(app.world_mut(), |handlers| {
-        Replay::default().register(handlers, &log)
-    })
-    .unwrap()
-    .unwrap();
+    replaying_with(&mut app, Replay::default(), &log);
     let effect = Replay::load(app.world_mut(), &log)[0];
     bus_support::tick_until(&mut app, "folded replay", |world| {
         world.get::<EffectOutcome>(effect).is_some()
@@ -797,20 +753,10 @@ fn request_shape_mismatch_is_a_terminal_divergence_instead_of_a_delivery_wait() 
     let recorder = EffectLogRecorder::new();
     EffectLogResource::install(live.world_mut(), recorder.clone());
     bus_support::register(&mut live, "model", bus_support::MockModel::new(&counters));
-    let effect = live
-        .world_mut()
-        .spawn(PendingEffect::new("model", bus_support::completion()))
-        .id();
-    bus_support::tick_until(&mut live, "unary recorded", |world| {
-        world.get::<EffectOutcome>(effect).is_some()
-    });
+    bus_support::answered(&mut live, "unary recorded");
     for log in [streamed, recorder.log()] {
         let mut app = bus_support::app();
-        Handlers::with(app.world_mut(), |handlers| {
-            Replay::policy_visible().register(handlers, &log)
-        })
-        .unwrap()
-        .unwrap();
+        replaying(&mut app, &log);
         let effect = Replay::load(app.world_mut(), &log)[0];
         if let EffectKind::Completion { stream, .. } = &mut app
             .world_mut()
@@ -849,10 +795,7 @@ fn malformed_delivery_metadata_is_refused_before_handlers_are_registered() {
             _ => deliveries.clear(),
         }
         let mut app = bus_support::app();
-        let result = Handlers::with(app.world_mut(), |handlers| {
-            Replay::policy_visible().register(handlers, &malformed)
-        })
-        .unwrap();
+        let result = Replay::policy_visible().register(app.world_mut(), &malformed);
         assert!(result.is_err());
         assert_eq!(
             app.world_mut()
@@ -866,7 +809,7 @@ fn malformed_delivery_metadata_is_refused_before_handlers_are_registered() {
 
 #[test]
 fn replay_tail_and_restored_subset_do_not_wait_for_already_answered_effects() {
-    use rig_ecs::bus::{Issued, Scene};
+    use rig_ecs::{bus::Issued, checkpoint::load_world};
     let (log, _) = ordered_live(false);
     let mut first = log.clone();
     first.records.truncate(1);
@@ -877,11 +820,7 @@ fn replay_tail_and_restored_subset_do_not_wait_for_already_answered_effects() {
         .unwrap()
         .retain(|step| step.id == first.records[0].id);
     let mut head = bus_support::app();
-    Handlers::with(head.world_mut(), |handlers| {
-        Replay::policy_visible().register(handlers, &first)
-    })
-    .unwrap()
-    .unwrap();
+    replaying(&mut head, &first);
     let answered = Replay::load(head.world_mut(), &first)[0];
     bus_support::tick_until(&mut head, "head complete", |world| {
         world.get::<EffectOutcome>(answered).is_some()
@@ -894,15 +833,13 @@ fn replay_tail_and_restored_subset_do_not_wait_for_already_answered_effects() {
         ))
         .id();
     assert!(head.world().get::<Issued>(tail_effect).is_none());
-    let scene = Scene::save(head.world_mut());
+    let saved = bus_support::checkpoint(&mut head);
     for replay_log in [log.clone(), log.tail(1)] {
         let mut restored = bus_support::app();
-        Handlers::with(restored.world_mut(), |handlers| {
-            Replay::policy_visible().register(handlers, &replay_log)
-        })
-        .unwrap()
-        .unwrap();
-        let loaded = scene.load(restored.world_mut()).unwrap();
+        replaying(&mut restored, &replay_log);
+        let loaded = load_world(&saved, restored.world_mut()).unwrap();
+        let loaded = loaded.with::<PendingEffect>(restored.world());
+        assert_eq!(loaded.len(), 2);
         bus_support::tick_until(&mut restored, "resumed subset", |world| {
             loaded
                 .iter()
@@ -916,10 +853,12 @@ fn replay_tail_and_restored_subset_do_not_wait_for_already_answered_effects() {
                 .0
                 .is_ok()
         }));
-        assert_eq!(
-            restored.world().get::<Issued>(loaded[1]).unwrap().0,
-            log.records[1].id
-        );
+        let mut ids: Vec<_> = loaded
+            .iter()
+            .map(|entity| restored.world().get::<Issued>(*entity).unwrap().0)
+            .collect();
+        ids.sort();
+        assert_eq!(ids, [log.records[0].id, log.records[1].id]);
     }
 }
 
@@ -995,11 +934,7 @@ fn policy_replay_does_not_insert_an_outcome_for_the_cancelled_loser() {
     let log = cancelled_loser_log();
     let mut replay = bus_support::app();
     replay.init_resource::<First>().add_observer(cancel_loser);
-    Handlers::with(replay.world_mut(), |handlers| {
-        Replay::policy_visible().register(handlers, &log)
-    })
-    .unwrap()
-    .unwrap();
+    replaying(&mut replay, &log);
     let loaded = Replay::load(replay.world_mut(), &log);
     bus_support::tick_until(&mut replay, "winner cancels loser", |world| {
         world.get::<EffectOutcome>(loaded[1]).is_some()
@@ -1010,7 +945,7 @@ fn policy_replay_does_not_insert_an_outcome_for_the_cancelled_loser() {
     assert!(
         !replay
             .world()
-            .contains_resource::<rig_ecs::bus::ReplayFailure>()
+            .contains_resource::<rig_cassette::ecs::ReplayFailure>()
     );
 }
 
@@ -1033,7 +968,7 @@ fn policy_replay_allows_cancellation_after_multiple_judge_passes() {
             RigSchedule,
             (move |effects: Query<(Entity, &PendingEffect, Option<&EffectOutcome>)>,
                    mut stage: Local<u8>,
-                   mut progress: ResMut<rig_ecs::bus::Progress>,
+                   wake: Res<rig_ecs::bus::Wake>,
                    mut commands: Commands| {
                 if !effects.iter().any(|(_, effect, outcome)| {
                     effect.key == HandlerKey::from("b") && outcome.is_some()
@@ -1049,32 +984,30 @@ fn policy_replay_allows_cancellation_after_multiple_judge_passes() {
                     }
                     if *stage < delay {
                         *stage += 1;
-                        progress.mark();
+                        wake.signal();
                     } else {
                         // The idle check must see this deferred removal even
-                        // when the final policy action does not mark Progress.
+                        // when the final policy action raises nothing.
                         commands.entity(entity).despawn();
                     }
                 }
             })
             .in_set(BusSet::Judge),
         );
-        Handlers::with(replay.world_mut(), |handlers| {
-            Replay::policy_visible().register(handlers, &log)
-        })
-        .unwrap()
-        .unwrap();
+        replaying(&mut replay, &log);
         let loaded = Replay::load(replay.world_mut(), &log);
         bus_support::tick_until(&mut replay, "delayed cancellation", |world| {
             world.get_entity(loaded[0]).is_err()
-                || world.contains_resource::<rig_ecs::bus::ReplayFailure>()
+                || world.contains_resource::<rig_cassette::ecs::ReplayFailure>()
         });
         assert!(
             !replay
                 .world()
-                .contains_resource::<rig_ecs::bus::ReplayFailure>(),
+                .contains_resource::<rig_cassette::ecs::ReplayFailure>(),
             "replay refused before the delayed cancellation: {:?}",
-            replay.world().get_resource::<rig_ecs::bus::ReplayFailure>()
+            replay
+                .world()
+                .get_resource::<rig_cassette::ecs::ReplayFailure>()
         );
         assert!(replay.world().get_entity(loaded[0]).is_err());
         replay.update();
@@ -1090,7 +1023,7 @@ fn policy_replay_allows_cancellation_after_multiple_judge_passes() {
         assert!(
             !replay
                 .world()
-                .contains_resource::<rig_ecs::bus::ReplayFailure>()
+                .contains_resource::<rig_cassette::ecs::ReplayFailure>()
         );
     }
 }
@@ -1099,17 +1032,16 @@ fn policy_replay_allows_cancellation_after_multiple_judge_passes() {
 fn policy_replay_refuses_when_quiescent_policy_never_cancels() {
     let log = cancelled_loser_log();
     let mut replay = bus_support::app();
-    Handlers::with(replay.world_mut(), |handlers| {
-        Replay::policy_visible().register(handlers, &log)
-    })
-    .unwrap()
-    .unwrap();
+    replaying(&mut replay, &log);
     // The loaded effects are found by query below; their handles are not needed.
     let _ = Replay::load(replay.world_mut(), &log);
     bus_support::tick_until(&mut replay, "missing policy cancellation", |world| {
-        world.contains_resource::<rig_ecs::bus::ReplayFailure>()
+        world.contains_resource::<rig_cassette::ecs::ReplayFailure>()
     });
-    let error = &replay.world().resource::<rig_ecs::bus::ReplayFailure>().0;
+    let error = &replay
+        .world()
+        .resource::<rig_cassette::ecs::ReplayFailure>()
+        .0;
     assert_eq!(error.kind, rig_core::error::ErrorKind::Divergence);
     assert!(error.to_string().contains("did not reproduce cancellation"));
 }
@@ -1165,11 +1097,7 @@ fn policy_cancels_at_the_same_partial_stream_state() {
         .world_mut()
         .resource_mut::<Schedules>()
         .add_systems(RigSchedule, cancel_partial.after(snapshot));
-    Handlers::with(replay.world_mut(), |handlers| {
-        Replay::policy_visible().register(handlers, &log)
-    })
-    .unwrap()
-    .unwrap();
+    replaying(&mut replay, &log);
     let effect = Replay::load(replay.world_mut(), &log)[0];
     bus_support::tick_until(&mut replay, "same partial cancel", |world| {
         world.get_entity(effect).is_err()
@@ -1179,7 +1107,7 @@ fn policy_cancels_at_the_same_partial_stream_state() {
     assert!(
         !replay
             .world()
-            .contains_resource::<rig_ecs::bus::ReplayFailure>()
+            .contains_resource::<rig_cassette::ecs::ReplayFailure>()
     );
 }
 
@@ -1276,11 +1204,7 @@ fn interleaved_streams_preserve_partial_states_and_provider_errors() {
         let log: EffectLog =
             serde_json::from_str(&serde_json::to_string(&recorder.log()).unwrap()).unwrap();
         let mut replay = interleaved_app();
-        Handlers::with(replay.world_mut(), |handlers| {
-            Replay::policy_visible().register(handlers, &log)
-        })
-        .unwrap()
-        .unwrap();
+        replaying(&mut replay, &log);
         let loaded = Replay::load(replay.world_mut(), &log);
         bus_support::tick_until(&mut replay, "interleaved streams replayed", |world| {
             loaded
@@ -1313,19 +1237,12 @@ struct TerminalErrors {
 impl Serve for TerminalErrors {
     type Family = rig_core::effect::family::Completion;
     fn descriptor(&self) -> HandlerDescriptor {
-        HandlerDescriptor {
-            key: "model".into(),
-            family: FamilyDescriptor::Completion {
-                model: ModelRef::new("terminal-errors"),
-                capabilities: ProviderCapabilities::default(),
-            },
-            layers: vec![],
-        }
+        completion_descriptor("model", "terminal-errors")
     }
     async fn serve(&self, _kind: EffectKind, _dispatch: Dispatch) -> Reply {
         let error = rig_core::error::ErrorReport::new(self.error_kind, "original error");
         let terminal =
-            rig_core::streaming::StreamEvent::Final(StreamFinal::new("test", Usage::new()));
+            rig_core::streaming::StreamEvent::Final(StreamFinal::new("test", Usage::default()));
         let first = if self.error_first {
             vec![Err(error), Ok(terminal)]
         } else {
@@ -1409,7 +1326,7 @@ fn errors_before_and_after_final_keep_their_positions_and_first_outcome() {
             })
             .unwrap();
         deliveries.remove(position);
-        let error = rig_ecs::bus::delivery::ReplayDelivery::new(&short, true)
+        let error = rig_cassette::ecs::ReplayDelivery::new(&short, true)
             .err()
             .expect("all error items must be represented");
         assert!(error.message.contains("counts disagree"));
@@ -1432,18 +1349,14 @@ fn errors_before_and_after_final_keep_their_positions_and_first_outcome() {
                     },
                 },
             );
-            let error = rig_ecs::bus::delivery::ReplayDelivery::new(&missing, true)
+            let error = rig_cassette::ecs::ReplayDelivery::new(&missing, true)
                 .err()
                 .expect("first outcome is not reconstructible");
             assert!(error.message.contains("first stream outcome"));
             assert!(error.message.contains("error positions"));
         }
         let mut replay = bus_support::app();
-        Handlers::with(replay.world_mut(), |handlers| {
-            Replay::policy_visible().register(handlers, &log)
-        })
-        .unwrap()
-        .unwrap();
+        replaying(&mut replay, &log);
         let loaded = Replay::load(replay.world_mut(), &log)[0];
         bus_support::tick_until(&mut replay, "terminal sequence replayed", |world| {
             world.get::<EffectOutcome>(loaded).is_some()
@@ -1546,14 +1459,7 @@ fn cancellation_after_an_original_answer_has_a_replayable_visibility_trace() {
     impl Serve for Truncated {
         type Family = rig_core::effect::family::Completion;
         fn descriptor(&self) -> HandlerDescriptor {
-            HandlerDescriptor {
-                key: "model".into(),
-                family: FamilyDescriptor::Completion {
-                    model: "truncated".into(),
-                    capabilities: Default::default(),
-                },
-                layers: vec![],
-            }
+            completion_descriptor("model", "truncated")
         }
         async fn serve(&self, _: EffectKind, _: Dispatch) -> Reply {
             Reply::Stream(Box::pin(futures::stream::empty()))
@@ -1611,7 +1517,7 @@ fn cancellation_after_an_original_answer_has_a_replayable_visibility_trace() {
                 .any(|delivery| matches!(delivery.kind, rig_core::effect::DeliveryKind::Outcome)),
             "no outcome reached the consumer"
         );
-        rig_ecs::bus::delivery::ReplayDelivery::new(&log, true)
+        rig_cassette::ecs::ReplayDelivery::new(&log, true)
             .expect("a library-generated cancellation trace must remain replayable");
         assert!(matches!(
             log.header.deliveries.as_ref().unwrap().last().unwrap().kind,
@@ -1619,16 +1525,12 @@ fn cancellation_after_an_original_answer_has_a_replayable_visibility_trace() {
         ));
         for policy in [false, true] {
             let mut replay = bus_support::app();
-            Handlers::with(replay.world_mut(), |handlers| {
-                let mode = if policy {
-                    Replay::policy_visible()
-                } else {
-                    Replay::default()
-                };
-                mode.register(handlers, &log)
-            })
-            .unwrap()
-            .unwrap();
+            let mode = if policy {
+                Replay::policy_visible()
+            } else {
+                Replay::default()
+            };
+            replaying_with(&mut replay, mode, &log);
             let loaded = Replay::load(replay.world_mut(), &log)[0];
             bus_support::tick_until(
                 &mut replay,
@@ -1662,11 +1564,7 @@ fn cancellation_after_an_original_answer_has_a_replayable_visibility_trace() {
         let mut reproduced = bus_support::app();
         let rerecorder = EffectLogRecorder::keeping_stream_events();
         EffectLogResource::install(reproduced.world_mut(), rerecorder.clone());
-        Handlers::with(reproduced.world_mut(), |handlers| {
-            Replay::policy_visible().register(handlers, &log)
-        })
-        .unwrap()
-        .unwrap();
+        replaying(&mut reproduced, &log);
         reproduced.world_mut().resource_mut::<Schedules>().add_systems(RigSchedule,
             (|mut commands: Commands, effects: Query<(Entity, &rig_ecs::bus::record::Observed), With<InFlight>>| {
                 for (entity, observed) in &effects {
@@ -1680,7 +1578,7 @@ fn cancellation_after_an_original_answer_has_a_replayable_visibility_trace() {
         assert!(
             !reproduced
                 .world()
-                .contains_resource::<rig_ecs::bus::ReplayFailure>()
+                .contains_resource::<rig_cassette::ecs::ReplayFailure>()
         );
         let rerecorded = rerecorder.log();
         assert_eq!(
@@ -1703,7 +1601,7 @@ fn cancellation_after_an_original_answer_has_a_replayable_visibility_trace() {
                 .kind,
             rig_core::effect::DeliveryKind::Cancelled
         ));
-        rig_ecs::bus::delivery::ReplayDelivery::new(&rerecorded, true)
+        rig_cassette::ecs::ReplayDelivery::new(&rerecorded, true)
             .expect("reproduced cancellation remains replayable");
 
         let mut invalid = log.clone();
@@ -1725,7 +1623,7 @@ fn cancellation_after_an_original_answer_has_a_replayable_visibility_trace() {
                 kind: rig_core::effect::DeliveryKind::Outcome,
             });
         assert!(
-            rig_ecs::bus::delivery::ReplayDelivery::new(&invalid, true).is_err(),
+            rig_cassette::ecs::ReplayDelivery::new(&invalid, true).is_err(),
             "cancellation closes the delivery trace"
         );
     }
@@ -1829,14 +1727,7 @@ fn cancelled_record_is_immutable_when_an_active_worker_poll_returns() {
     impl Serve for InPoll {
         type Family = rig_core::effect::family::Completion;
         fn descriptor(&self) -> HandlerDescriptor {
-            HandlerDescriptor {
-                key: "active-poll".into(),
-                family: FamilyDescriptor::Completion {
-                    model: ModelRef::new("mock"),
-                    capabilities: ProviderCapabilities::default(),
-                },
-                layers: Vec::new(),
-            }
+            completion_descriptor("active-poll", "mock")
         }
         async fn serve(&self, _: EffectKind, _: Dispatch) -> Reply {
             let entered = self.entered.clone();
@@ -1852,7 +1743,7 @@ fn cancelled_record_is_immutable_when_an_active_worker_poll_returns() {
                 entered.send(()).unwrap();
                 release.recv_timeout(bus_support::GUARD).unwrap();
                 std::task::Poll::Ready(Some(Ok(rig_core::streaming::StreamEvent::Final(
-                    StreamFinal::new("mock", Usage::new()),
+                    StreamFinal::new("mock", Usage::default()),
                 ))))
             })))
         }
@@ -1889,7 +1780,7 @@ fn cancelled_record_is_immutable_when_an_active_worker_poll_returns() {
         cancelled,
         "a poll returning after cancellation must not mutate the closed recording"
     );
-    rig_effect_log::EffectLogReplayer::check_header(&recorder.log()).unwrap();
+    rig_cassette::effect_log::EffectLogReplayer::check_header(&recorder.log()).unwrap();
 }
 
 #[test]
@@ -1935,11 +1826,7 @@ fn implicit_cancelled_prefix_rerecord_does_not_invent_an_error_item() {
     let mut app = bus_support::app();
     let rerecorder = EffectLogRecorder::keeping_stream_events();
     EffectLogResource::install(app.world_mut(), rerecorder.clone());
-    Handlers::with(app.world_mut(), |handlers| {
-        Replay::policy_visible().register(handlers, &log)
-    })
-    .unwrap()
-    .unwrap();
+    replaying(&mut app, &log);
     let effect = Replay::load(app.world_mut(), &log)[0];
     app.world_mut().resource_mut::<Schedules>().add_systems(
         RigSchedule,
@@ -1960,7 +1847,7 @@ fn implicit_cancelled_prefix_rerecord_does_not_invent_an_error_item() {
     });
     assert!(
         !app.world()
-            .contains_resource::<rig_ecs::bus::ReplayFailure>()
+            .contains_resource::<rig_cassette::ecs::ReplayFailure>()
     );
     let rerecorded = rerecorder.log();
     assert_eq!(
@@ -1971,5 +1858,5 @@ fn implicit_cancelled_prefix_rerecord_does_not_invent_an_error_item() {
         serde_json::to_value(&rerecorded.records).unwrap(),
         serde_json::to_value(&log.records).unwrap()
     );
-    rig_ecs::bus::delivery::ReplayDelivery::new(&rerecorded, true).unwrap();
+    rig_cassette::ecs::ReplayDelivery::new(&rerecorded, true).unwrap();
 }

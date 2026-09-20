@@ -10,14 +10,6 @@
 //! | §11.2 the quiescence cap is a diagnostic, never a hang | `the_quiescence_cap_ends_the_tick` |
 //! | 9 a handler survives every effect it served; nothing is re-registered | `handlers_outlive_every_effect_and_serve_again` |
 
-#![allow(
-    clippy::expect_used,
-    clippy::unwrap_used,
-    clippy::panic,
-    clippy::indexing_slicing,
-    clippy::type_complexity
-)]
-
 use crate::bus_support;
 
 use std::{
@@ -27,11 +19,10 @@ use std::{
 
 use bevy_ecs::prelude::*;
 use bus_support::*;
+use rig_cassette::ecs::EffectLogResource;
+use rig_cassette::effect_log::EffectLogRecorder;
 use rig_core::serve::ServingPolicy;
-use rig_ecs::bus::{
-    BusSet, EffectLogResource, EffectOutcome, InFlight, PendingEffect, Progress, RigSchedule, Seq,
-};
-use rig_effect_log::EffectLogRecorder;
+use rig_ecs::bus::{BusSet, EffectOutcome, InFlight, PendingEffect, RigSchedule, Seq};
 
 #[derive(Resource, Default)]
 struct Spawned(std::sync::Mutex<Vec<Entity>>);
@@ -151,44 +142,32 @@ fn ten_thousand_effects_in_flight_cost_one_bounded_tick() {
     });
 }
 
-/// A system that always reports progress: the cap must end the tick.
-fn always_progress(mut progress: ResMut<Progress>, mut passes: ResMut<Passes>) {
-    progress.mark();
+/// A system in `RigSchedule` counts its runs.
+fn count_passes(mut passes: ResMut<Passes>) {
     passes.0 += 1;
 }
 
 #[derive(Resource, Default)]
 struct Passes(usize);
 
+/// One app update runs `RigSchedule` exactly once, whatever the systems in
+/// it do: nothing loops the schedule inside a tick.
 #[test]
-fn the_quiescence_cap_ends_the_tick() {
+fn one_update_is_one_pass() {
     let mut app = app();
     app.init_resource::<Passes>();
     app.world_mut()
         .resource_mut::<bevy_ecs::schedule::Schedules>()
-        .add_systems(RigSchedule, always_progress.after(BusSet::Judge));
-    let start = Instant::now();
+        .add_systems(RigSchedule, count_passes.after(BusSet::Judge));
     app.update();
-    assert!(start.elapsed() < GUARD);
-    assert_eq!(
-        app.world().resource::<Passes>().0,
-        rig_ecs::bus::QUIESCENCE_CAP,
-        "exactly the cap's passes, then the tick ends"
-    );
+    app.update();
+    assert_eq!(app.world().resource::<Passes>().0, 2);
 }
 
 #[test]
 fn handlers_outlive_every_effect_and_serve_again() {
-    let counters = Arc::new(Counters::default());
-    let mut app = app();
-    register(&mut app, "model", MockModel::new(&counters));
-    let first = app
-        .world_mut()
-        .spawn(PendingEffect::new("model", completion()))
-        .id();
-    tick_until(&mut app, "first", |world| {
-        world.get::<EffectOutcome>(first).is_some()
-    });
+    let (mut app, _model, counters) = served();
+    let first = answered(&mut app, "first");
     // Every effect entity gone — the fixture's "driver dead" moment: here
     // nothing dies, because the handler is an entity of its own.
     app.world_mut().despawn(first);
@@ -199,12 +178,6 @@ fn handlers_outlive_every_effect_and_serve_again() {
         .iter(app.world())
         .count();
     assert_eq!(effects, 0);
-    let second = app
-        .world_mut()
-        .spawn(PendingEffect::new("model", completion()))
-        .id();
-    tick_until(&mut app, "second", |world| {
-        world.get::<EffectOutcome>(second).is_some()
-    });
+    answered(&mut app, "second");
     assert_eq!(counters.unary_served.load(Ordering::SeqCst), 2);
 }

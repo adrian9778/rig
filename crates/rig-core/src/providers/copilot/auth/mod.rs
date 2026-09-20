@@ -1,4 +1,5 @@
 use crate::http_client::HttpClientExt;
+use crate::wire::Secret;
 use futures::lock::Mutex;
 use std::fmt;
 use std::path::PathBuf;
@@ -15,6 +16,20 @@ mod wasm;
 use native as platform;
 #[cfg(target_family = "wasm")]
 use wasm as platform;
+
+/// Where Copilot's own editor integrations keep their token caches:
+/// `{config_dir}/github_copilot`, holding `access-token` and
+/// `api-key.json`.
+///
+/// [`Authenticator::new`] takes the two cache paths explicitly, because a
+/// host that wants no on-disk cache passes `None` and a test passes a
+/// temporary directory. This is the default the deleted client builder
+/// applied when the caller named neither, and it is the only place the
+/// location is written down — reading a cache Copilot's own tooling wrote
+/// means resolving it the same way.
+pub fn default_token_dir() -> Option<PathBuf> {
+    crate::providers::internal::auth::config_dir().map(|dir| dir.join("github_copilot"))
+}
 
 #[derive(Clone)]
 pub enum AuthSource {
@@ -55,7 +70,8 @@ pub use crate::providers::internal::auth::AuthError;
 
 #[derive(Debug, Clone)]
 pub struct AuthContext {
-    pub api_key: String,
+    /// Resolved credential. Use [`Secret::expose`] only when raw bytes are required.
+    pub api_key: Secret,
     pub api_base: Option<String>,
 }
 
@@ -86,7 +102,7 @@ impl Authenticator {
     {
         match &self.source {
             AuthSource::ApiKey(api_key) => Ok(AuthContext {
-                api_key: api_key.clone(),
+                api_key: api_key.clone().into(),
                 api_base: None,
             }),
             AuthSource::GitHubAccessToken(access_token) => {

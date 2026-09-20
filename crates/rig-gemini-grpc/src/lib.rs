@@ -5,13 +5,13 @@
 //!
 //! # Example
 //! ```no_run
-//! use rig_core::client::CompletionClient;
+//! use rig_core::driver::CompletionProvider;
 //! use rig_gemini_grpc::{Client, completion::GEMINI_2_0_FLASH};
 //!
 //! # async fn example() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 //! let client = Client::new("YOUR_API_KEY").await?;
 //!
-//! let completion_model = client.completion_model(GEMINI_2_0_FLASH);
+//! let completion_model = client.completion(GEMINI_2_0_FLASH);
 //! # Ok(())
 //! # }
 //! ```
@@ -44,13 +44,13 @@ impl From<&proto::GenerateContentResponse> for rig_core::completion::Usage {
             .usage_metadata
             .as_ref()
             .map(|u| rig_core::completion::Usage {
-                input_tokens: u.prompt_token_count as u64,
-                output_tokens: u.candidates_token_count as u64,
-                total_tokens: u.total_token_count as u64,
-                cached_input_tokens: u.cached_content_token_count as u64,
-                cache_creation_input_tokens: 0,
-                tool_use_prompt_tokens: 0,
-                reasoning_tokens: 0,
+                input_tokens: Some(u.prompt_token_count as u64),
+                output_tokens: Some(u.candidates_token_count as u64),
+                total_tokens: Some(u.total_token_count as u64),
+                cached_input_tokens: Some(u.cached_content_token_count as u64),
+                cache_creation_input_tokens: None,
+                tool_use_prompt_tokens: None,
+                reasoning_tokens: None,
             })
             .unwrap_or_default()
     }

@@ -558,7 +558,9 @@ impl HookContext {
     }
 }
 
-pub use crate::run::policy::{InvalidToolCallAction, InvalidToolCallContext, RetryRequest};
+pub use crate::run::policy::{
+    InvalidToolCallAction, InvalidToolCallContext, InvalidToolCallReason, RetryRequest,
+};
 
 /// Completion-call event.
 ///
@@ -702,12 +704,11 @@ pub struct ModelTurnFinished<'a> {
     pub max_tokens: Option<u64>,
     /// The provider's own response for this attempt — see
     /// `CompletionResponse::raw` in `rig-core` for the exact meaning of the
-    /// payload: the value the model's inherent `raw_completion` /
-    /// `raw_stream` would have returned, serialized. Every provider seam
-    /// populates it; `Value::Null` only when the response was built without
-    /// a provider behind it (a hand-constructed model, a record persisted
-    /// before the field). On a retry this is the retried attempt's own,
-    /// never a previous attempt's.
+    /// payload: the provider's reply document as its decoder parsed it,
+    /// serialized. Every provider seam populates it; `Value::Null` only when
+    /// the response was built without a provider behind it (a
+    /// hand-constructed model, a record persisted before the field). On a
+    /// retry this is the retried attempt's own, never a previous attempt's.
     ///
     /// Carried here, and not only on the surface-specific events, for the
     /// same reason identity is: this is the medium-neutral event, so a hook
@@ -942,10 +943,6 @@ pub struct DispatchEvent<'a> {
 
 /// What a hook decides at the dispatch boundary. Closed on purpose.
 #[derive(Debug, Clone)]
-#[allow(
-    clippy::large_enum_variant,
-    reason = "a patch carries a whole effect by design; the common `Proceed` is returned by value once per dispatch"
-)]
 pub enum DispatchAction {
     /// Dispatch as is.
     Proceed,
@@ -1086,10 +1083,6 @@ pub struct OutcomeEvent<'a> {
 
 /// What a hook decides after an effect resolved. Closed on purpose.
 #[derive(Debug, Clone)]
-#[allow(
-    clippy::large_enum_variant,
-    reason = "a replacement carries a whole outcome by design; the common `Proceed` is returned by value once per dispatch"
-)]
 pub enum OutcomeAction {
     /// Keep the answer.
     Proceed,

@@ -12,14 +12,20 @@
 //!   (answered); a stream accumulates in [`Streamed`] on the way. There is
 //!   no future for a host to hold and nothing to probe: readiness is the
 //!   component landing (`Added<EffectOutcome>`, `Changed<Streamed>`, an
-//!   `On<Add, EffectOutcome>` observer).
+//!   `On<Add, EffectOutcome>` observer) and, once the record closed, the
+//!   [`Landed`] entity event bubbling up `ChildOf` to the turn, the run and
+//!   the agent.
 //! - **A handler is an entity.** [`Handlers::register`] spawns one with a
-//!   [`Bound`] component (the key and the descriptor, serde) and puts the
-//!   erased handler in the world's [`HandlerTable`]. The registry is a
-//!   query; deregistration is a despawn.
+//!   [`Bound`] component (the key and the descriptor, serde; immutable, so
+//!   its hooks keep [`HandlerIndex`] exact), a `Name`, and the erased
+//!   handler as [`Handler`] on the same entity (the erased handler itself
+//!   lives in the non-send `HandlerTable`). An effect names its handler by
+//!   [`ServedBy`] (its inverse [`Serves`]). The registry is a query;
+//!   deregistration is a despawn.
 //! - **The driver is two systems.** [`BusSet::Dispatch`] takes pending
 //!   effects in [`Seq`] order and spawns each handler's future on the task
-//!   pool, held in the effect entity as Bevy's own `Task`; [`BusSet::Collect`]
+//!   pool, held in the effect entity as Bevy's own `Task` ([`Serving`],
+//!   [`Streaming`]; dropping the component cancels it); [`BusSet::Collect`]
 //!   reads what finished and writes the outcome component. Neither awaits,
 //!   neither blocks (a guard greps for `block_on`).
 //! - **Causality is `ChildOf`.** A handler that is a system spawns child
@@ -30,9 +36,9 @@
 //!   descendants, so a parent's cancel reaches its children with no table.
 //! - **Serial serving is a query.** Under
 //!   [`ServingPolicy::serial_per_handler`] `Dispatch` takes a key only when
-//!   nothing is in flight on it, and refuses (with a `Request` report,
-//!   before any dispatch) an effect whose ancestor is in flight on its own
-//!   key: it could only wait forever.
+//!   nothing is in flight on it (the handler's [`Serves`]), and refuses
+//!   (with a `Request` report, before any dispatch) an effect whose
+//!   ancestor is in flight on its own key: it could only wait forever.
 //! - **Interception is two system slots.** A user system in [`BusSet::Gate`]
 //!   rewrites a [`PendingEffect`] (patch), replaces it with
 //!   `EffectOutcome(Err(Denied))` (deny) or holds it with [`Held`] until a
@@ -49,12 +55,12 @@
 //! - **The log is a fold over entities.** With a [`Recording`] resource
 //!   installed ([`Recording::install`]), `Dispatch` opens a record as it
 //!   takes an effect and `Collect` closes it as the outcome lands; a
-//!   despawn before that closes it as cancelled. Under the `replay` feature
-//!   a `Replay` loads a log's records as effect entities with their
-//!   recorded ids and registers a replayer that answers each by id. An ECS
-//!   recording also keeps consumer delivery batches. Policy-visible replay
-//!   requires these boundaries and, for streams, kept events and error items;
-//!   it does not reconstruct arbitrary resources or elapsed time.
+//!   despawn before that closes it as cancelled. `rig_cassette::ecs::Replay`
+//!   loads records as effect entities with their recorded ids and registers
+//!   a replayer that answers each by id. An ECS recording also
+//!   keeps consumer delivery batches. Policy-visible replay requires these
+//!   boundaries and, for streams, kept events and error items; it does not
+//!   reconstruct arbitrary resources or elapsed time.
 //! - **Decisions are witnessed beside the log.** With a [`Witnessing`]
 //!   resource installed ([`Witnessing::install`]), the bus's own systems
 //!   emit a typed `rig_core::observe::Observation` at each decision site —
@@ -67,25 +73,31 @@
 //!   outcome overwritten after the record closed (a `Judge` replacement).
 //!   A host policy names itself through [`Witnessing::emit`]. The trace is
 //!   an analysis artifact: never replay identity, never part of the log.
-//! - **A scene is a checkpoint.** [`Scene::save`] takes the effect entities
-//!   (intent, ids, outcomes, stream state, causality, scope) and the bound descriptors as
-//!   serde; [`Scene::load`] spawns them back, ids reserved, outcomes kept,
-//!   so `Dispatch` re-issues safe unanswered intents. Load refuses unfinished
-//!   streams with delivered progress: no provider cursor prevents a repeated
-//!   prefix. Completed streams restore without re-executing their handlers.
+//! - **A checkpoint is the world.** [`crate::checkpoint::save_world`] takes
+//!   every entity with a reflected component — the effect entities (intent,
+//!   ids, outcomes, stream state, causality, scope) and the handlers'
+//!   [`Bound`]s among them; [`crate::checkpoint::load_world`] spawns them
+//!   back, ids reserved, outcomes kept, so `Dispatch` re-issues safe
+//!   unanswered intents. Load refuses unfinished streams with delivered
+//!   progress: no provider cursor prevents a repeated prefix. Completed
+//!   streams restore without re-executing their handlers. In-flight state
+//!   ([`Serving`], [`Streaming`], [`Handler`]) is never saved.
 //!
 //! # The schedule
 //!
-//! [`Bus::install`] adds a [`RigSchedule`] with four sets in order —
-//! [`BusSet::Gate`], [`BusSet::Dispatch`], [`BusSet::Collect`],
-//! [`BusSet::Judge`]. The host runs it **to quiescence** by calling
-//! [`run_to_quiescence`] once per tick from the schedule or loop it owns:
-//! as long as a bus system reports [`Progress`], the schedule runs again
-//! (capped at [`QUIESCENCE_CAP`] passes, a `warn!` when reached). Users add
-//! their systems to `RigSchedule`, ordered against the sets, never beside
-//! the runner: a system beside the runner sees one pass, a system in
-//! `RigSchedule` sees every pass. Intake bounds can defer a dispatch to the
-//! next tick; async readiness can require later ticks.
+//! [`BusPlugin`] adds a [`RigSchedule`] after `Update` with four sets in
+//! order — [`BusSet::Gate`], [`BusSet::Dispatch`], [`BusSet::Collect`],
+//! [`BusSet::Judge`] — and [`RigEnd`] after it, and runs them **once per
+//! app update**. Users add their systems to `RigSchedule`, ordered against
+//! the sets. A host updates the app when there is something to do: every
+//! task the bus spawns raises [`Wake`] as it finishes or delivers, a host
+//! system that needs another pass raises it too, and the plugin's default
+//! runner ([`woken_runner`]) updates on that signal, so nothing spins.
+//! Intake bounds apply per update; async readiness can require later
+//! updates. Cassette's `rig_cassette::ecs::ReplayPlugin` installs replay
+//! diagnosis in `RigEnd`, running only after a pass that raised nothing.
+//! [`BusPlugin::install`] is the runtime's world half, for a test that drives
+//! `RigSchedule` itself.
 //!
 //! # What it deliberately does not have
 //!
@@ -99,53 +111,44 @@
 
 pub mod binding;
 pub mod collect;
-#[cfg(feature = "replay")]
-pub mod delivery;
+pub mod diagnostics;
 pub mod dispatch;
 pub mod effect;
 pub mod handlers;
 pub mod hold;
 pub mod plugin;
 pub mod record;
-#[cfg(feature = "reflect")]
 pub mod reflect;
-pub mod scene;
 pub mod stream_delivery;
 pub mod witness;
 
-#[cfg(feature = "replay")]
-pub mod replay;
-
 pub use binding::{
     CredentialRef, MaterializeError, MaterializeFailed, MaterializeReport, Materializer,
-    ProviderBinding, ProviderKind, Secret, materialize, materialize_bindings,
+    ProviderBinding, Secret, materialize, materialize_bindings,
 };
-pub use collect::{Landed, StreamingView, collect_streams, collect_tasks, settle};
+pub use collect::{Landed, Landing, StreamingView, collect_streams, collect_tasks, settle};
+pub use diagnostics::{
+    BindingReport, CredentialGuidance, ProviderDiagnostics, RegisteredProvider,
+    provider_diagnostics,
+};
 pub use dispatch::{Candidate, CandidateView, dispatch, handler_unavailable, reentrant};
 pub use effect::{
     Answer, Asked, EffectOutcome, Held, IdCounter, InFlight, Issued, PendingEffect, Publishing,
-    Reserved, Scope, Seq, SeqCounter, Serving, Streamed, Streaming, ToolInputs, ToolOutputs, Typed,
-    WorldEffect, WorldOutcome,
+    Reserved, Scope, Seq, SeqCounter, Serving, Streamed, Streaming, Tasks, ToolInputs, ToolOutputs,
+    Typed, WorldEffect, WorldOutcome,
 };
 pub use handlers::{
-    Bound, HandlerTable, Handlers, Served, WorldHandler, WorldServe, answered, unbound,
+    Bound, Handler, HandlerIndex, Handlers, Registry, Served, ServedBy, Serves, WorldHandler,
+    WorldServe, answered,
 };
 pub use hold::{HoldOwners, HoldRefused, acquire_hold, release_hold};
-pub use plugin::{
-    Bus, BusSet, Intake, Policy, Progress, QUIESCENCE_CAP, RigSchedule, run_to_quiescence,
-};
+pub use plugin::{BusPlugin, BusSet, Policy, RigEnd, RigSchedule, Wake, woken_runner};
 pub use record::{
     Observed, ObservedState, Recording, WorldObserver, record_bound, record_cancelled,
 };
-pub use scene::{Scene, SceneEffect};
 pub use stream_delivery::StreamItemsDelivered;
 pub use witness::{
     AdapterOperation, BUS_EMITTER, Despawning, SubjectWalk, Subjects, Witnessing, bus_emitter,
 };
-
-#[cfg(feature = "replay")]
-pub use delivery::{ReplayDelivery, ReplayFailure};
-#[cfg(feature = "replay")]
-pub use replay::{EffectLogResource, Replay};
 
 pub use rig_core::serve::ServingPolicy;

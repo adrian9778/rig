@@ -34,10 +34,6 @@ pub type StreamingResult = Pin<Box<dyn Stream<Item = Result<MultiTurnStreamItem,
 #[serde(tag = "type", rename_all = "camelCase")]
 /// One item of a streamed run: a provider stream event, a committed tool
 /// call, a lifecycle marker, or the run's final response.
-#[allow(
-    clippy::large_enum_variant,
-    reason = "the terminal items are one per run and are moved, not copied; boxing them would put an allocation on every consumer's match"
-)]
 pub enum MultiTurnStreamItem {
     /// A provider stream event — the content the **model emitted**: block
     /// starts and ends, text/reasoning deltas, tool-call deltas, the
@@ -102,8 +98,8 @@ pub enum MultiTurnStreamItem {
     /// ```rust,ignore
     /// match item {
     ///     MultiTurnStreamItem::CompletionCall(completion_call) => {
-    ///         // Zero-valued usage means the provider reported no metrics.
-    ///         if completion_call.usage.has_values() {
+    ///         // Every counter is `None` when the provider reported no metrics.
+    ///         if completion_call.usage.is_reported() {
     ///             let context_tokens = completion_call.usage.input_tokens;
     ///         }
     ///     }
@@ -212,7 +208,7 @@ pub(crate) async fn drain_stream_usage(
         }
     }
 
-    Ok(crate::completion::Usage::new())
+    Ok(crate::completion::Usage::default())
 }
 
 /// Build the final streamed content for a finished run (#1928).
@@ -265,12 +261,12 @@ pub enum StreamingError {
     Report(#[from] rig_core::error::ErrorReport),
     /// The run failed for a reason the blocking surface reports the same way.
     #[error("PromptError: {0}")]
-    Prompt(#[from] Box<PromptError>),
+    Prompt(#[from] PromptError),
 }
 
 impl From<rig_core::memory::MemoryError> for StreamingError {
     fn from(err: rig_core::memory::MemoryError) -> Self {
-        Self::Prompt(Box::new(PromptError::MemoryError(err)))
+        Self::Prompt(PromptError::MemoryError(err))
     }
 }
 
@@ -585,6 +581,8 @@ pub async fn stream_to_stdout(
     Ok(final_res)
 }
 
+#[cfg(test)]
+mod malformed_tool_args_tests;
 #[cfg(test)]
 #[allow(irrefutable_let_patterns, unreachable_patterns)]
 mod tests;

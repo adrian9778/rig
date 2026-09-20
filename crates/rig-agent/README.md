@@ -12,12 +12,35 @@ Direct users import construction and prompting explicitly:
 
 ```rust,ignore
 use rig_agent::prelude::*;
-use rig_core::providers::openai;
+use rig_core::providers::openai::{self, OpenAI};
+use rig_reqwest::prelude::*;
 
-let client = openai::Client::from_env()?;
-let agent = client.agent(openai::GPT_5_2).build();
+let agent = OpenAI::from_env()?
+    .bound()?
+    .agent(openai::GPT_5_2)
+    .build();
 let answer = agent.prompt("Explain ownership briefly.").await?;
 ```
+
+## Recording and replay
+
+The runtime accepts `rig_core::serve::Recorder`, not a concrete log type.
+Enable the separate `rig-cassette` crate's `agent` feature for logs and replay
+adapters; neither crate configuration adds ECS/Bevy or the native HTTP engine.
+
+Retain a `rig_cassette::effect_log::EffectLogRecorder` and attach a clone with
+`AgentBuilder::record_to`. Choose `keeping_stream_events()` when the recording
+must preserve stream items. Import `rig_cassette::agent::AgentReplayExt` and
+call `agent.stamp(recorder.take())` after the run, or stamp `recorder.log()` for
+a snapshot. The extension trait also owns `run_spec_hash` and
+`check_replayable`. A host-owned bus attaches its recorder through
+`BusDriver::record_to`; agents over that bus cannot replace it.
+
+Register recorded handlers through `rig_cassette::agent::replay::register_all`
+or `register_all_checking`, then drive the ordinary bus. The runtime has no
+normal cassette dependency, even with all runtime features enabled.
+See [the cassette README](../rig-cassette/README.md) for feature isolation,
+checkpoint formats and migration from implicit recording/log getters.
 
 ## The run protocol
 

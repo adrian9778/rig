@@ -17,6 +17,7 @@ More information about this crate can be found in the [crate documentation](http
 - Portable contracts for agent runtimes, including completions, messages, tools, and memory
 - Full [GenAI Semantic Convention](https://opentelemetry.io/docs/specs/semconv/gen-ai/) compatibility
 - 20+ model providers, all under one singular unified interface
+- Providers selectable as data: `providers::registry` names a vendor and a protocol family (`deepseek/openai:deepseek-chat`) or carries a whole typed configuration, and both round-trip through serde without a credential
 - 10+ vector store integrations, all under one singular unified interface
 - Full support for LLM completion and embedding workflows
 - Support for transcription, audio generation and image generation model capabilities
@@ -38,18 +39,20 @@ Node.js 19 or later do. WASI targets are not supported.
 ## Simple example
 ```rust
 use rig_core::{
-    client::CompletionClient,
     completion::{AssistantContent, CompletionModel},
-    providers::openai,
+    providers::openai::{self, OpenAI},
 };
+// rig-core ships no transport; `.bound()` builds the bundled `reqwest` one.
+use rig_reqwest::prelude::*;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Create an OpenAI client and completion model.
-    // This requires the `OPENAI_API_KEY` environment variable to be set.
-    let openai_client = openai::Client::from_env()?;
+    // Read `OPENAI_API_KEY` into the provider's configuration, bind it to a
+    // transport, and pick a model: a model is a wire plus its socket.
+    // OpenAI's default completion route is the Responses API;
+    // `.with_route(Route::Chat)` on the configuration selects Chat Completions.
+    let model = OpenAI::from_env()?.bound()?.completion(openai::GPT_5_2);
 
-    let model = openai_client.completion_model(openai::GPT_5_2);
     let request = model.completion_request("Who are you?").build();
     let response = model.completion(request).await?;
     for item in response.choice {

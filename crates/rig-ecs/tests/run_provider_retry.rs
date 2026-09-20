@@ -10,25 +10,22 @@
 //! | a non-retryable report after tool work ends the run on the first failure | `a_non_retryable_failure_after_tool_work_ends_the_run_at_once` |
 //! | `ProviderRetries(0)` is the old behaviour | `a_zero_budget_never_retries` |
 //! | a backoff is a host hold on the re-issued effect; a cancel during it ends the run `Cancelled` with no further request | `a_host_hold_is_where_a_backoff_goes_and_a_cancel_during_it_ends_the_run` |
-//! | a scene saved during that hold resumes into the retry, not a fresh prompt | `a_scene_saved_during_the_hold_resumes_into_the_retry` |
+//! | a checkpoint saved during that hold resumes into the retry, not a fresh prompt | `a_checkpoint_saved_during_the_hold_resumes_into_the_retry` |
 //! | a stream cut before its terminal record is a transport fault: retryable, re-issued, answered | `a_truncated_stream_is_reissued` |
-
-#![allow(
-    clippy::expect_used,
-    clippy::unwrap_used,
-    clippy::panic,
-    clippy::indexing_slicing,
-    clippy::type_complexity
-)]
 
 use crate::run_support;
 
 use std::{
     collections::VecDeque,
     sync::{Arc, Mutex},
+    time::Duration,
 };
 
 use bevy_ecs::prelude::*;
+use rig_cassette::ecs::EffectLogResource;
+use rig_cassette::ecs::Replay;
+use rig_cassette::ecs::identity::stamp_run;
+use rig_cassette::effect_log::{EffectLog, EffectLogRecorder};
 use rig_core::{
     completion::{CompletionRequest, CompletionResponse, ModelRef, ProviderCapabilities, Usage},
     effect::{EffectKind, FamilyDescriptor, HandlerDescriptor, HandlerKey, Outcome},
@@ -40,18 +37,13 @@ use rig_core::{
 };
 use rig_ecs::{
     agent::{
-        Cancelled, Cursor, Failed, Failure, Grant, MaxTurns, Order, ProviderRetried,
-        ProviderRetries, RunResult, Settled,
-        scene::{load_world, save_world},
+        Cancelled, Cursor, Failed, Failure, Grant, MaxTurns, ProviderRetried, ProviderRetries,
+        RunResult, Settled,
     },
-    bus::{
-        Bound, BusSet, EffectLogResource, Handlers, Held, PendingEffect, Replay, RigSchedule,
-        Witnessing,
-    },
-    replay::stamp_run,
+    bus::{Bound, BusSet, Held, PendingEffect, RigSchedule, Witnessing},
+    checkpoint::{Checkpoint, load_world, save_world},
     systems::RunCommands,
 };
-use rig_effect_log::{EffectLog, EffectLogRecorder};
 use run_support::*;
 
 const MODEL: &str = "t/model:default";
@@ -86,7 +78,7 @@ impl Serve for Flaky {
         Reply::Outcome(match next {
             Some(Ok(choice)) => Ok(Outcome::Completion(CompletionResponse::new(
                 choice,
-                Usage::new(),
+                Usage::default(),
                 "flaky",
             ))),
             Some(Err(report)) => Err(report),
@@ -140,15 +132,8 @@ fn tooling(
     let tool = register(&mut app, ADD, Adder::new(ADD));
     let agent = spawn_agent(app.world_mut(), "t", model);
     app.world_mut().entity_mut(agent).insert(MaxTurns(4));
-    app.world_mut()
-        .spawn((Grant(tool), Order(0), ChildOf(agent)));
+    app.world_mut().spawn((Grant(tool), ChildOf(agent)));
     (app, agent, requests, recorder, witness)
-}
-
-fn ended(app: &mut bevy_app::App, run: Entity, what: &str) {
-    tick_until(app, what, |world| {
-        world.get::<Settled>(run).is_some() || world.get::<Failed>(run).is_some()
-    });
 }
 
 fn failure(world: &World, run: Entity) -> Failure {
@@ -239,16 +224,14 @@ fn a_retryable_failure_after_tool_work_is_reissued_and_the_tool_runs_once() {
     // The log replays: the same program over by-id replayers sees the
     // failed attempt answered from its record, retries, and settles.
     let mut replay = run_support::app();
-    Handlers::with(replay.world_mut(), |h| Replay::default().register(h, &log))
-        .unwrap()
+    Replay::default()
+        .register(replay.world_mut(), &log)
         .unwrap();
     let model = bound_entity(replay.world_mut(), MODEL);
     let tool = bound_entity(replay.world_mut(), ADD);
     let agent = spawn_agent(replay.world_mut(), "t", model);
     replay.world_mut().entity_mut(agent).insert(MaxTurns(4));
-    replay
-        .world_mut()
-        .spawn((Grant(tool), Order(0), ChildOf(agent)));
+    replay.world_mut().spawn((Grant(tool), ChildOf(agent)));
     let run = replay.world_mut().spawn_run(agent, &[], "add", false, None);
     ended(&mut replay, run, "the replayed run");
     assert_eq!(
@@ -323,7 +306,7 @@ fn a_zero_budget_never_retries() {
 
 /// Whether the host's backoff hold is in force.
 #[derive(Resource)]
-struct Backoff(bool);
+struct HostBackoff(bool);
 
 /// A host `Gate` system: the re-issued completion of a run that has
 /// retried waits under a hold until the host releases it (the backoff).
@@ -331,7 +314,7 @@ fn hold_retried_completion(
     fresh: Query<(Entity, &PendingEffect, &ChildOf), Added<PendingEffect>>,
     turns: Query<&ChildOf>,
     runs: Query<&ProviderRetried>,
-    backoff: Res<Backoff>,
+    backoff: Res<HostBackoff>,
     mut commands: Commands,
 ) {
     if !backoff.0 {
@@ -364,7 +347,7 @@ fn a_host_hold_is_where_a_backoff_goes_and_a_cancel_during_it_ends_the_run() {
         Err(unavailable("status 503")),
         Ok(done()),
     ]);
-    app.insert_resource(Backoff(true));
+    app.insert_resource(HostBackoff(true));
     app.world_mut()
         .resource_mut::<Schedules>()
         .add_systems(RigSchedule, hold_retried_completion.in_set(BusSet::Gate));
@@ -401,13 +384,13 @@ fn a_host_hold_is_where_a_backoff_goes_and_a_cancel_during_it_ends_the_run() {
 }
 
 #[test]
-fn a_scene_saved_during_the_hold_resumes_into_the_retry() {
+fn a_checkpoint_saved_during_the_hold_resumes_into_the_retry() {
     let (mut app, agent, requests, recorder, _) = tooling(vec![
         Ok(add_call()),
         Err(unavailable("status 503")),
         Ok(done()),
     ]);
-    app.insert_resource(Backoff(true));
+    app.insert_resource(HostBackoff(true));
     app.world_mut()
         .resource_mut::<Schedules>()
         .add_systems(RigSchedule, hold_retried_completion.in_set(BusSet::Gate));
@@ -422,13 +405,16 @@ fn a_scene_saved_during_the_hold_resumes_into_the_retry() {
     });
     assert_eq!(requests.lock().unwrap().len(), 2);
     let saved = save_world(app.world_mut()).expect("every component serializes");
-    let json = serde_json::to_string(&saved).expect("serde");
-    assert!(json.contains("\"provider_retried\""), "{json}");
+    let json = saved.to_json().expect("serde");
+    assert!(
+        json.contains(std::any::type_name::<ProviderRetried>()),
+        "the spent retry is checkpoint data: {json}"
+    );
     drop(app);
 
     // A fresh world, the same handlers, no hold: the loaded run carries its
     // spent retry and its held attempt, which is released and answered.
-    let saved = serde_json::from_str(&json).expect("serde");
+    let saved = Checkpoint::from_json(&json).expect("serde");
     let mut app = run_support::app();
     EffectLogResource::install(app.world_mut(), EffectLogRecorder::new());
     let requests: Requests = Arc::default();
@@ -442,12 +428,7 @@ fn a_scene_saved_during_the_hold_resumes_into_the_retry() {
     );
     register(&mut app, ADD, Adder::new(ADD));
     let loaded = load_world(&saved, app.world_mut()).expect("the handlers are bound");
-    let run = loaded
-        .graph
-        .iter()
-        .copied()
-        .find(|entity| app.world().get::<rig_ecs::agent::Run>(*entity).is_some())
-        .expect("the run");
+    let run = loaded.with::<rig_ecs::agent::Run>(app.world())[0];
     assert_eq!(retried(app.world(), run), 1, "the spent retry is restored");
     for held in holding(&mut app) {
         app.world_mut().entity_mut(held).remove::<Held>();
@@ -516,7 +497,7 @@ impl Serve for Truncating {
         }
         Reply::Outcome(Ok(Outcome::Completion(CompletionResponse::new(
             done(),
-            Usage::new(),
+            Usage::default(),
             "whole",
         ))))
     }
@@ -560,4 +541,59 @@ fn a_truncated_stream_is_reissued() {
         .map(|r| r.outcome.is_ok())
         .collect();
     assert_eq!(completions, [false, true]);
+}
+
+/// `agent::Backoff` on the agent: the retry's completion is held as
+/// `rig-ecs/backoff` and released when the world's clock has advanced by
+/// the delay — a paused `Time<Virtual>` holds it for as long as the host
+/// likes, and advancing the clock by hand releases it.
+#[test]
+fn a_backoff_on_the_agent_delays_the_retry_on_the_worlds_clock() {
+    use bevy_time::{Time, Virtual};
+    let (mut app, agent, requests, _, _) = tooling(vec![
+        Ok(add_call()),
+        Err(unavailable("status 503")),
+        Ok(done()),
+    ]);
+    app.world_mut()
+        .entity_mut(agent)
+        .insert(rig_ecs::agent::Backoff {
+            base: Duration::from_secs(10),
+            max: Duration::from_secs(60),
+        });
+    app.world_mut().resource_mut::<Time<Virtual>>().pause();
+    let run = app.world_mut().spawn_run(agent, &[], "add", false, None);
+    tick_until(&mut app, "the retry is held by the backoff", |world| {
+        world
+            .query_filtered::<&rig_ecs::bus::HoldOwners, With<PendingEffect>>()
+            .iter(world)
+            .any(|owners| {
+                owners
+                    .owners()
+                    .any(|owner| owner.name == rig_ecs::systems::backoff::BACKOFF_OWNER)
+            })
+    });
+    for _ in 0..8 {
+        app.update();
+    }
+    assert_eq!(requests.lock().unwrap().len(), 2, "the clock is paused");
+    assert!(app.world().get::<Settled>(run).is_none());
+    // Nine seconds is not ten.
+    app.world_mut()
+        .resource_mut::<Time<Virtual>>()
+        .advance_by(Duration::from_secs(9));
+    for _ in 0..4 {
+        app.update();
+    }
+    assert_eq!(requests.lock().unwrap().len(), 2);
+    app.world_mut()
+        .resource_mut::<Time<Virtual>>()
+        .advance_by(Duration::from_secs(1));
+    ended(&mut app, run, "the retried run");
+    assert_eq!(
+        app.world().get::<RunResult>(run).map(|r| r.0.clone()),
+        Some("done".into())
+    );
+    assert_eq!(requests.lock().unwrap().len(), 3);
+    assert!(holding(&mut app).is_empty());
 }

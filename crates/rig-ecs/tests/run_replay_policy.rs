@@ -1,19 +1,14 @@
 //! Effective configuration, explicit scope and declared custom policy identity.
-#![allow(
-    clippy::unwrap_used,
-    clippy::expect_used,
-    clippy::panic,
-    clippy::indexing_slicing
-)]
 use crate::run_support;
 use bevy_ecs::prelude::*;
+use rig_cassette::ecs::EffectLogResource;
+use rig_cassette::ecs::identity::{check_replayable, spec_hash, stamp_run};
+use rig_cassette::effect_log::{EffectLog, EffectLogRecorder};
 use rig_ecs::{
     agent::{InvalidCalls, MaxTurns, PolicyVersion, Preamble, ToolPolicy, Unhandled},
-    bus::{EffectLogResource, Scope},
-    replay::{check_replayable, spec_hash, stamp_run},
+    bus::Scope,
     systems::RunCommands,
 };
-use rig_effect_log::{EffectLog, EffectLogRecorder};
 use run_support::*;
 
 fn setup() -> (bevy_app::App, Entity, Entity, EffectLog) {

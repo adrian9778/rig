@@ -122,15 +122,15 @@ cargo add rig
 ### Simple example
 ```rust
 use rig::prelude::*;
-use rig::providers::openai;
+use rig::providers::openai::{self, OpenAI};
 
 #[tokio::main]
 async fn main() -> Result<(), anyhow::Error> {
-    // Create OpenAI client
-    let client = openai::Client::from_env()?;
-
-    // Create agent with a single context prompt
-    let comedian_agent = client
+    // Create an agent over OpenAI on the bundled transport. OpenAI's default
+    // completion route is the Responses API; `.with_route(Route::Chat)` on the
+    // configuration selects Chat Completions for every agent built on it.
+    let comedian_agent = OpenAI::from_env()?
+        .bound()?
         .agent(openai::GPT_5_2)
         .preamble("You are a comedian here to entertain the user using humour and jokes.")
         .build();
@@ -146,7 +146,20 @@ async fn main() -> Result<(), anyhow::Error> {
 Note using `#[tokio::main]` requires you enable tokio's `macros` and `rt-multi-thread` features
 or just `full` to enable all features (`cargo add tokio --features macros,rt-multi-thread`).
 
-You can find more examples in each crate's `examples` directory (for example, [`examples`](./examples)). Provider-specific integration coverage lives under [`tests/providers`](./tests/providers), with cassette-backed tests that replay offline by default and live-only tests kept separate when real provider APIs are still required. See [`tests/README.md`](./tests/README.md) for test target, replay, record, and cassette safety commands. More detailed use case walkthroughs are regularly published on our [Dev.to Blog](https://dev.to/0thtachi) and added to Rig's official documentation at [rig.rs/docs](https://rig.rs/docs).
+More examples live in [`examples`](./examples) and each crate's `examples` directory; provider test coverage and cassette commands are described in [`tests/README.md`](./tests/README.md). Detailed walkthroughs are published on our [Dev.to Blog](https://dev.to/0thtachi) and at [rig.rs/docs](https://rig.rs/docs).
+
+## Recording and replay
+
+`rig::cassette::effect_log` provides logs, recorders, replay handlers and
+checkpoints. Keep an `EffectLogRecorder` handle and attach its clone with
+`AgentBuilder::record_to`; import `rig::cassette::agent::AgentReplayExt` to stamp
+the resulting log or check replay compatibility.
+
+For transport-free consumers, depend directly on `rig-cassette` with default
+features disabled. Its optional `agent` and `ecs` adapters are independent of
+each other and of the native `http` engine. Neither runtime depends on the
+concrete logging crate. See the [cassette README](crates/rig-cassette/README.md)
+for dependency guarantees, ECS replay installation and migration paths.
 
 ## Supported Integrations
 
@@ -176,6 +189,7 @@ rig = { version = "0.36.0", features = ["lancedb", "fastembed"] }
 | ScyllaDB | [`rig-scylladb`](https://github.com/0xPlaygrounds/rig/tree/main/crates/rig-scylladb) | `scylladb` | `rig::scylladb` |
 | SQLite | [`rig-sqlite`](https://github.com/0xPlaygrounds/rig/tree/main/crates/rig-sqlite) | `sqlite` | `rig::sqlite` |
 | SurrealDB | [`rig-surrealdb`](https://github.com/0xPlaygrounds/rig/tree/main/crates/rig-surrealdb) | `surrealdb` | `rig::surrealdb` |
+| TypeSafe Jev (experimental judgments) | [`rig-typesafeai`](crates/rig-typesafeai) | `typesafeai` | `rig::typesafeai` |
 
 `rig::memory` is available without the `memory` feature; it contains the core
 conversation memory traits and in-memory backend re-exported from `rig-core`.

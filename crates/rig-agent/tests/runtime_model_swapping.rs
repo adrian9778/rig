@@ -86,8 +86,8 @@ impl AgentHook for StopSelection {
 
 fn usage(total_tokens: u64) -> Usage {
     Usage {
-        total_tokens,
-        ..Usage::new()
+        total_tokens: Some(total_tokens),
+        ..Usage::default()
     }
 }
 
@@ -149,7 +149,7 @@ impl Turn {
             Self::Text { usage, .. } | Self::Tool { usage, .. } | Self::Rich { usage, .. } => {
                 *usage
             }
-            Self::Error(_) => Usage::new(),
+            Self::Error(_) => Usage::default(),
         }
     }
 
@@ -682,7 +682,7 @@ async fn model_selection_stop_cancels_before_provider_execution() {
     assert!(matches!(
         error,
         StreamingError::Prompt(error)
-            if matches!(*error, PromptError::PromptCancelled { ref reason, .. }
+            if matches!(&error, PromptError::PromptCancelled { reason, .. }
                 if reason == "routing denied")
     ));
     assert!(streaming_script.requests().is_empty());
@@ -1502,7 +1502,7 @@ impl CompletionModel for PendingStreamingModel {
     ) -> Result<CompletionResponse, CompletionError> {
         Ok(CompletionResponse::new(
             vec![AssistantContent::text("unused")],
-            Usage::new(),
+            Usage::default(),
             "pending",
         ))
     }
@@ -1747,7 +1747,7 @@ async fn a_stopped_completion_call_hook_suppresses_selection_on_both_surfaces() 
             assert!(matches!(
                 error,
                 StreamingError::Prompt(error)
-                    if matches!(*error, PromptError::PromptCancelled { ref reason, .. }
+                    if matches!(&error, PromptError::PromptCancelled { reason, .. }
                         if reason == "completion denied")
             ));
         } else {

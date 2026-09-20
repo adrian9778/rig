@@ -96,7 +96,9 @@ pub mod policy;
 pub mod response;
 pub mod streamed;
 
-pub use policy::{InvalidToolCallAction, InvalidToolCallContext, RetryRequest};
+pub use policy::{
+    InvalidToolCallAction, InvalidToolCallContext, InvalidToolCallReason, RetryRequest,
+};
 pub use response::{CompletionCall, MemoryAppend, PromptError, PromptResponse};
 use rig_core::completion::message::turn_delivered_no_answer;
 use rig_core::json_utils;
@@ -126,7 +128,7 @@ fn unknown_tool_call_error(
         tool_name,
         available_tools,
         allowed_tools,
-        chat_history: Box::new(chat_history),
+        chat_history,
     }
 }
 
@@ -136,6 +138,7 @@ struct InvalidToolCallDiagnostic<'a> {
     executable_tool_names: &'a BTreeSet<String>,
     allowed_tool_names: &'a BTreeSet<String>,
     history: &'a [Message],
+    reason: &'a InvalidToolCallReason,
 }
 
 impl InvalidToolCallDiagnostic<'_> {
@@ -148,13 +151,37 @@ impl InvalidToolCallDiagnostic<'_> {
         )
     }
 
+    /// The fail-fast error for the call as rejected: an unknown name is
+    /// `UnknownToolCall`; malformed arguments reproduce the provider-side
+    /// report that would have ended the run before rig#2447, so a `Fail`
+    /// resolution is byte-for-byte what a consumer saw previously.
     fn unknown_current(&self) -> PromptError {
-        self.unknown(self.tool_call.function.name.clone())
+        match self.reason {
+            InvalidToolCallReason::UnknownTool => {
+                self.unknown(self.tool_call.function.name.clone())
+            }
+            InvalidToolCallReason::MalformedArguments { error } => {
+                PromptError::Report(malformed_tool_input_report(self.tool_call, error))
+            }
+        }
     }
 
     fn cancelled(&self, reason: String) -> PromptError {
         PromptError::prompt_cancelled(self.history.to_vec(), reason)
     }
+}
+
+/// The report the provider stream raised for malformed tool input,
+/// rebuilt from the diagnostic call so `Fail` and a rejected `Repair`
+/// surface the same error a pre-#2447 run did.
+fn malformed_tool_input_report(tool_call: &ToolCall, error: &str) -> rig_core::error::ErrorReport {
+    rig_core::error::ErrorReport::new(
+        rig_core::error::ErrorKind::Response,
+        format!(
+            "tool call `{}` arrived with malformed JSON input: {error}",
+            tool_call.function.name
+        ),
+    )
 }
 
 enum ValidatedInvalidToolCallAction {
@@ -353,7 +380,7 @@ pub enum ModelTurnOutcome {
     /// turn. The driver must decide how to recover (typically by asking its
     /// invalid tool-call hook) and answer via
     /// [`AgentRun::resolve_invalid_tool_call`].
-    NeedsResolution(Box<InvalidToolCallContext>),
+    NeedsResolution(InvalidToolCallContext),
     /// The turn was rolled back with corrective feedback appended to the
     /// history. Call [`AgentRun::next_step`] to obtain the retry
     /// [`AgentRunStep::CallModel`].
@@ -425,16 +452,16 @@ enum RunState {
     AwaitingModel,
     /// Scanning the model turn's tool calls for validity; may be waiting for
     /// [`AgentRun::resolve_invalid_tool_call`].
-    ResolvingToolCalls(Box<ResolvingState>),
+    ResolvingToolCalls(ResolvingState),
     /// The turn was accepted; ready to emit [`AgentRunStep::CallTools`] or
     /// [`AgentRunStep::Done`].
-    AwaitingAdvance(Box<TurnState>),
+    AwaitingAdvance(TurnState),
     /// Waiting for [`AgentRun::tool_results`] for these pending tool calls.
     /// Carrying the calls in the state keeps a serialized run self-contained:
     /// a resumed process re-obtains them from [`AgentRun::next_step`].
     ExecutingTools(Vec<PendingToolCall>),
     /// Terminal: the run completed successfully.
-    Done(Box<PromptResponse>),
+    Done(PromptResponse),
     /// Terminal: the run returned an error.
     Failed,
 }
@@ -564,7 +591,7 @@ impl AgentRun {
             chat_history: None,
             new_messages: vec![prompt.into()],
             current_turn: 0,
-            usage: Usage::new(),
+            usage: Usage::default(),
             completion_calls: Vec::new(),
             completion_call_index: 0,
             invalid_tool_call_retries: 0,
@@ -977,6 +1004,7 @@ impl AgentRun {
             tool_choice: self.tool_choice.clone(),
             chat_history: self.diagnostic_history(resolving),
             is_streaming: false,
+            reason: InvalidToolCallReason::UnknownTool,
         })
     }
 
@@ -1001,8 +1029,8 @@ impl AgentRun {
                 if self.current_turn >= self.max_turns {
                     return Err(PromptError::MaxTurnsError {
                         max_turns: self.max_turns,
-                        chat_history: self.full_history().into(),
-                        prompt: prompt.into(),
+                        chat_history: self.full_history(),
+                        prompt,
                     });
                 }
 
@@ -1025,7 +1053,7 @@ impl AgentRun {
                     has_tool_calls,
                     skipped,
                     mut block_ids,
-                } = *turn_state;
+                } = turn_state;
                 // Tool output mode (#1928): a call to the synthetic output tool
                 // finalizes the run with the call's arguments as the response,
                 // instead of executing it as a tool. First match wins; any
@@ -1222,7 +1250,7 @@ impl AgentRun {
                 Ok(step)
             }
             RunState::Done(response) => {
-                let step = AgentRunStep::Done((*response).clone());
+                let step = AgentRunStep::Done(response.clone());
                 self.state = RunState::Done(response);
                 Ok(step)
             }
@@ -1276,7 +1304,7 @@ impl AgentRun {
         let items: Vec<AssistantContent> = turn.choice.clone();
         let has_tool_calls = has_tool_calls(&items);
 
-        self.state = RunState::ResolvingToolCalls(Box::new(ResolvingState {
+        self.state = RunState::ResolvingToolCalls(ResolvingState {
             message_id: turn.message_id,
             original_choice: turn.choice,
             items,
@@ -1287,7 +1315,7 @@ impl AgentRun {
             recovered: false,
             any_skipped: false,
             has_tool_calls,
-        }));
+        });
 
         self.advance_resolution()
     }
@@ -1351,7 +1379,7 @@ impl AgentRun {
             .with_completion_calls(self.completion_calls.clone())
             .with_output_tool_calls(output_tool_calls)
             .with_content(content);
-        self.state = RunState::Done(Box::new(response.clone()));
+        self.state = RunState::Done(response.clone());
         AgentRunStep::Done(response)
     }
 
@@ -1367,13 +1395,13 @@ impl AgentRun {
         skipped: BTreeMap<usize, UserContent>,
         block_ids: Vec<(rig_core::message::ToolCallId, BlockId)>,
     ) {
-        self.state = RunState::AwaitingAdvance(Box::new(TurnState {
+        self.state = RunState::AwaitingAdvance(TurnState {
             message_id,
             items,
             has_tool_calls,
             skipped,
             block_ids,
-        }));
+        });
     }
 
     /// Validate the recovery policy shared by buffered and streamed turns.
@@ -1395,13 +1423,22 @@ impl AgentRun {
                     Ok(ValidatedInvalidToolCallAction::Retry { feedback })
                 }
             }
-            InvalidToolCallAction::Repair { tool_name } => {
-                if diagnostic.allowed_tool_names.contains(&tool_name) {
-                    Ok(ValidatedInvalidToolCallAction::Repair { tool_name })
-                } else {
-                    Err(diagnostic.unknown(tool_name))
+            InvalidToolCallAction::Repair { tool_name } => match diagnostic.reason {
+                // Repair replaces a *name*; it cannot rewrite argument
+                // bytes, so a repair of malformed input would dispatch a
+                // tool with arguments the model never produced. Fail closed
+                // with the same report `Fail` gives.
+                InvalidToolCallReason::MalformedArguments { .. } => {
+                    Err(diagnostic.unknown_current())
                 }
-            }
+                InvalidToolCallReason::UnknownTool => {
+                    if diagnostic.allowed_tool_names.contains(&tool_name) {
+                        Ok(ValidatedInvalidToolCallAction::Repair { tool_name })
+                    } else {
+                        Err(diagnostic.unknown(tool_name))
+                    }
+                }
+            },
             InvalidToolCallAction::Stop { reason } => Err(diagnostic.cancelled(reason)),
             InvalidToolCallAction::Skip { reason } => {
                 if matches!(self.tool_choice, Some(ToolChoice::None)) {
@@ -1454,6 +1491,7 @@ impl AgentRun {
                 tool_call: &tool_call,
                 executable_tool_names: &resolving.executable_tool_names,
                 allowed_tool_names: &resolving.allowed_tool_names,
+                reason: &InvalidToolCallReason::UnknownTool,
                 history: &diagnostic_history,
             },
         )?;
@@ -1607,7 +1645,7 @@ impl AgentRun {
     /// Take the resolving state out of `self.state`, leaving `Failed` behind;
     /// callers restore it on their rejection paths so an out-of-protocol call
     /// does not corrupt a drivable run.
-    fn take_resolving(&mut self, violation: &str) -> Result<Box<ResolvingState>, PromptError> {
+    fn take_resolving(&mut self, violation: &str) -> Result<ResolvingState, PromptError> {
         match std::mem::replace(&mut self.state, RunState::Failed) {
             RunState::ResolvingToolCalls(resolving) => Ok(resolving),
             other => {
@@ -1638,7 +1676,7 @@ impl AgentRun {
         if resolving.next_index < resolving.items.len() {
             self.state = RunState::ResolvingToolCalls(resolving);
             return match self.pending_invalid_tool_call() {
-                Some(context) => Ok(ModelTurnOutcome::NeedsResolution(Box::new(context))),
+                Some(context) => Ok(ModelTurnOutcome::NeedsResolution(context)),
                 None => Err(self.protocol_violation(
                     "internal: pending invalid tool call could not be derived",
                 )),
@@ -1653,7 +1691,7 @@ impl AgentRun {
             any_skipped,
             has_tool_calls,
             ..
-        } = *resolving;
+        } = resolving;
 
         // When any tool call was skipped, none of the turn's tool calls
         // execute: peers get a synthetic "not executed" result.
@@ -1689,8 +1727,8 @@ impl AgentRun {
     /// stream is drained for usage after the rollback — so recording is
     /// decoupled from turn ingestion. Valid while a model response is pending
     /// or between a turn rollback and the next [`AgentRunStep::CallModel`];
-    /// aggregates `usage` into the run total. Zero-valued usage means the
-    /// provider reported no usage metrics.
+    /// aggregates `usage` into the run total. Usage whose counters are all
+    /// `None` means the provider reported no usage metrics.
     ///
     /// `raw` is the stream's terminal record as carried on `StreamFinal::raw`
     /// — read off the same terminal the driver reads `identity` and
@@ -1738,6 +1776,7 @@ impl AgentRun {
             chat_history: self
                 .streamed_diagnostic_history(partial, Some(invalid.tool_call.clone())),
             is_streaming: true,
+            reason: invalid.reason.clone(),
         }
     }
 
@@ -1768,6 +1807,7 @@ impl AgentRun {
                 tool_call: &invalid.tool_call,
                 executable_tool_names: &invalid.executable_tool_names,
                 allowed_tool_names: &invalid.allowed_tool_names,
+                reason: &invalid.reason,
                 history: &diagnostic_history,
             },
         )?;
@@ -1800,7 +1840,7 @@ impl AgentRun {
                     reason,
                     diagnostic_history,
                     "invalid tool call skip produced no recovery messages",
-                    Some(Box::new(skipped_tool_result)),
+                    Some(skipped_tool_result),
                 )
             }
         }
@@ -1830,7 +1870,7 @@ impl AgentRun {
         feedback: String,
         diagnostic_history: Vec<Message>,
         no_messages_reason: &str,
-        skipped_tool_result: Option<Box<ToolResult>>,
+        skipped_tool_result: Option<ToolResult>,
     ) -> Result<StreamedResolution, PromptError> {
         let Some((assistant_message, user_message)) =
             partial.rollback_messages(invalid.tool_call.clone(), feedback)
@@ -1867,14 +1907,14 @@ impl AgentRun {
         // never learned usage (no record before the turn completed) still get
         // the call recorded, with no reported usage.
         if !self.streamed_completion_call_recorded {
-            // `Usage::new()` is the additive identity for `Usage`'s `AddAssign`,
+            // `Usage::default()` is the additive identity for `Usage`'s `AddAssign`,
             // so routing the no-usage fallback through `record_completion_call`
             // leaves the run total unchanged while unifying the accounting.
             // Identity carries the turn's message id — the same value written
             // into run history below — so `completion_calls` and `messages()`
             // agree even for a hand-driven driver that never recorded usage.
             self.record_completion_call(
-                Usage::new(),
+                Usage::default(),
                 ResponseIdentity {
                     message_id: turn.message_id.clone(),
                     ..ResponseIdentity::default()

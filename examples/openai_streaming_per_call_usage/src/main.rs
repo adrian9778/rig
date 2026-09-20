@@ -24,7 +24,7 @@ use futures::StreamExt;
 use rig::agent::MultiTurnStreamItem;
 use rig::completion::Usage;
 use rig::prelude::*;
-use rig::providers::openai;
+use rig::providers::openai::{self, Route, wire::OpenAI};
 use rig::streaming::{Delta, StreamEvent};
 use rig::tool::Tool;
 use serde::{Deserialize, Serialize};
@@ -81,7 +81,9 @@ impl Tool for ProjectStatusTool {
 fn print_usage(label: &str, usage: Usage) {
     println!(
         "{label}: input_tokens={}, output_tokens={}, total_tokens={}",
-        usage.input_tokens, usage.output_tokens, usage.total_tokens
+        usage.input_tokens.unwrap_or(0),
+        usage.output_tokens.unwrap_or(0),
+        usage.total_tokens.unwrap_or(0)
     );
 }
 
@@ -89,7 +91,11 @@ fn print_usage(label: &str, usage: Usage) {
 async fn main() -> Result<()> {
     let model = std::env::var("OPENAI_MODEL").unwrap_or_else(|_| openai::GPT_4O_MINI.to_string());
 
-    let agent = openai::CompletionsClient::from_env()?
+    // Chat Completions: the route every OpenAI-compatible server speaks,
+    // chosen once on the configuration.
+    let agent = OpenAI::from_env()?
+        .with_route(Route::Chat)
+        .bound()?
         .agent(model)
         .preamble(
             "You are a concise release assistant. The user will ask about an \
@@ -137,9 +143,9 @@ async fn main() -> Result<()> {
                     println!();
                     printed_streamed_text = false;
                 }
-                // Zero-valued usage is Usage's documented sentinel for
-                // "the provider reported no usage metrics".
-                if completion_call.usage.has_values() {
+                // A `Usage` with every counter `None` means the provider
+                // reported no usage metrics.
+                if completion_call.usage.is_reported() {
                     print_usage(
                         &format!("completion call {} usage", completion_call.call_index),
                         completion_call.usage,
@@ -165,9 +171,12 @@ async fn main() -> Result<()> {
 
     if let Some(final_completion_call) = response.completion_calls().last().cloned() {
         let usage = final_completion_call.usage;
-        if usage.has_values() {
+        if usage.is_reported() {
             print_usage("final completion call usage", usage);
-            println!("final prompt/context token length: {}", usage.input_tokens);
+            println!(
+                "final prompt/context token length: {}",
+                usage.input_tokens.unwrap_or(0)
+            );
         } else {
             println!("final completion call usage: not reported");
         }

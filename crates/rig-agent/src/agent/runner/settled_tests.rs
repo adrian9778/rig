@@ -88,7 +88,7 @@ mod slow_stream {
                 }
                 let _ = out
                     .finish(rig_core::test_utils::mock_final(
-                        rig_core::completion::Usage::new(),
+                        rig_core::completion::Usage::default(),
                     ))
                     .await;
             })
@@ -116,7 +116,7 @@ mod slow_stream {
         driver
             .register_erased(key.clone(), rig_core::serve::ErasedHandler::new(Slow))
             .expect("register");
-        let recorder = rig_effect_log::EffectLogRecorder::new();
+        let recorder = rig_cassette::effect_log::EffectLogRecorder::new();
         driver.record_to(recorder.clone());
         let task = tokio::spawn(driver);
         let agent = AgentBuilder::over_bus(dispatcher.clone(), registrar.clone(), "golden", key)
@@ -127,7 +127,7 @@ mod slow_stream {
         while let Some(item) = stream.next().await {
             if let Err(crate::agent::StreamingError::Prompt(error)) = item {
                 stopped = matches!(
-                    *error,
+                    error,
                     crate::completion::PromptError::PromptCancelled { .. }
                 );
             }
@@ -163,24 +163,25 @@ mod slow_stream {
     /// and the log holds the cancel.
     #[tokio::test]
     async fn a_delta_stop_on_an_owned_bus_is_in_the_log() {
+        let recorder = rig_cassette::effect_log::EffectLogRecorder::new();
         let agent = AgentBuilder::new(rig_core::test_utils::MockCompletionModel::text("never"))
             .name("golden")
             .model_route_handler("slow", Slow)
             .add_hook(SelectSlow)
             .add_hook(StopOnTextDelta)
-            .record_effects()
+            .record_to(recorder.clone())
             .build();
         let mut stream = agent.prompt("go").stream();
         while let Some(item) = stream.next().await {
             if let Err(crate::agent::StreamingError::Prompt(error)) = item {
                 assert!(matches!(
-                    *error,
+                    error,
                     crate::completion::PromptError::PromptCancelled { .. }
                 ));
             }
         }
         drop(stream);
-        let log = agent.take_effect_log().expect("recording");
+        let log = recorder.take();
         assert_eq!(log.len(), 1, "the cancelled dispatch is a record");
         let report = log[0].outcome.as_ref().expect_err("cancelled in flight");
         assert_eq!(
@@ -225,7 +226,7 @@ async fn capped_reasoning_settlement_exposes_only_the_committed_prompt() {
             MockCompletionModel::from_stream_turns([[
                 MockStreamEvent::reasoning("unfinished reasoning"),
                 MockStreamEvent::FinalResponse(
-                    mock_final(Usage::new()).with_finish_reason(FinishReason::Length),
+                    mock_final(Usage::default()).with_finish_reason(FinishReason::Length),
                 ),
             ]])
         } else {
