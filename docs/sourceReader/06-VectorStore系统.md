@@ -1,221 +1,156 @@
 # 06-VectorStore 系统
 
-Rig 的 VectorStore 系统旨在为 AI 应用提供强大的语义搜索与知识库能力，支持将文档或内容转换为向量以进行相似度匹配。它作为一个独立的模块集成在 Rig 中，允许任意模型服务接入并实现向量索引功能。
+向量库为 Agent 提供语义检索（RAG）底座：嵌入模型把查询变向量，`VectorStoreIndex` 在后端找出最相似的 N 条。Rig 的设计是：trait 在 rig-core，实现放伴侣 crate，记忆策略在 rig-memory。
 
 ---
 
-## 🌐 为什么需要 VectorStore？
-
-在许多实际应用场景中，AI 需要处理非结构化信息（如长文本、日志等），并对其进行理解和检索。典型的使用场景包括：
-
-- 搜索相关的文档片段
-- 基于语义的问答系统
-- 知识库中的内容推荐与提取
-
-为了完成上述任务，Rig 引入了 VectorStore 抽象层，将向量嵌入和相似度搜索抽象出来。
-
----
-
-## 💡 VectorStore 系统概览
-
-### 🔗 核心概念
-
-- **Document (文档)**：一个由文本内容组成的基本单位
-- **Embedding (嵌入)**：文档转化为数学向量形式的过程
-- **Vector Index **(向量索引)：用于快速查找近似最近邻项的数据结构
-
----
-
-## 🧱 接口定义详解
-
-Rig 的 VectorStore 系统通过以下 trait 定义其核心功能：
-
-### 1. `VectorStoreIndex` Trait
+## 🧱 接口定义（当前签名）
 
 ```rust
-pub trait VectorStoreIndex {
-    type Error: std::error::Error + Send + Sync + 'static;
-    type Document: VectorDocument;
+// File: crates/rig-core/src/vector_store/mod.rs:133
 
-    async fn top_n(&self, query: &Embedding, n: usize) -> Result<Vec<Self::Document>, Self::Error>;
-    async fn top_n_ids(&self, query: &Embedding, n: usize) -> Result<Vec<DocId>, Self::Error>;
+pub trait VectorStoreIndex: WasmCompatSend + WasmCompatSync {
+    /// 该后端的过滤类型
+    type Filter: SearchFilter + WasmCompatSend + WasmCompatSync;
+
+    fn top_n<T: DeserializeOwned + WasmCompatSend>(
+        &self,
+        req: VectorSearchRequest<Self::Filter>,
+    ) -> impl Future<Output = Result<Vec<(f64, String, T)>, VectorStoreError>> + WasmCompatSend;
+    // 返回 (score, id, document)
+
+    fn top_n_ids(
+        &self,
+        req: VectorSearchRequest<Self::Filter>,
+    ) -> impl Future<Output = Result<Vec<(f64, String)>, VectorStoreError>> + WasmCompatSend;
 }
 ```
 
-#### 方法说明
+与旧文档的差异：**不再有关联 Error/Document**——统一 `VectorStoreError`，文档类型由调用点的 `T` 指定；查询是 `VectorSearchRequest` 结构体（`vector_store/request.rs:17`）而不是裸参数，携带 `query`（查询文本，由存储侧内部嵌入）、`samples`（top-N 数量）、`threshold`（最低相似度）、`additional_params`、`filter`（后端专属过滤式），配套 builder。
 
-| 方法名     | 输入         | 输出             | 功能描述                        |
-|------------|--------------|------------------|---------------------------------|
-| `top_n`    | 嵌入向量、数量 | 文档列表         | 返回最相似的 n 个文档           |
-| `top_n_ids`| 嵌入向量、数量 | ID 列表          | 获取最相似文档的唯一标识符集合   |
+### 两个方法都要实现
 
-> 通常这两个方法是相互配套使用的。比如先获取 ID，再根据这些 ID 查询完整内容。
+仓库规则（AGENTS.md）：伴侣 crate 必须同时实现 `top_n` 与 `top_n_ids`；错误用 `VectorStoreError` 变体而不是字符串；bound 用 `WasmCompatSend/Sync`。
 
----
+### 检索是 bus 上的一种效果
 
-## 📦 支持的实现方式（Providers）
-
-以下是一些已支持的 VectorStore 实现：
-
-| 实现名称 | Crate 名称        | 原生后端     |
-|----------|-------------------|--------------|
-| Qdrant   | `rig-qdrant`      | Qdrant       |
-| Milvus   | `rig-milvus`      | Milvus       |
-| SurrealDB| `rig-surrealdb`   | SurrealDB    |
-
-这些实现都遵循统一的 trait 接口，因此在不同数据库之间进行切换非常简单。
+Agent 侧接入用 `.dynamic_context(samples, index)`：每轮折叠请求前派发 `EffectKind::Retrieve { query: RetrieveQuery::TopN { .. } }`（返回 JSON 文档，客户端侧反序列化），hook 可在 `on_dispatch` 门控（opt-in `RetrieveDispatch`）。记忆加载/落盘则是 `EffectKind::Memory`。
 
 ---
 
-## 🧩 示例：Qdrant 实现结构
+## 📦 内存实现（rig-core 内置）
 
-### 1. 初始化过程：
+`crates/rig-core/src/vector_store/in_memory_store.rs:24`：
 
 ```rust
-use rig_qdrant::Qdrant;
-
-let qdrant_client = Qdrant::builder()
-    .endpoint("http://localhost:6333")
-    .api_key(Some("my_api_key")) // 可选
-    .build();
+InMemoryVectorStore::from_documents(vec![(doc, embedding)])            // id 自动 "doc{n}"
+InMemoryVectorStore::from_documents_with_ids(vec![(id, doc, emb)])
+InMemoryVectorStore::builder()                                          // 自选索引策略
+    .index_strategy(IndexStrategy::default())   // 默认 BruteForce；可换 LSH
+    .build()
 ```
 
-### 2. 注册到 Agent 中：
+LSH（`vector_store/lsh.rs`）：
 
 ```rust
-use rig_agent::{Client, Agent};
+pub struct LSH { /* dim, num_tables, num_hyperplanes */ }
+LSH::new(dim, num_tables, num_hyperplanes);
+lsi.hash(&vector, table_idx);           // :62  局部敏感哈希
 
-let client = Client::new(qdrant_client); // 将 VectorStore 接口注入 Client
-
-let agent = client
-    .agent("gpt-4")
-    .preamble("You are a helpful assistant.")
-    .build();
-
+pub struct LSHIndex { ... }
+LSHIndex::new(dim, num_tables, num_hyperplanes);
+index.insert(id, &embedding);           // :109
+index.query(&embedding) -> Vec<String>; // :119
+index.clear();                          // :141
 ```
-
-> 注意：当前仅支持 `CompletionModel` 和 `EmbeddingModel` 与 `VectorStoreIndex` 共同使用。
 
 ---
 
-## 🔄 文档存储与检索流程（Mermaid 图）
+## 🗃️ 伴侣 crate 名录（全部实现 `VectorStoreIndex`）
+
+| crate | 后端 | crate | 后端 |
+|---|---|---|---|
+| `rig-qdrant` | Qdrant | `rig-milvus` | Milvus |
+| `rig-sqlite` | SQLite | `rig-lancedb` | LanceDB |
+| `rig-mongodb` | MongoDB | `rig-neo4j` | Neo4j |
+| `rig-postgres` | Postgres | `rig-surrealdb` | SurrealDB |
+| `rig-scylladb` | ScyllaDB | `rig-s3vectors` | AWS S3Vectors |
+| `rig-helixdb` | HelixDB | `rig-vectorize` | Cloudflare Vectorize |
+| `rig-fastembed` | 本地 Fastembed 嵌入 + 索引 | | |
+
+经门面 feature 暴露（`rig::qdrant` ← feature `qdrant`，见 `src/lib.rs` 的 `companion_modules!` 表）。
+
+### 伴侣 crate 模式（以 rig-qdrant / rig-sqlite 为范本）
+
+- 独立 crate，重导出 `rig-core` 契约；
+- 后端专属 builder（endpoint/key/collection…）；
+- 专属 `Filter` 类型实现 `SearchFilter`；
+- 服务型后端的集成测试在 `test-support/service-tests`（Docker 驱动，CI 慢车道跑）。
+
+---
+
+## 🧠 嵌入与检索的配合
+
+```rust
+// 1) 建索引
+let embeddings: Vec<Embedding> = embedding_model.embed_texts(vec!["...".to_string()]).await?;
+let mut store = InMemoryVectorStore::from_documents(
+    texts.into_iter().zip(embeddings)
+);
+
+// 2) Agent 侧每轮检索
+let agent = client.agent("gpt-5.2")
+    .dynamic_context(5, my_vector_index)        // 每轮 top-5 进上下文
+    .build();                                   // AgentBuilder::build 直接返回 Agent
+
+// 3) 或独立检索（查询文本 + 样本数，存储内部负责嵌入）
+let hits: Vec<(f64, String, MyDoc)> = store
+    .top_n(VectorSearchRequest::builder().query("...").samples(5).build())
+    .await?;
+```
+
+---
+
+## 🧠 记忆与会话（memory 模块 + rig-memory）
+
+trait 在 `crates/rig-core/src/memory.rs:98`：
+
+```rust
+pub trait ConversationMemory: WasmCompatSend + WasmCompatSync {
+    fn load<'a>(&'a self, conversation_id: &'a ConversationId)
+        -> WasmBoxedFuture<'a, Result<Vec<Message>, MemoryError>>;
+    fn append(&self, conversation_id, messages: ...) -> ...;   // 成功轮后回写
+    // 以及 owned 便捷
+}
+```
+
+agent builder `.memory(backend)` + `.conversation(id)` 接入；load/append 都是 bus 效果（hook 可见、可录制）。策略族在 `crates/rig-memory/src/lib.rs`（门面 feature `memory`）：
+
+| 策略 | 一句话 |
+|---|---|
+| `SlidingWindowMemory` | 按条数滑窗 |
+| `TokenWindowMemory`（+ `HeuristicTokenCounter`） | 按 token 预算滑窗 |
+| `PolicyMemory<M, P>` / `DemotingPolicyMemory` | 用 `NoopMemoryPolicy` 或自定义策略过滤历史 |
+| `CompactingMemory<M, P, C>` + `TemplateCompactor` | 超窗时压缩成摘要 |
+
+---
+
+## 🔄 文档存取/检索流程图
 
 ```mermaid
 graph LR
-    A[Input Text] --> B[Embedding Model]
-    B --> C[Vector Store Index]
-    C --> D{Search Query}
-    D --> E[Top N Similar Docs]
-    E --> F[Return Matching Documents]
-
-    G[Document Collection] --> H[Insert Into Vector DB]
-    H --> C
+    W[写入侧] --> EMB1[EmbeddingModel.embed_texts]
+    EMB1 --> INS[VectorStoreIndex.add_documents]
+    Q[查询侧] --> EMB2[嵌入查询]
+    EMB2 --> RET[VectorSearchRequest → top_n]
+    RET --> DOCS[(score,id,doc) 列表]
+    DOCS --> CTX[注入 agent 上下文 / dynamic_context]
 ```
-
-### 说明：
-1. 输入文本被转换为嵌入向量
-2. 向量存储系统索引这些数据并支持高效搜索
-3. 用户查询时，传入新的嵌入向量，从索引中返回最相关的结果
-
----
-
-## 🔁 数据交换机制（Embedding 转换）
-
-Rig 保证了嵌入处理的统一性：
-
-```rust
-// EmbeddingRequest -> EmbeddingResponse -> Vec<f32>
-
-let embedding_request = EmbeddingRequest {
-    input: vec!["What is the weather today?".to_string()],
-};
-
-let embedding_response = client.embed(embedding_request).await?;
-let embeddings = embedding_response.embeddings;
-
-// 将向量传入 VectorStore
-let result_documents = vector_store.top_n(&embeddings[0], 5).await?;
-```
-
-> 这里 `vector_store` 是实现了 `VectorStoreIndex` 的客户端，比如 Qdrant、Milvus 等。
-
----
-
-## 📐 高阶使用示例（Agent 中结合文档）
-
-```rust
-use rig_agent::{Client, Agent};
-use rig_qdrant::Qdrant;
-use rig_openai::OpenAI;
-
-let vector_store = Qdrant::builder()
-    .endpoint("http://localhost:6333")
-    .build();
-
-let client = Client::new((vector_store, OpenAI::default()));
-
-let agent = client
-    .agent("gpt-4")
-    .preamble("Answer based on provided context only.")
-    .temperature(0.3)
-    .build();
-```
-
-在这种情况下，Agent 使用 `Client` 来调用两者功能，实现完整的向量知识检索流程。
-
----
-
-## ⚙️ Qdrant 向量存储接口说明
-
-Qdrant 接口通常需要以下参数：
-
-```rust
-pub struct QdrantBuilder {
-    endpoint: String,
-    api_key: Option<String>,
-    collection_name: Option<String>,
-}
-```
-
-### 构建方法：
-
-```rust
-let qdrant = Qdrant::builder()
-    .endpoint("https://qdrant.example.com")
-    .api_key(Some("your-api-key"))
-    .collection_name("my_docs")
-    .build();
-```
-
----
-
-## 🔄 插件化机制
-
-所有 VectorStore 实现都应遵循下面接口，从而实现通用性：
-
-```rust
-trait VectorStoreIndex {
-    type Error: std::error::Error + Send + Sync + 'static;
-    type Document: VectorDocument;
-
-    async fn top_n(&self, query: &Embedding, n: usize) -> Result<Vec<Self::Document>, Self::Error>;
-    async fn top_n_ids(&self, query: &Embedding, n: usize) -> Result<Vec<DocId>, Self::Error>;
-}
-
-// 所有向量库必须实现这些方法。
-```
-
-> 这使得我们可以轻松添加新的后端存储（如 LanceDB、Pinecone），而无需修改现有应用逻辑。
 
 ---
 
 ## 🧩 总结
 
-VectorStore 是 Rig 的关键模块之一，主要提供：
-
-- 统一的查询接口用于语义搜索
-- 面向多数据库的支持能力
-- 低耦合文档插入/检索过程
-- 易于扩展的新存储类型实现方式
-
-结合 `Agent` 和 `EmbeddingModel`，可以构建出功能强大的知识库系统。
+- 契约集中：一个 trait + 统一错误 + 请求结构体，13 个后端可插拔切换。
+- 检索与记忆都走 effect bus：可被 hook 门控、可录制重放。
+- 内存实现（BruteForce/LSH）零依赖可测试；服务型后端的真实验证在 service-tests。

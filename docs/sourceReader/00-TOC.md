@@ -1,6 +1,9 @@
 # Rig 项目文档库索引
 
-本目录为 **Rig** 项目的完整技术文档库，旨在帮助开发者深入理解项目架构与核心组件，并可基于此文档进行代码复现或重构。
+本目录为 **Rig** 项目的源码级技术文档库，旨在帮助开发者深入理解项目架构与核心组件，并可基于此文档进行代码复现或重构。
+
+> 同步基线：工作区版本 **0.42.0** 之后、下一次发布之前的 main 分支（2026-09 核对）。
+> 该区间包含大量破坏性重构（Provider 泛型客户端、传输层拆分、effect bus、rig-ecs 等），对应 `MIGRATING.md` 的 "0.41 → next" 章节。所有类型签名与文件路径均与当前代码逐条核对。
 
 ---
 
@@ -8,15 +11,16 @@
 
 ```bash
 docs/sourceReader/
-├── 01-架构总览.md               # 系统整体模块划分、设计理念
-├── 02-核心模块与类关系.md          # 模块间依赖关系、重要类型与接口定义
-├── 03-API与接口设计.md            # API 接口定义与使用流程详解
-├── 04-配置与数据流.md             # 应用配置管理及数据流转图
-├── 05-Provider 体系说明.md        # 模型接入能力、兼容性处理机制
-├── 06-VectorStore 系统.md         # 向量数据库接口及其实现细节
-├── 07-Agent 与钩子系统.md         # 自动代理系统结构与钩子行为控制
-├── 08-错误与异常处理.md           # 异常结构化设计及处理流程
-└── 09-构建与运行说明.md           # 构建、测试及部署指南
+├── 00-TOC.md                    # 本文件
+├── 01-架构总览.md               # 工作区拓扑、核心抽象、一次请求的完整旅程
+├── 02-核心模块与类关系.md         # rig-core / rig-agent / rig-ecs 的模块地图与类型关系
+├── 03-API与接口设计.md           # 客户端、模型、Agent、工具、向量库的对外 API
+├── 04-配置与数据流.md             # 配置体系（AgentConfig、feature 矩阵）与运行时数据流
+├── 05-Provider 体系说明.md        # Provider trait 家族、26 个内置 Provider、新增 Provider 指南
+├── 06-VectorStore 系统.md         # 向量库 trait、内存实现、12+ 伴侣 crate、记忆策略
+├── 07-Agent 与钩子系统.md         # AgentHook 全事件、动作语义、HookStack 规则、rig-ecs 运行时
+├── 08-错误与异常处理.md           # ErrorReport 线错误模型、各域错误枚举、可重试语义
+└── 09-构建与运行说明.md           # 工具链、测试布局、cassette、xtask 验证、发布说明
 ```
 
 ---
@@ -24,75 +28,74 @@ docs/sourceReader/
 ## 📘 各篇章说明
 
 ### 🧠 01-架构总览.md
-> **目的**：介绍项目整体的软件架构，核心模块划分，模块职责。
-> 
+> **目的**：介绍工作区的 crate 拓扑（facade `rig`、无传输依赖的 `rig-core`、经典运行时 `rig-agent`、Bevy World 运行时 `rig-ecs`），以及贯穿两者的 effect 协议。
+>
 > **内容包括**：
-> - 高层模块图
-> - 核心抽象模型（Model、Tool、Vector Store）
-> - 数据流与任务执行流程概述
+> - 工作区 crate 依赖图与职责表
+> - 核心抽象（CompletionModel、EmbeddingModel、VectorStoreIndex、Tool/PortableTool、effect bus）
+> - 一次带工具的多轮请求的完整旅程
 
 ### 🔗 02-核心模块与类关系.md
-> **目的**：从组件角度详细梳理模块之间的调用图。
-> 
+> **目的**：从模块角度梳理 `Client<P, H>` 泛型客户端、Provider/Has* 能力 trait、Agent/AgentRunner/AgentRun 状态机、bus 三角色与 rig-ecs 的系统集。
+>
 > **内容包括**：
-> - 每个模块内关键类型及其交互
-> - 类图、依赖关系（Mermaid）
-> - 所有类型定义与实现细节
-> - 接口契约
+> - rig-core 与 rig-agent 的模块地图（真实路径）
+> - 泛型客户端架构与 builder 状态机
+> - sans-IO 运行状态机与 hook 栈
+> - Mermaid 类图 / 依赖图
 
 ### ⚙️ 03-API与接口设计.md
-> **目的**：全面展示对外 API 设计，说明函数/结构体/trait 的职责。
-> 
+> **目的**：展示对外 API 的真实签名与用法：客户端构造、completion/embedding 调用、Agent 的 run/stream/run_channel/chat/resume、提取器、工具定义。
+>
 > **内容包括**：
-> - 完整 API 概览及调用示例
-> - 请求响应定义与转换机制
-> - 链式 Builder 模式实践
+> - 各 API 的真实代码签名（文件:行号可定位）
+> - `#[rig_tool]` 宏与上下文工具
+> - 多轮流式事件（MultiTurnStreamItem / RunEvents）
 
 ### 🧭 04-配置与数据流.md
-> **目的**：解释配置项来源、数据流转路径，支持开发者自定义实现。
-> 
+> **目的**：解释配置项来源（builder → 共享 AgentConfig → runner 副本）、RequestPatch 合并语义、feature 门控矩阵。
+>
 > **内容包括**：
-> - 配置加载流程图（Mermaid）
-> - 数据处理过程中的状态变换
-> - Agent/Tool/Model 间交互的数据结构
+> - 配置流转图
+> - AgentRunner 一次 run 的逐步数据流
+> - facade feature 与环境变量
 
 ### 🌐 05-Provider 体系说明.md
-> **目的**：详解如何扩展和适配新的 Provider（如 OpenAI、Gemini）。
-> 
+> **目的**：详解 Provider 的编写模型（一个 `Provider` 值类型 + 若干 `Has*` 能力实现）、内置 Provider 名录、共享适配层与 cassette 回归测试。
+>
 > **内容包括**：
-> - Provider trait 定义
-> - 实现示例（如 openai/）
-> - 模型参数转换流程
+> - `providers/internal/` 适配层（36 个文件）
+> - 请求/响应转换与错误保留
+> - 新增 Provider 的步骤清单
 
 ### 🧠 06-VectorStore 系统.md
-> **目的**：描述向量数据库接口，及不同后端实现方式。
-> 
+> **目的**：描述向量库 trait（Filter 关联类型 + VectorSearchRequest）、内存实现与 LSH、各伴侣 crate 与记忆策略 crate。
+>
 > **内容包括**：
-> - 接口定义与调用流程
-> - 支持的 Vector Store 类型（qdrant, milvus, etc.）
-> - 查询与插入行为详解
+> - trait 签名与调用流程
+> - InMemoryVectorStore / LSHIndex
+> - rig-memory 策略族
 
 ### 🧩 07-Agent 与钩子系统.md
-> **目的**：详细解析 Agent 的运行机制、钩子系统的使用方式。
-> 
+> **目的**：完整解析 AgentHook 的每个生命周期事件、动作枚举与 HookStack 组合语义；并介绍 rig-ecs 这一"运行即图"的替代运行时。
+>
 > **内容包括**：
-> - Hook 生命周期与调用规则
-> - 请求/响应改写、工具执行控制
-> - 多轮对话与上下文传递逻辑
+> - 事件 × 动作对照表（on_run_start/on_model_select/on_dispatch/…）
+> - 补丁合并与短路规则
+> - rig-ecs：效果即实体、场景存取、重放身份
 
 ### 🛑 08-错误与异常处理.md
-> **目的**：梳理项目所有自定义错误类型及抛出场景。
-> 
+> **目的**：梳理线错误模型 `ErrorReport`/`ErrorKind`、各域错误枚举、可重试判定与 provider 响应保留。
+>
 > **内容包括**：
-> - 错误类型结构体与转换方式
-> - 如何统一捕获与记录异常
-> - 统一返回码机制（ErrorKind）
+> - 唯一的状态码→可重试表
+> - PromptError / CompletionError / VectorStoreError 等
+> - 错误跨边界的转换链
 
 ### 🏗️ 09-构建与运行说明.md
-> **目的**：帮助开发者正确编译、测试和部署项目。
-> 
-> **内容包括**：
-> - 编译构建命令
-> - 单元测试组织与运行指南
-> - 集成测试策略（cassette 测试）
+> **目的**：帮助开发者正确编译、测试和验证项目（Rust 1.95.0 工具链、nextest、cassette、xtask）。
 >
+> **内容包括**：
+> - 工作区成员与测试布局规则
+> - cassette 录制/回放命令
+> - `cargo xtask verify` 与发布文档的生成规则
