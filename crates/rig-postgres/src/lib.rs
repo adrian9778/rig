@@ -17,6 +17,7 @@ use rig_core::{
         InsertDocuments, VectorStoreError, VectorStoreIndex,
         request::{SearchFilter, SqlCondition, VectorSearchRequest},
     },
+    wasm_compat::WasmCompatSend,
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::Value;
@@ -63,6 +64,28 @@ impl Display for PgVectorDistanceFunction {
     }
 }
 
+impl PgVectorDistanceFunction {
+    /// A SQL expression that grows with similarity, so
+    /// [`VectorSearchRequest::threshold`] — documented as a *minimum
+    /// similarity* — can be applied as `score >= $n`. pgvector only exposes
+    /// distances, so the expression is derived per operator: cosine and
+    /// jaccard distances are complements of a similarity in `[0, 1]`; `<#>`
+    /// is already the negated inner product; the metric distances are negated
+    /// so "more similar" still sorts higher. `embedding` and `query` are
+    /// column/placeholder text spliced verbatim.
+    fn score_expression(&self, embedding: &str, query: &str) -> String {
+        match self {
+            PgVectorDistanceFunction::Cosine | PgVectorDistanceFunction::Jaccard => {
+                format!("1 - ({embedding} {self} {query})")
+            }
+            PgVectorDistanceFunction::InnerProduct
+            | PgVectorDistanceFunction::L2
+            | PgVectorDistanceFunction::L1
+            | PgVectorDistanceFunction::Hamming => format!("-({embedding} {self} {query})"),
+        }
+    }
+}
+
 /// Placeholder token emitted for every bind parameter. `search_query` rewrites
 /// each occurrence into its numbered form (`$3`, `$4`, ...), so every constructor
 /// below must use this token and nothing else — a stray `?` would reach Postgres
@@ -102,7 +125,6 @@ impl PgSearchFilter {
         self.0.into_parts()
     }
 
-    #[allow(clippy::should_implement_trait)]
     pub fn not(self) -> Self {
         Self(self.0.not())
     }
@@ -136,7 +158,7 @@ impl PgSearchFilter {
     }
 
     pub fn member(key: &str, values: Vec<<Self as SearchFilter>::Value>) -> Self {
-        Self(SqlCondition::list(key, "is in", PLACEHOLDER, values))
+        Self(SqlCondition::list(key, "IN", PLACEHOLDER, values))
     }
 
     // String matching ops
@@ -247,13 +269,10 @@ impl<M: EmbeddingModel> PostgresVectorStore<M> {
         R: for<'r> sqlx::FromRow<'r, sqlx::postgres::PgRow> + Send + Unpin,
     {
         if req.samples() > i64::MAX as u64 {
-            return Err(VectorStoreError::DatastoreError(
-                format!(
-                    "The maximum amount of samples to return with the `rig` Postgres integration cannot be larger than {}",
-                    i64::MAX
-                )
-                .into(),
-            ));
+            return Err(VectorStoreError::BuilderError(format!(
+                "The maximum amount of samples to return with the `rig` Postgres integration cannot be larger than {}",
+                i64::MAX
+            )));
         }
 
         let embedded_query: pgvector::Vector = self
@@ -284,41 +303,68 @@ impl<M: EmbeddingModel> PostgresVectorStore<M> {
         with_document: bool,
         req: &VectorSearchRequest<PgSearchFilter>,
     ) -> (String, Vec<serde_json::Value>) {
-        let document = if with_document { ", document" } else { "" };
+        render_search_query(
+            &self.distance_function,
+            &self.documents_table,
+            with_document,
+            req,
+        )
+    }
+}
 
-        let thresh = req
-            .threshold()
-            .map(|t| PgSearchFilter::gt("distance", t.into()));
-        let filter = match (thresh, req.filter()) {
-            (Some(thresh), Some(filt)) => Some(thresh.and(filt.clone())),
-            (Some(thresh), _) => Some(thresh),
-            (_, Some(filt)) => Some(filt.clone()),
-            _ => None,
-        };
-        let (where_clause, params) = match filter {
-            Some(f) => {
-                let (expr, params) = f.into_clause();
-                (String::from("WHERE") + &expr, params)
-            }
-            None => (Default::default(), Default::default()),
-        };
+/// Render the search SQL and its bind values (after `$1` = query vector,
+/// `$2` = limit).
+///
+/// The threshold is a minimum similarity applied to
+/// [`PgVectorDistanceFunction::score_expression`] inside the inner
+/// `SELECT`'s `WHERE`; it cannot reference the `distance` alias, which is
+/// only visible in the outer query. Returned scores stay raw distances in
+/// ascending order, so callers who never set a threshold see identical
+/// results.
+fn render_search_query(
+    distance_function: &PgVectorDistanceFunction,
+    documents_table: &str,
+    with_document: bool,
+    req: &VectorSearchRequest<PgSearchFilter>,
+) -> (String, Vec<serde_json::Value>) {
+    let document = if with_document { ", document" } else { "" };
 
-        let mut counter = 3;
-        let mut buf = String::with_capacity(where_clause.len() * 2);
+    // Bind order: threshold (if any) first, then filter values. The threshold
+    // condition is rendered after renumbering because its `$1` must stay the
+    // query vector.
+    let mut params = Vec::new();
+    let mut conditions = Vec::new();
+    let mut counter = 3;
 
-        for c in where_clause.chars() {
+    if let Some(threshold) = req.threshold() {
+        let score = distance_function.score_expression("embedding", "$1");
+        conditions.push(format!("({score} >= ${counter})"));
+        params.push(serde_json::Value::from(threshold));
+        counter += 1;
+    }
+
+    if let Some(filter) = req.filter() {
+        let (expr, filter_params) = filter.clone().into_clause();
+        let mut buf = String::with_capacity(expr.len() * 2);
+        for c in expr.chars() {
             buf.push(c);
-
             if c == '$' {
                 let _ = write!(buf, "{counter}");
                 counter += 1;
             }
         }
+        conditions.push(format!("({buf})"));
+        params.extend(filter_params);
+    }
 
-        let where_clause = buf;
+    let where_clause = if conditions.is_empty() {
+        String::new()
+    } else {
+        format!("WHERE {}", conditions.join(" AND "))
+    };
 
-        let query = format!(
-            "
+    let query = format!(
+        "
             SELECT id{}, distance FROM ( \
               SELECT DISTINCT ON (id) id{}, embedding {} $1 as distance \
               FROM {} \
@@ -327,15 +373,14 @@ impl<M: EmbeddingModel> PostgresVectorStore<M> {
             ) as d \
             ORDER BY distance \
             LIMIT $2",
-            document, document, self.distance_function, self.documents_table
-        );
+        document, document, distance_function, documents_table
+    );
 
-        (query, params)
-    }
+    (query, params)
 }
 
 impl<M: EmbeddingModel> InsertDocuments for PostgresVectorStore<M> {
-    async fn insert_documents<Doc: Serialize + Embed + Send>(
+    async fn insert_documents<Doc: Serialize + Embed + WasmCompatSend>(
         &self,
         documents: Vec<(Doc, Vec<Embedding>)>,
     ) -> Result<(), VectorStoreError> {
@@ -370,7 +415,7 @@ impl<M: EmbeddingModel> VectorStoreIndex for PostgresVectorStore<M> {
 
     /// Get the top n documents based on the distance to the given query.
     /// The result is a list of tuples of the form (score, id, document)
-    async fn top_n<T: for<'a> Deserialize<'a> + Send>(
+    async fn top_n<T: DeserializeOwned + WasmCompatSend>(
         &self,
         req: VectorSearchRequest<PgSearchFilter>,
     ) -> Result<Vec<(f64, String, T)>, VectorStoreError> {

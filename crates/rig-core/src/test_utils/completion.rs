@@ -120,7 +120,7 @@ impl MockTurn {
         Self {
             response: Ok(MockTurnResponse {
                 choice: vec![content],
-                usage: Usage::new(),
+                usage: Usage::default(),
                 message_id: None,
                 response_id: None,
                 provider_request_id: None,
@@ -138,7 +138,7 @@ impl MockTurn {
         Self {
             response: Ok(MockTurnResponse {
                 choice: content.into_iter().collect(),
-                usage: Usage::new(),
+                usage: Usage::default(),
                 message_id: None,
                 response_id: None,
                 provider_request_id: None,
@@ -409,7 +409,7 @@ impl CompletionModel for MockCompletionModel {
         // and the same `Stop` -> `ToolCalls` reconciliation callers see in
         // production runs in `StreamingCompletionResponse` for both.
         let stream = async_stream::stream! {
-            let mut out = crate::providers::internal::adapter::AdapterOutput::new();
+            let mut out = crate::operation::AdapterOutput::new();
             // An id-less scripted tool call mints per stream, like a wire
             // that carries no ids (`tool-0`, `tool-1`, …).
             let mut tool_ids = crate::streaming::SyntheticIds::tool();

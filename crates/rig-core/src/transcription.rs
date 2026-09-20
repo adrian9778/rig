@@ -37,9 +37,9 @@ crate::provider_response::provider_error_enum!(
 pub struct TranscriptionResponse {
     /// The transcribed text.
     pub text: String,
-    /// Token or duration usage as the provider reported it. Zero-valued when
-    /// the provider reported none — the same sentinel [`Usage`] documents for
-    /// completions. Duration-billed endpoints report no token counts.
+    /// Token or duration usage as the provider reported it; every counter is
+    /// `None` when the provider reported none (see [`Usage`]). Duration-billed
+    /// endpoints report no token counts.
     #[serde(default)]
     pub usage: Usage,
     /// Stable descriptor name of the provider that produced this response,
@@ -74,7 +74,7 @@ impl TranscriptionResponse {
     pub fn new(text: impl Into<String>, provider: impl Into<String>) -> Self {
         Self {
             text: text.into(),
-            usage: Usage::new(),
+            usage: Usage::default(),
             provider: provider.into(),
             model: None,
             response_id: None,
@@ -117,10 +117,12 @@ pub trait NormalizeTranscriptionResponse {
 /// either from a third-party provider (e.g: OpenAI) or a local model.
 ///
 /// The trait describes only what a model *does*: it has no associated types.
-/// Construction lives on [`crate::client::transcription::TranscriptionClient`], and
-/// `Clone` is required only by [`TranscriptionModel::transcription_request`],
-/// which needs to hand the builder its own copy. A model behind an `Arc` is a
-/// model: the trait is implemented for `Arc<M>` by forwarding.
+/// A model is a provider's transcription wire bound to a transport — bind a
+/// provider that declares one and call `transcription(model)` on the resulting
+/// [`Bound`](crate::driver::Bound) — and `Clone` is required only by
+/// [`TranscriptionModel::transcription_request`], which needs to hand the
+/// builder its own copy. A model behind an `Arc` is a model: the trait is
+/// implemented for `Arc<M>` by forwarding.
 pub trait TranscriptionModel: WasmCompatSend + WasmCompatSync {
     /// Generates a completion response for the given transcription model
     fn transcription(
@@ -172,14 +174,14 @@ pub struct TranscriptionRequest {
 /// Example usage:
 /// ```ignore
 /// use rig_core::{
-///     prelude::TranscriptionClient,
-///     providers::openai::{Client, self},
+///     providers::openai::{self, wire::OpenAI},
 ///     transcription::{TranscriptionModel, TranscriptionRequestBuilder},
 /// };
+/// use rig_reqwest::prelude::*;
 ///
 /// # async fn run() -> Result<(), Box<dyn std::error::Error>> {
-/// let openai = Client::new("your-openai-api-key")?;
-/// let model = openai.transcription_model(openai::WHISPER_1);
+/// let openai = OpenAI::new("your-openai-api-key").bound()?;
+/// let model = openai.transcription(openai::WHISPER_1);
 ///
 /// // Create the transcription request and execute it separately.
 /// let request = TranscriptionRequestBuilder::new(model.clone())
@@ -196,14 +198,14 @@ pub struct TranscriptionRequest {
 /// Alternatively, you can execute the transcription request directly from the builder:
 /// ```ignore
 /// use rig_core::{
-///     prelude::TranscriptionClient,
-///     providers::openai::{Client, self},
+///     providers::openai::{self, wire::OpenAI},
 ///     transcription::TranscriptionRequestBuilder,
 /// };
+/// use rig_reqwest::prelude::*;
 ///
 /// # async fn run() -> Result<(), Box<dyn std::error::Error>> {
-/// let openai = Client::new("your-openai-api-key")?;
-/// let model = openai.transcription_model(openai::WHISPER_1);
+/// let openai = OpenAI::new("your-openai-api-key").bound()?;
+/// let model = openai.transcription(openai::WHISPER_1);
 ///
 /// // Create the transcription request and execute it directly.
 /// let response = TranscriptionRequestBuilder::new(model)

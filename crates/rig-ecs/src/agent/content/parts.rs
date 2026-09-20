@@ -1,23 +1,24 @@
 //! Lossless conversion between message DTOs and ordered, typed child entities.
 
 use bevy_ecs::prelude::*;
+use bevy_reflect::Reflect;
 use rig_core::message::{self, AssistantContent, ToolResultContent, UserContent};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 use super::binary::{BinaryAssets, BinaryError, PartSource};
-use crate::agent::{MessageParts, Order, Role, Utterance};
+use crate::agent::{MessageParts, Role, Utterance};
 
 /// A content entity, owned by an utterance or a tool-result part.
-#[derive(Component, Debug, Clone, Copy, Serialize, Deserialize)]
-#[cfg_attr(feature = "reflect", derive(bevy_reflect::Reflect), reflect(Component))]
+#[derive(Component, Debug, Clone, Copy, Serialize, Deserialize, Reflect)]
+#[reflect(Component)]
 pub struct ContentPart;
 
 /// A request-only edit on an ordered link entity owned by a fresh turn.
 /// Text replacement preserves annotations; removal omits the complete target.
 /// Persistent history is unchanged. Links are consumed when the request is folded.
-#[derive(Component, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[cfg_attr(feature = "reflect", derive(bevy_reflect::Reflect), reflect(Component))]
+#[derive(Component, Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Reflect)]
+#[reflect(Component)]
 pub enum RequestPartEdit {
     /// Replace the text of a TextPart, preserving its other fields.
     Text(String),
@@ -26,122 +27,114 @@ pub enum RequestPartEdit {
 }
 
 /// Target of a RequestPartEdit link; scene persistence remaps this relationship.
-#[derive(Component, Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Component, Debug, Clone, Copy, PartialEq, Eq, Reflect)]
 #[relationship(relationship_target = EditedBy)]
-#[cfg_attr(feature = "reflect", derive(bevy_reflect::Reflect), reflect(Component))]
+#[reflect(Component)]
 pub struct EditTarget(pub Entity);
 
 /// Request edit links naming this content part.
-#[derive(Component, Debug, Default)]
+#[derive(Component, Debug, Default, Reflect)]
 #[relationship_target(relationship = EditTarget)]
-#[cfg_attr(feature = "reflect", derive(bevy_reflect::Reflect), reflect(Component))]
+#[reflect(Component)]
 pub struct EditedBy(Vec<Entity>);
 
 /// Provider-assigned assistant message identifier, including explicit absence.
-#[derive(Component, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[cfg_attr(feature = "reflect", derive(bevy_reflect::Reflect), reflect(Component))]
+#[derive(Component, Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Reflect)]
+#[reflect(Component)]
 pub struct MessageId(pub Option<String>);
 
 /// A text part, including provider annotations.
-#[derive(Component, Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[cfg_attr(feature = "reflect", derive(bevy_reflect::Reflect), reflect(Component))]
-pub struct TextPart(
-    #[cfg_attr(feature = "reflect", reflect(remote = super::reflect::TextPartReflect))]
-    pub  message::Text,
-);
+#[derive(Component, Debug, Clone, PartialEq, Serialize, Deserialize, Reflect)]
+#[reflect(Component)]
+pub struct TextPart(#[reflect(remote = super::reflect::TextPartReflect)] pub message::Text);
 
 /// A tool call with correlation IDs, arguments, signature and metadata.
-#[derive(Component, Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[cfg_attr(feature = "reflect", derive(bevy_reflect::Reflect), reflect(Component))]
+#[derive(Component, Debug, Clone, PartialEq, Serialize, Deserialize, Reflect)]
+#[reflect(Component)]
 pub struct ToolCallPart(
-    #[cfg_attr(feature = "reflect", reflect(remote = super::reflect::ToolCallPartReflect))]
-    pub  message::ToolCall,
+    #[reflect(remote = super::reflect::ToolCallPartReflect)] pub message::ToolCall,
 );
 
 /// Ordered reasoning content with IDs, signatures and opaque provider data.
-#[derive(Component, Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[cfg_attr(feature = "reflect", derive(bevy_reflect::Reflect), reflect(Component))]
+#[derive(Component, Debug, Clone, PartialEq, Serialize, Deserialize, Reflect)]
+#[reflect(Component)]
 pub struct ReasoningPart(
-    #[cfg_attr(feature = "reflect", reflect(remote = super::reflect::ReasoningPartReflect))]
-    pub  message::Reasoning,
+    #[reflect(remote = super::reflect::ReasoningPartReflect)] pub message::Reasoning,
 );
 
 /// A structured JSON item under a tool-result part; never implicitly parsed from text.
-#[derive(Component, Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[cfg_attr(feature = "reflect", derive(bevy_reflect::Reflect), reflect(Component))]
-pub struct JsonPart(
-    #[cfg_attr(feature = "reflect", reflect(remote = super::reflect::JsonPartReflect))]
-    pub  serde_json::Value,
-);
+#[derive(Component, Debug, Clone, PartialEq, Serialize, Deserialize, Reflect)]
+#[reflect(Component)]
+pub struct JsonPart(#[reflect(remote = super::reflect::JsonPartReflect)] pub serde_json::Value);
 
 /// A image content part, retaining per-use metadata beside its shared source.
-#[derive(Component, Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[cfg_attr(feature = "reflect", derive(bevy_reflect::Reflect), reflect(Component))]
+#[derive(Component, Debug, Clone, PartialEq, Serialize, Deserialize, Reflect)]
+#[reflect(Component)]
 pub struct ImagePart {
     /// Inline source metadata or a reference to shared binary bytes.
     pub source: PartSource,
     /// This occurrence's media type.
-    #[cfg_attr(feature = "reflect", reflect(remote = super::reflect::ImageMediaReflect))]
+    #[reflect(remote = super::reflect::ImageMediaReflect)]
     pub media_type: Option<message::ImageMediaType>,
     /// This occurrence's provider-specific metadata.
-    #[cfg_attr(feature = "reflect", reflect(remote = super::reflect::PartParamsReflect))]
+    #[reflect(remote = super::reflect::PartParamsReflect)]
     pub additional_params: Option<message::AdditionalParams>,
     /// Provider rendering preference for this occurrence.
-    #[cfg_attr(feature = "reflect", reflect(remote = super::reflect::ImageDetailReflect))]
+    #[reflect(remote = super::reflect::ImageDetailReflect)]
     pub detail: Option<message::ImageDetail>,
 }
 
 /// A audio content part, retaining per-use metadata beside its shared source.
-#[derive(Component, Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[cfg_attr(feature = "reflect", derive(bevy_reflect::Reflect), reflect(Component))]
+#[derive(Component, Debug, Clone, PartialEq, Serialize, Deserialize, Reflect)]
+#[reflect(Component)]
 pub struct AudioPart {
     /// Inline source metadata or a reference to shared binary bytes.
     pub source: PartSource,
     /// This occurrence's media type.
-    #[cfg_attr(feature = "reflect", reflect(remote = super::reflect::AudioMediaReflect))]
+    #[reflect(remote = super::reflect::AudioMediaReflect)]
     pub media_type: Option<message::AudioMediaType>,
     /// This occurrence's provider-specific metadata.
-    #[cfg_attr(feature = "reflect", reflect(remote = super::reflect::PartParamsReflect))]
+    #[reflect(remote = super::reflect::PartParamsReflect)]
     pub additional_params: Option<message::AdditionalParams>,
 }
 
 /// A video content part, retaining per-use metadata beside its shared source.
-#[derive(Component, Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[cfg_attr(feature = "reflect", derive(bevy_reflect::Reflect), reflect(Component))]
+#[derive(Component, Debug, Clone, PartialEq, Serialize, Deserialize, Reflect)]
+#[reflect(Component)]
 pub struct VideoPart {
     /// Inline source metadata or a reference to shared binary bytes.
     pub source: PartSource,
     /// This occurrence's media type.
-    #[cfg_attr(feature = "reflect", reflect(remote = super::reflect::VideoMediaReflect))]
+    #[reflect(remote = super::reflect::VideoMediaReflect)]
     pub media_type: Option<message::VideoMediaType>,
     /// This occurrence's provider-specific metadata.
-    #[cfg_attr(feature = "reflect", reflect(remote = super::reflect::PartParamsReflect))]
+    #[reflect(remote = super::reflect::PartParamsReflect)]
     pub additional_params: Option<message::AdditionalParams>,
 }
 
 /// A document content part, retaining per-use metadata beside its shared source.
-#[derive(Component, Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[cfg_attr(feature = "reflect", derive(bevy_reflect::Reflect), reflect(Component))]
+#[derive(Component, Debug, Clone, PartialEq, Serialize, Deserialize, Reflect)]
+#[reflect(Component)]
 pub struct DocumentPart {
     /// Inline source metadata or a reference to shared binary bytes.
     pub source: PartSource,
     /// This occurrence's media type.
-    #[cfg_attr(feature = "reflect", reflect(remote = super::reflect::DocumentMediaReflect))]
+    #[reflect(remote = super::reflect::DocumentMediaReflect)]
     pub media_type: Option<message::DocumentMediaType>,
     /// This occurrence's provider-specific metadata.
-    #[cfg_attr(feature = "reflect", reflect(remote = super::reflect::PartParamsReflect))]
+    #[reflect(remote = super::reflect::PartParamsReflect)]
     pub additional_params: Option<message::AdditionalParams>,
 }
 
 /// Tool-result identity; its ordered children are TextPart, ImagePart or JsonPart.
-#[derive(Component, Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[cfg_attr(feature = "reflect", derive(bevy_reflect::Reflect), reflect(Component))]
+#[derive(Component, Debug, Clone, PartialEq, Serialize, Deserialize, Reflect)]
+#[reflect(Component)]
 pub struct ToolResultPart {
     /// The call answered by this result.
-    #[cfg_attr(feature = "reflect", reflect(remote = crate::agent::reflect::ToolCallIdReflect))]
+    #[reflect(remote = crate::agent::reflect::ToolCallIdReflect)]
     pub call: message::ToolCallId,
     /// Original provider call identifiers.
-    #[cfg_attr(feature = "reflect", reflect(remote = crate::agent::reflect::ProviderCallIdReflect))]
+    #[reflect(remote = crate::agent::reflect::ProviderCallIdReflect)]
     pub provider: Option<message::ProviderCallId>,
     /// Executed tool name, including hook repairs.
     pub name: String,
@@ -151,8 +144,8 @@ pub struct ToolResultPart {
 /// graph data the batch lands, never rendered into the transport DTO — the
 /// result's content items are the same whatever the status. Absent on a
 /// result written from a DTO (`write_message`, a memory load, prior history).
-#[derive(Component, Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[cfg_attr(feature = "reflect", derive(bevy_reflect::Reflect), reflect(Component))]
+#[derive(Component, Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Reflect)]
+#[reflect(Component)]
 #[serde(rename_all = "snake_case")]
 pub enum ToolResultStatus {
     /// The tool ran and answered.
@@ -185,8 +178,8 @@ pub const TOOL_RESULT_LIMIT_MARKER: &str = "\n[… {omitted} bytes omitted …]\
 /// by `assemble` after the turn's `RequestPartEdit`s, to the outgoing
 /// request only: history, the graph and a scene keep the full text. Absent
 /// is verbatim. Request shaping like `RequestPatch`: not replay identity.
-#[derive(Component, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[cfg_attr(feature = "reflect", derive(bevy_reflect::Reflect), reflect(Component))]
+#[derive(Component, Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Reflect)]
+#[reflect(Component)]
 pub struct ToolResultLimit {
     /// The most bytes of one text item the request carries besides the marker.
     pub max_bytes: usize,
@@ -217,9 +210,6 @@ pub enum ContentError {
     /// A part has conflicting types, an invalid parent, or the wrong role.
     #[error("content part has an invalid type or role")]
     Shape,
-    /// Two siblings share an order, which cannot round-trip unambiguously.
-    #[error("content siblings have duplicate orders")]
-    DuplicateOrder,
 }
 
 // Transient conversion plan. This is never a component or persisted alongside
@@ -322,8 +312,8 @@ fn prepare(
 }
 
 fn spawn_parts(world: &mut World, parent: Entity, parts: Vec<PartValue>) {
-    for (order, part) in parts.into_iter().enumerate() {
-        let mut entity = world.spawn((ContentPart, Order(order as u64), ChildOf(parent)));
+    for part in parts {
+        let mut entity = world.spawn((ContentPart, ChildOf(parent)));
         match part {
             PartValue::Text(value) => {
                 entity.insert(value);
@@ -360,8 +350,8 @@ fn spawn_parts(world: &mut World, parent: Entity, parts: Vec<PartValue>) {
 /// Replace an utterance's content graph. This is a persistent edit; request-only
 /// steering must patch the reconstructed request instead. A rejected source
 /// leaves the existing graph unchanged; unreferenced interned assets can be collected.
-/// Sibling Order values are local, contiguous indices and do not consume the
-/// run/utterance OrderCounter. Repeated identical parts remain distinct entities.
+/// Sibling order is the utterance's `Children` order, the parts as given.
+/// Repeated identical parts remain distinct entities.
 pub fn write_message(
     world: &mut World,
     utterance: Entity,
@@ -400,17 +390,9 @@ fn ordered<'a>(
         if entity.get::<ContentPart>().is_none() {
             return Err(ContentError::Shape);
         }
-        let order = entity.get::<Order>().ok_or(ContentError::Missing)?;
-        ordered.push((*order, child));
+        ordered.push(child);
     }
-    ordered.sort_by_key(|(order, _)| *order);
-    if ordered
-        .windows(2)
-        .any(|pair| pair.first().map(|x| x.0) == pair.get(1).map(|x| x.0))
-    {
-        return Err(ContentError::DuplicateOrder);
-    }
-    Ok(ordered.into_iter().map(|(_, entity)| entity).collect())
+    Ok(ordered)
 }
 
 fn read_image(assets: &BinaryAssets, value: &ImagePart) -> Result<message::Image, ContentError> {
@@ -536,8 +518,8 @@ fn to_user(assets: &BinaryAssets, value: PartValue) -> Result<UserContent, Conte
     })
 }
 
-/// Reconstruct a message from its role, ID and typed children. Invalid types,
-/// missing components, duplicate sibling orders and unresolved assets are errors.
+/// Reconstruct a message from its role, ID and typed children in sibling
+/// order. Invalid types, missing components and unresolved assets are errors.
 pub fn read_message(world: &World, utterance: Entity) -> Result<MessageParts, ContentError> {
     let empty = BinaryAssets::default();
     let assets = world.get_resource::<BinaryAssets>().unwrap_or(&empty);
@@ -723,9 +705,8 @@ pub(crate) fn spawn_deferred(
     assets: &mut BinaryAssets,
     parent: Entity,
     message: MessageParts,
-    order: Order,
 ) -> Result<Entity, ContentError> {
-    spawn_deferred_with(commands, assets, parent, message, order, Vec::new())
+    spawn_deferred_with(commands, assets, parent, message, Vec::new())
 }
 
 /// `spawn_deferred`, stamping `statuses` on the utterance's tool-result
@@ -735,11 +716,10 @@ pub(crate) fn spawn_deferred_with(
     assets: &mut BinaryAssets,
     parent: Entity,
     message: MessageParts,
-    order: Order,
     statuses: Vec<ToolResultStatus>,
 ) -> Result<Entity, ContentError> {
     let (role, id, parts) = prepare(assets, message)?;
-    let mut utterance = commands.spawn((Utterance, role, order, ChildOf(parent)));
+    let mut utterance = commands.spawn((Utterance, role, ChildOf(parent)));
     if let Some(id) = id {
         utterance.insert(id);
     }
@@ -755,15 +735,13 @@ fn stamp_statuses(world: &mut World, utterance: Entity, statuses: &[ToolResultSt
     if statuses.is_empty() {
         return;
     }
-    let mut results: Vec<(Order, Entity)> = world
+    let results: Vec<Entity> = world
         .get::<Children>(utterance)
         .into_iter()
         .flat_map(|children| children.iter())
         .filter(|child| world.get::<ToolResultPart>(*child).is_some())
-        .filter_map(|child| world.get::<Order>(child).map(|order| (*order, child)))
         .collect();
-    results.sort_by_key(|(order, _)| *order);
-    for ((_, entity), status) in results.into_iter().zip(statuses) {
+    for (entity, status) in results.into_iter().zip(statuses) {
         world.entity_mut(entity).insert(*status);
     }
 }

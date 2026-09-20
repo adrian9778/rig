@@ -20,6 +20,12 @@
 //! runtime-owned items. The comprehensive end-user facade is the root `rig`
 //! crate.
 //!
+//! Recording accepts [`rig_core::serve::Recorder`] through
+//! [`agent::AgentBuilder::record_to`] or [`bus::BusDriver::record_to`].
+//! Concrete logs and classic replay registration live in `rig-cassette`
+//! with its `agent` feature. Its `agent::AgentReplayExt` supplies log stamping
+//! and compatibility checks; this runtime has no normal cassette dependency.
+//!
 //! # Target support
 //!
 //! Native targets are fully supported. `wasm32-unknown-unknown` (browser) is
@@ -89,9 +95,6 @@ pub use agent::{
 #[cfg(feature = "derive")]
 #[cfg_attr(docsrs, doc(cfg(feature = "derive")))]
 pub use rig_derive::rig_tool;
-#[cfg(feature = "derive")]
-#[cfg_attr(docsrs, doc(cfg(feature = "derive")))]
-pub use rig_derive::rig_tool as tool_macro;
 
 // Compile-time thread-safety contract: the agent surface must be safe to hold
 // in shared host state (worker pools, ECS resources) on native targets.

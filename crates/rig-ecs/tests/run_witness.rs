@@ -2,14 +2,6 @@
 //! requests, invalid-call resolutions and the tool batch's holds, each with
 //! the run's scope as its subject.
 
-#![allow(
-    clippy::expect_used,
-    clippy::unwrap_used,
-    clippy::panic,
-    clippy::indexing_slicing,
-    clippy::type_complexity
-)]
-
 use crate::run_support;
 
 use std::sync::Arc;
@@ -17,7 +9,7 @@ use std::sync::Arc;
 use bevy_ecs::prelude::*;
 use rig_core::observe::{Action, ObservationLog, Stage};
 use rig_ecs::{
-    agent::{Cancelled, Failed, Grant, Order, Settled, ToolPolicy},
+    agent::{Cancelled, Failed, Grant, Settled, ToolPolicy},
     bus::{Scope, Witnessing},
     systems::RunCommands,
 };
@@ -255,8 +247,7 @@ fn a_tool_batch_beyond_its_concurrency_is_held_then_released() {
     app.world_mut()
         .entity_mut(agent)
         .insert(ToolPolicy { concurrency: 1 });
-    app.world_mut()
-        .spawn((Grant(tool), Order(0), ChildOf(agent)));
+    app.world_mut().spawn((Grant(tool), ChildOf(agent)));
     let run = app
         .world_mut()
         .spawn_run(agent, &[], "add things", false, Some(3));

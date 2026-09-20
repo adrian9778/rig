@@ -21,8 +21,14 @@ use crate::{
     memory::MemoryError,
     rerank::RerankError,
     tool::{ToolErrorKind, ToolExecutionError},
+    transcription::TranscriptionError,
     vector_store::VectorStoreError,
 };
+
+#[cfg(feature = "audio")]
+use crate::audio_generation::AudioGenerationError;
+#[cfg(feature = "image")]
+use crate::image_generation::ImageGenerationError;
 
 /// Normalized classification of an [`ErrorReport`].
 ///
@@ -151,7 +157,50 @@ pub struct ErrorReport {
     /// failure that crossed the wire loses nothing a caller could read off
     /// the provider error it came from.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub provider_response: Option<Box<crate::provider_response::ProviderResponseError>>,
+    pub provider_response: Option<crate::provider_response::ProviderResponseError>,
+    /// Structured diagnostic for failures a consumer may want to *route*
+    /// rather than only display. Absent for the common case; see
+    /// [`ErrorDetail`] for what each variant carries and why.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<ErrorDetail>,
+}
+
+/// Typed diagnostic attached to an [`ErrorReport`] when a failure has a
+/// recovery path that needs more than the message text.
+///
+/// A report's `kind` and `message` stay the public contract; a `detail`
+/// is additive so anything matching on those keeps working.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "detail", rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum ErrorDetail {
+    /// A streamed tool call closed with input that is not JSON.
+    ///
+    /// The wire promised a complete block (Anthropic `content_block_stop`,
+    /// Bedrock `contentBlockStop`), so this is a response defect rather
+    /// than truncation — but it is the *model's* defect, and an agent can
+    /// feed it back for a retry instead of ending the run. `raw` is the
+    /// exact argument text the accumulator held, unmodified, so a consumer
+    /// can log or replay it; `error` is the parser's own description.
+    MalformedToolInput(MalformedToolInput),
+}
+
+/// The payload of [`ErrorDetail::MalformedToolInput`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MalformedToolInput {
+    /// The tool the model named.
+    pub name: String,
+    /// Rig's durable correlation id for the call — the same id the call
+    /// would have carried had its input parsed, so a recovery can address
+    /// it (a tool result, a rollback) exactly as it would a valid call.
+    pub id: crate::message::ToolCallId,
+    /// The provider's own call id(s), when the wire supplied any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<crate::message::ProviderCallId>,
+    /// The raw argument text, byte-for-byte as accumulated.
+    pub raw: String,
+    /// The JSON parser's description of what was wrong.
+    pub error: String,
 }
 
 impl ErrorReport {
@@ -167,6 +216,7 @@ impl ErrorReport {
             source_chain: Vec::new(),
             request_id: None,
             provider_response: None,
+            detail: None,
         }
     }
 
@@ -200,6 +250,12 @@ impl ErrorReport {
         self
     }
 
+    /// Attach a typed diagnostic.
+    pub fn with_detail(mut self, detail: ErrorDetail) -> Self {
+        self.detail = Some(detail);
+        self
+    }
+
     /// Whether the same operation may reasonably be retried.
     pub const fn is_retryable(&self) -> bool {
         self.retryable
@@ -223,7 +279,7 @@ impl ErrorReport {
     pub fn provider_response_headers(&self) -> Option<&http::HeaderMap> {
         self.provider_response
             .as_ref()
-            .and_then(|response| response.headers.as_deref())
+            .and_then(|response| response.headers.as_ref())
     }
 
     /// The HTTP status this report carries, as a status code.
@@ -286,7 +342,7 @@ pub fn transient_transport(error: &crate::http_client::Error) -> bool {
 
 /// Collect the `Display` of each `source()` link below `error`, outermost
 /// first.
-fn source_chain(error: &(dyn std::error::Error + 'static)) -> Vec<String> {
+pub(crate) fn source_chain(error: &(dyn std::error::Error + 'static)) -> Vec<String> {
     let mut chain = Vec::new();
     let mut current = error.source();
     while let Some(source) = current {
@@ -295,6 +351,71 @@ fn source_chain(error: &(dyn std::error::Error + 'static)) -> Vec<String> {
     }
     chain
 }
+
+/// The report of an operation error declared by
+/// [`provider_error_enum!`](crate::provider_response::provider_error_enum):
+/// the five core variants classify identically on every operation, and
+/// whatever the operation adds is a fault in the request it was asked to
+/// build.
+///
+/// An operation with a variant that is *not* a request fault — Gemini's
+/// `CachedContentError::Expired`, which is the provider's verdict on a
+/// handle with its status folded into the variant — names it after the
+/// type, rather than restating the whole table to change one row.
+macro_rules! impl_report_for_provider_error {
+    ($error:ident $(, $extra:pat => $extra_kind:expr)* $(,)?) => {
+        impl From<&$error> for $crate::error::ErrorReport {
+            fn from(error: &$error) -> Self {
+                use $crate::error::ErrorKind;
+                let (kind, provider_response) = match error {
+                    $error::HttpError(_) => (ErrorKind::Http, None),
+                    $error::JsonError(_) => (ErrorKind::Json, None),
+                    $error::ResponseError(_) => (ErrorKind::Response, None),
+                    $error::ProviderError(_) => (ErrorKind::Provider, None),
+                    $error::ProviderResponse(response) => {
+                        (ErrorKind::ProviderResponse, Some(response.clone()))
+                    }
+                    $( $extra => ($extra_kind, None), )*
+                    _ => (ErrorKind::Request, None),
+                };
+                $crate::error::ErrorReport {
+                    kind,
+                    retryable: error.is_retryable(),
+                    message: error.to_string(),
+                    code: provider_response
+                        .as_ref()
+                        .and_then(|response| response.machine_code()),
+                    http_status: provider_response
+                        .as_ref()
+                        .and_then(|response| response.status.map(|status| status.as_u16())),
+                    refusal: provider_response
+                        .as_ref()
+                        .is_some_and(|response| response.refusal),
+                    source_chain: $crate::error::source_chain(error),
+                    request_id: provider_response
+                        .as_ref()
+                        .and_then(|response| response.provider_request_id.clone()),
+                    provider_response,
+                    detail: None,
+                }
+            }
+        }
+
+        impl From<$error> for $crate::error::ErrorReport {
+            fn from(error: $error) -> Self {
+                Self::from(&error)
+            }
+        }
+    };
+}
+
+pub(crate) use impl_report_for_provider_error;
+
+impl_report_for_provider_error!(TranscriptionError);
+#[cfg(feature = "image")]
+impl_report_for_provider_error!(ImageGenerationError);
+#[cfg(feature = "audio")]
+impl_report_for_provider_error!(AudioGenerationError);
 
 impl CompletionError {
     /// The wire form of this error.
@@ -330,7 +451,7 @@ impl From<&CompletionError> for ErrorReport {
         // provider error exposed (status, body, headers, request id) stays
         // readable after the failure crossed the wire.
         let provider_response = match error {
-            CompletionError::ProviderResponse(response) => Some(Box::new(response.clone())),
+            CompletionError::ProviderResponse(response) => Some(response.clone()),
             CompletionError::HttpError(_)
             | CompletionError::JsonError(_)
             | CompletionError::UrlError(_)
@@ -356,6 +477,7 @@ impl From<&CompletionError> for ErrorReport {
             source_chain: source_chain(error),
             request_id,
             provider_response,
+            detail: None,
         }
     }
 }
@@ -397,6 +519,7 @@ impl From<&ToolExecutionError> for ErrorReport {
             source_chain: source_chain(error),
             request_id: None,
             provider_response: None,
+            detail: None,
         }
     }
 }
@@ -431,6 +554,7 @@ impl From<&MemoryError> for ErrorReport {
             source_chain: source_chain(error),
             request_id: None,
             provider_response: None,
+            detail: None,
         }
     }
 }
@@ -464,7 +588,7 @@ impl From<&EmbeddingError> for ErrorReport {
         // never a copy of its table kept beside the report.
         let retryable = error.is_retryable();
         let provider_response = match error {
-            EmbeddingError::ProviderResponse(response) => Some(Box::new(response.clone())),
+            EmbeddingError::ProviderResponse(response) => Some(response.clone()),
             _ => None,
         };
         let request_id = provider_response
@@ -486,6 +610,7 @@ impl From<&EmbeddingError> for ErrorReport {
             source_chain: source_chain(error),
             request_id,
             provider_response,
+            detail: None,
         }
     }
 }
@@ -513,7 +638,7 @@ impl From<&RerankError> for ErrorReport {
         // never a copy of its table kept beside the report.
         let retryable = error.is_retryable();
         let provider_response = match error {
-            RerankError::ProviderResponse(response) => Some(Box::new(response.clone())),
+            RerankError::ProviderResponse(response) => Some(response.clone()),
             _ => None,
         };
         let request_id = provider_response
@@ -535,6 +660,7 @@ impl From<&RerankError> for ErrorReport {
             source_chain: source_chain(error),
             request_id,
             provider_response,
+            detail: None,
         }
     }
 }
@@ -575,9 +701,9 @@ impl From<&VectorStoreError> for ErrorReport {
         };
         // The store's reply travels with the report like any provider's.
         let provider_response = match error {
-            VectorStoreError::ExternalAPIError(status, body) => Some(Box::new(
+            VectorStoreError::ExternalAPIError(status, body) => Some(
                 crate::provider_response::ProviderResponseError::new(*status, body.clone()),
-            )),
+            ),
             _ => None,
         };
         ErrorReport {
@@ -590,6 +716,7 @@ impl From<&VectorStoreError> for ErrorReport {
             source_chain: source_chain(error),
             request_id: None,
             provider_response,
+            detail: None,
         }
     }
 }

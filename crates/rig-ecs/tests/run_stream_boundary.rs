@@ -1,8 +1,6 @@
 //! A delivered invalid name must be actionable before the producer finishes.
 //! The producer gate prevents EOF from masquerading as a midstream boundary.
 // Test assertions and the shared run_support fixtures intentionally panic.
-#![allow(clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
-
 #[path = "run_stream_boundary/errors.rs"]
 mod errors;
 #[path = "run_stream_boundary/multiple.rs"]
@@ -32,7 +30,7 @@ use rig_core::{
     streaming::{BlockClose, StreamFinal, ToolCallEnd},
 };
 use rig_ecs::{
-    agent::{Grant, MessageParts, Order, Resolution, RunResult, Settled, Usage},
+    agent::{Grant, MessageParts, Resolution, RunResult, Settled, Usage},
     bus::RigSchedule,
     systems::RigSet,
 };
@@ -52,8 +50,8 @@ impl Serve for FinishingName {
             return Reply::Outcome(Ok(Outcome::Completion(CompletionResponse::new(
                 vec![AssistantContent::text("done")],
                 ProviderUsage {
-                    total_tokens: 3,
-                    ..ProviderUsage::new()
+                    total_tokens: Some(3),
+                    ..ProviderUsage::default()
                 },
                 "boundary",
             ))));
@@ -92,8 +90,8 @@ impl Serve for FinishingName {
                 .event(StreamEvent::Final(StreamFinal::new(
                     "boundary",
                     ProviderUsage {
-                        total_tokens: 7,
-                        ..ProviderUsage::new()
+                        total_tokens: Some(7),
+                        ..ProviderUsage::default()
                     },
                 )))
                 .await
@@ -174,8 +172,7 @@ fn early_skip_retains_prefix_and_drained_usage_without_dispatching_tool() {
     let peak = Arc::clone(&adder.peak);
     let tool = register(&mut app, "boundary/add", adder);
     let agent = spawn_agent(app.world_mut(), "boundary", model);
-    app.world_mut()
-        .spawn((Grant(tool), Order(0), ChildOf(agent)));
+    app.world_mut().spawn((Grant(tool), ChildOf(agent)));
     let run = app.world_mut().spawn_run(agent, &[], "add", true, Some(2));
     tick_until(&mut app, "skip before EOF", |world| {
         world.resource::<RepairCount>().0 == 1
@@ -199,7 +196,7 @@ fn early_skip_retains_prefix_and_drained_usage_without_dispatching_tool() {
     assert_eq!(app.world().get::<RunResult>(run).expect("result").0, "done");
     assert_eq!(
         app.world().get::<Usage>(run).expect("usage").0.total_tokens,
-        10
+        Some(10)
     );
     assert_eq!(peak.load(std::sync::atomic::Ordering::SeqCst), 0);
     assert_eq!(app.world().resource::<RepairCount>().0, 1);
@@ -273,8 +270,7 @@ fn early_repair_survives_raw_block_completion_and_provider_identity() {
     let peak = Arc::clone(&adder.peak);
     let tool = register(&mut app, "boundary/add", adder);
     let agent = spawn_agent(app.world_mut(), "boundary", model);
-    app.world_mut()
-        .spawn((Grant(tool), Order(0), ChildOf(agent)));
+    app.world_mut().spawn((Grant(tool), ChildOf(agent)));
     let run = app.world_mut().spawn_run(agent, &[], "add", true, Some(2));
     tick_until(&mut app, "repair before EOF", |world| {
         world.resource::<RepairCount>().0 == 1
@@ -308,7 +304,7 @@ fn early_repair_survives_raw_block_completion_and_provider_identity() {
     assert_eq!(peak.load(std::sync::atomic::Ordering::SeqCst), 1);
     assert_eq!(
         app.world().get::<Usage>(run).expect("usage").0.total_tokens,
-        10
+        Some(10)
     );
     let calls: Vec<_> = app
         .world_mut()

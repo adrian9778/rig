@@ -146,14 +146,14 @@ macro_rules! assert_funnel {
 }
 
 /// A 429's rate-limit metadata, as a provider would send it.
-fn retry_after_headers() -> Box<http::HeaderMap> {
+fn retry_after_headers() -> http::HeaderMap {
     let mut headers = http::HeaderMap::new();
     headers.insert(
         http::header::RETRY_AFTER,
         http::HeaderValue::from_static("20"),
     );
     headers.insert("x-ratelimit-remaining", http::HeaderValue::from_static("0"));
-    Box::new(headers)
+    headers
 }
 
 #[test]
@@ -266,7 +266,7 @@ fn attaching_headers_never_overwrites_an_earlier_capture() {
     ] {
         let error = build(StatusCode::TOO_MANY_REQUESTS, "slow down")
             .with_response_headers(Some(retry_after_headers()))
-            .with_response_headers(Some(Box::new(later.clone())));
+            .with_response_headers(Some(later.clone()));
 
         assert_eq!(
             error
@@ -336,7 +336,7 @@ fn display_goldens_for_error_shapes() {
     let details = crate::http_client::Error::InvalidStatusCodeWithDetails {
         status: StatusCode::NOT_FOUND,
         body: "x".to_string(),
-        headers: Box::new(http::HeaderMap::new()),
+        headers: http::HeaderMap::new(),
     };
     assert_eq!(
         details.to_string(),
@@ -375,7 +375,7 @@ fn provider_response_error_round_trips_its_identity_and_not_its_headers() {
     );
     let error = ProviderResponseError::new(http::StatusCode::TOO_MANY_REQUESTS, "slow")
         .with_provider_request_id(Some("req-1".into()))
-        .with_headers(Some(Box::new(headers)));
+        .with_headers(Some(headers));
     let json = serde_json::to_string(&error).unwrap();
     assert!(!json.contains("headers"), "{json}");
     let back: ProviderResponseError = serde_json::from_str(&json).unwrap();
@@ -492,4 +492,27 @@ fn a_refusal_is_never_retryable_whatever_its_status_or_transport_verdict() {
     let plain_block =
         ProviderResponseError::without_status("blocked".to_owned()).with_refusal(true);
     assert!(!plain_block.is_retryable());
+}
+
+/// An error envelope delivered under a 200 (Gemini's blocked prompt, a 2xx
+/// error body): the driver stamps the transport's real status so callers
+/// see it, but a success status is no retry verdict — the decoder's
+/// `transient` decides, exactly as it does with no status at all. A
+/// non-success status still classifies by the status table alone.
+#[test]
+fn a_success_status_defers_to_the_transport_verdict() {
+    use super::ProviderResponseError;
+    let transient_under_200 = ProviderResponseError::without_status("blocked".to_owned())
+        .with_transient(Some(true))
+        .with_status(Some(http::StatusCode::OK));
+    assert!(transient_under_200.is_retryable());
+
+    let silent_under_200 = ProviderResponseError::without_status("blocked".to_owned())
+        .with_status(Some(http::StatusCode::OK));
+    assert!(!silent_under_200.is_retryable());
+
+    let transient_under_400 = ProviderResponseError::without_status("bad".to_owned())
+        .with_transient(Some(true))
+        .with_status(Some(http::StatusCode::BAD_REQUEST));
+    assert!(!transient_under_400.is_retryable());
 }

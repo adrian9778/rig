@@ -77,8 +77,8 @@ pub struct RerankResponse {
     /// still produced a ranking.
     #[serde(default)]
     pub model: Option<String>,
-    /// Token usage for this rerank request. Zero-valued when the provider
-    /// reported none — the sentinel [`Usage`] documents.
+    /// Token usage for this rerank request; every counter is `None` when the
+    /// provider reported none (see [`Usage`]).
     #[serde(default)]
     pub usage: Usage,
     /// Stable descriptor name of the provider that produced this response,
@@ -108,7 +108,7 @@ impl RerankResponse {
         Self {
             results,
             model: None,
-            usage: Usage::new(),
+            usage: Usage::default(),
             provider: provider.into(),
             response_id: None,
             provider_request_id: None,
@@ -129,16 +129,3 @@ impl RerankResponse {
 }
 
 crate::provider_response::modality_response_metadata_setters!(RerankResponse);
-
-/// Convert a provider's own rerank payload into the normalized
-/// [`RerankResponse`].
-///
-/// The provider descriptor name is an *input*, never something the conversion
-/// knows — the Jina-shaped wire is shared by several servers, and a hardcoded
-/// name would mislabel every provider but one. A trait rather than
-/// `TryFrom<(&str, T)>` so that out-of-tree provider extensions can implement
-/// it on their own response type without tripping the orphan rule.
-pub trait NormalizeRerankResponse {
-    /// Normalize this payload, attributing it to `provider`.
-    fn normalize(self, provider: &str) -> Result<RerankResponse, RerankError>;
-}

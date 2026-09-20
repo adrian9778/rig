@@ -10,31 +10,26 @@
 //! | the second slot: a `Patch` system rewrites the folded effect and the record holds the patch | `a_patch_system_rewrites_the_folded_request_and_the_record_holds_it` |
 //! | the first slot: a system before `Assemble` rewrites an utterance and the request carries it | `a_system_before_assemble_rewrites_an_utterance` |
 
-#![allow(
-    clippy::expect_used,
-    clippy::unwrap_used,
-    clippy::panic,
-    clippy::indexing_slicing,
-    clippy::type_complexity
-)]
-
 use crate::run_support;
 
 use bevy_ecs::prelude::*;
+use rig_cassette::ecs::EffectLogResource;
+use rig_cassette::effect_log::EffectLogRecorder;
 use rig_core::{
     effect::EffectKind,
     message::{Message, UserContent},
 };
 use rig_ecs::{
     agent::{
-        Context, DocumentId, DocumentText, Grant, MessageParts, Order, RunResult, Settled,
-        UsesModel, Utterance,
+        Context, DocumentId, DocumentText, Grant, MessageParts, RunResult, Settled, UsesModel,
+        Utterance,
     },
-    bus::{EffectLogResource, PendingEffect, RigSchedule},
+    bus::{PendingEffect, RigSchedule},
     systems::{RigSet, RunCommands},
 };
-use rig_effect_log::EffectLogRecorder;
 use run_support::*;
+
+const MODEL: &str = "t/model:default";
 
 fn add_before_assemble<M>(
     app: &mut bevy_app::App,
@@ -76,9 +71,7 @@ fn despawn_the_assistant_utterance(
 #[test]
 fn an_utterance_despawned_before_assemble_leaves_the_next_request() {
     let mut app = app();
-    let (model, requests) = Capturing::new("t/model:default", "ok");
-    let model = register(&mut app, "t/model:default", model);
-    let agent = spawn_agent(app.world_mut(), "t", model);
+    let (agent, requests) = capturing_agent(&mut app, MODEL, MODEL, "ok");
     app.init_resource::<Once>();
     add_before_assemble(&mut app, despawn_the_assistant_utterance);
     let history = vec![
@@ -106,9 +99,7 @@ fn an_utterance_despawned_before_assemble_leaves_the_next_request() {
 #[test]
 fn one_document_attached_to_two_runs_appears_in_both_requests() {
     let mut app = app();
-    let (model, requests) = Capturing::new("t/model:default", "ok");
-    let model = register(&mut app, "t/model:default", model);
-    let agent = spawn_agent(app.world_mut(), "t", model);
+    let (agent, requests) = capturing_agent(&mut app, MODEL, MODEL, "ok");
     let document = app
         .world_mut()
         .spawn((
@@ -116,8 +107,7 @@ fn one_document_attached_to_two_runs_appears_in_both_requests() {
             DocumentText("one document, many turns".to_owned()),
         ))
         .id();
-    app.world_mut()
-        .spawn((Context(document), Order(0), ChildOf(agent)));
+    app.world_mut().spawn((Context(document), ChildOf(agent)));
     let first = app
         .world_mut()
         .spawn_run(agent, &[], "first?", false, Some(1));
@@ -144,8 +134,7 @@ fn one_document_attached_to_two_runs_appears_in_both_requests() {
 #[test]
 fn a_tool_granted_by_a_relationship_is_advertised_and_gone_after_removal() {
     let mut app = app();
-    let (model, requests) = Capturing::new("t/model:default", "ok");
-    let model = register(&mut app, "t/model:default", model);
+    let (agent, requests) = capturing_agent(&mut app, MODEL, MODEL, "ok");
     let tool = register(
         &mut app,
         "t/tool:add#0",
@@ -153,13 +142,9 @@ fn a_tool_granted_by_a_relationship_is_advertised_and_gone_after_removal() {
             name: "add".to_owned(),
         },
     );
-    let agent = spawn_agent(app.world_mut(), "t", model);
     let before = app.world_mut().spawn_run(agent, &[], "one", false, Some(1));
     settle(&mut app, before, "before the grant");
-    let grant = app
-        .world_mut()
-        .spawn((Grant(tool), Order(0), ChildOf(agent)))
-        .id();
+    let grant = app.world_mut().spawn((Grant(tool), ChildOf(agent))).id();
     let during = app.world_mut().spawn_run(agent, &[], "two", false, Some(1));
     settle(&mut app, during, "with the grant");
     app.world_mut().despawn(grant);
@@ -181,9 +166,9 @@ fn a_tool_granted_by_a_relationship_is_advertised_and_gone_after_removal() {
 #[test]
 fn uses_model_swapped_on_a_run_changes_the_next_requests_key() {
     let mut app = app();
-    let (default_model, default_requests) = Capturing::new("t/model:default", "from default");
+    let (default_model, default_requests) = Capturing::new(MODEL, "from default");
     let (fast_model, fast_requests) = Capturing::new("t/model:fast", "from fast");
-    let default_model = register(&mut app, "t/model:default", default_model);
+    let default_model = register(&mut app, MODEL, default_model);
     let fast_model = register(&mut app, "t/model:fast", fast_model);
     EffectLogResource::install(app.world_mut(), EffectLogRecorder::new());
     let agent = spawn_agent(app.world_mut(), "t", default_model);
@@ -217,8 +202,8 @@ fn patch_temperature(mut effects: Query<&mut PendingEffect, Added<PendingEffect>
 #[test]
 fn a_patch_system_rewrites_the_folded_request_and_the_record_holds_it() {
     let mut app = app();
-    let (model, requests) = Capturing::new("t/model:default", "ok");
-    let model = register(&mut app, "t/model:default", model);
+    let (model, requests) = Capturing::new(MODEL, "ok");
+    let model = register(&mut app, MODEL, model);
     EffectLogResource::install(app.world_mut(), EffectLogRecorder::new());
     app.world_mut()
         .resource_mut::<Schedules>()
@@ -268,10 +253,8 @@ fn shout_the_prompt(
 #[test]
 fn a_system_before_assemble_rewrites_an_utterance() {
     let mut app = app();
-    let (model, requests) = Capturing::new("t/model:default", "ok");
-    let model = register(&mut app, "t/model:default", model);
+    let (agent, requests) = capturing_agent(&mut app, MODEL, MODEL, "ok");
     add_before_assemble(&mut app, shout_the_prompt);
-    let agent = spawn_agent(app.world_mut(), "t", model);
     let run = app
         .world_mut()
         .spawn_run(agent, &[], "quietly", false, Some(1));
@@ -299,8 +282,8 @@ fn stop_the_run(effects: Query<Entity, Added<PendingEffect>>, mut commands: Comm
 #[test]
 fn despawning_the_effect_in_patch_fails_the_run_cancelled() {
     let mut app = app();
-    let (model, requests) = Capturing::new("t/model:default", "ok");
-    let model = register(&mut app, "t/model:default", model);
+    let (model, requests) = Capturing::new(MODEL, "ok");
+    let model = register(&mut app, MODEL, model);
     EffectLogResource::install(app.world_mut(), EffectLogRecorder::new());
     app.world_mut()
         .resource_mut::<Schedules>()
@@ -327,4 +310,21 @@ fn despawning_the_effect_in_patch_fails_the_run_cancelled() {
         log.records.is_empty(),
         "despawned before dispatch: no record"
     );
+}
+
+/// The runtime's diagnostics are `bevy_diagnostic`'s: a run in flight is a
+/// measurement `LogDiagnosticsPlugin` would print.
+#[test]
+fn the_runtime_measures_itself_into_bevy_diagnostics() {
+    use bevy_diagnostic::DiagnosticsStore;
+    use rig_ecs::systems::diagnostics::RUNS_LIVE;
+    let mut app = app();
+    let (agent, _) = capturing_agent(&mut app, "t/model:m", "m", "hello");
+    let run = app.world_mut().spawn_run(agent, &[], "hi", false, None);
+    app.update();
+    ended(&mut app, run, "settled");
+    let store = app.world().resource::<DiagnosticsStore>();
+    let live = store.get(&RUNS_LIVE).expect("registered");
+    assert_eq!(live.value(), Some(0.0));
+    assert!(live.history_len() >= 1);
 }

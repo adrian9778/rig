@@ -1,19 +1,15 @@
-//! Typed custom answers retain every JSON shape through logs and scenes.
-
-#![allow(
-    clippy::expect_used,
-    clippy::unwrap_used,
-    clippy::indexing_slicing,
-    clippy::panic
-)]
+//! Typed custom answers retain every JSON shape through logs and checkpoints.
 
 use crate::bus_support;
 
+use rig_cassette::ecs::EffectLogResource;
+use rig_cassette::ecs::Replay;
+use rig_cassette::effect_log::{EffectLog, EffectLogRecorder};
 use rig_core::effect::CustomEffect;
-use rig_ecs::bus::{
-    Answer, Asked, EffectLogResource, EffectOutcome, Handlers, PendingEffect, Replay, Scene,
+use rig_ecs::{
+    bus::{Answer, Asked, EffectOutcome, Handlers, PendingEffect},
+    checkpoint::load_world,
 };
-use rig_effect_log::{EffectLog, EffectLogRecorder};
 use serde_json::{Value, json};
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -25,7 +21,7 @@ impl CustomEffect for Echo {
 }
 
 #[test]
-fn typed_json_answers_round_trip_through_log_replay_and_scene() {
+fn typed_json_answers_round_trip_through_log_replay_and_checkpoint() {
     for value in [
         json!("approved"),
         json!(42),
@@ -48,7 +44,7 @@ impl CustomEffect for Approval {
 }
 
 #[test]
-fn typed_string_answer_keeps_its_type_through_log_replay_and_scene() {
+fn typed_string_answer_keeps_its_type_through_log_replay_and_checkpoint() {
     assert_persists(Approval, "approved".to_owned());
 }
 
@@ -89,15 +85,12 @@ where
         &serde_json::to_string(&log).expect("every JSON answer is persistable"),
     )
     .unwrap();
-    let scene = Scene::save(live.world_mut());
-    let scene: Scene = serde_json::from_str(&serde_json::to_string(&scene).unwrap()).unwrap();
+    let saved = bus_support::checkpoint(&mut live);
 
     let mut replay = bus_support::app();
-    Handlers::with(replay.world_mut(), |handlers| {
-        Replay::default().register(handlers, &log)
-    })
-    .unwrap()
-    .unwrap();
+    Replay::default()
+        .register(replay.world_mut(), &log)
+        .unwrap();
     let replayed = Replay::load(replay.world_mut(), &log)[0];
     bus_support::tick_until(&mut replay, "replayed answer", |world| {
         world.get::<EffectOutcome>(replayed).is_some()
@@ -113,7 +106,8 @@ where
     );
 
     let mut restored = bus_support::app();
-    let loaded = scene.load(restored.world_mut()).unwrap()[0];
+    let loaded = load_world(&saved, restored.world_mut()).unwrap();
+    let loaded = loaded.with::<PendingEffect>(restored.world())[0];
     restored.update();
     assert_eq!(
         restored

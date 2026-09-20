@@ -2,13 +2,6 @@
 //! that is never called, an app with both plugins, and the tick guard.
 
 #![allow(dead_code, reason = "each suite uses the part of the support it needs")]
-#![allow(
-    clippy::expect_used,
-    clippy::unwrap_used,
-    clippy::indexing_slicing,
-    clippy::panic,
-    reason = "test support fails immediately when a fixture invariant is violated"
-)]
 
 use rig_core::serve::Dispatch;
 use std::{
@@ -16,22 +9,23 @@ use std::{
     time::{Duration, Instant},
 };
 
-use bevy_app::{App, Update};
+use bevy_app::App;
 use bevy_ecs::{prelude::*, schedule::LogLevel};
 use rig_core::{
     completion::{CompletionRequest, CompletionResponse, ModelRef, ProviderCapabilities, Usage},
     effect::{EffectKind, FamilyDescriptor, HandlerDescriptor, HandlerKey, Outcome},
     error::{ErrorKind, ErrorReport},
-    message::AssistantContent,
+    message::{AssistantContent, Message},
     serve::{Serve, ServingPolicy},
 };
 use rig_ecs::{
     agent::{
-        AdditionalParams, DefaultMaxTurns, InvalidCalls, MaxTokens, MaxTurns, Output, Owner,
-        Preamble, Temperature, ToolChoiceSpec, UsesModel,
+        AdditionalParams, DefaultMaxTurns, Failed, InvalidCalls, MaxTokens, MaxTurns, Output,
+        Owner, Preamble, Settled, Temperature, ToolChoiceSpec, UsesModel, Utterance,
+        content::parts::read_message,
     },
-    bus::{Bus, run_to_quiescence},
-    systems::install_agent,
+    bus::{BusPlugin, Handlers, PendingEffect},
+    systems::AgentPlugin,
 };
 
 pub const GUARD: Duration = Duration::from_secs(10);
@@ -77,7 +71,7 @@ impl Serve for Capturing {
                 self.requests.lock().expect("requests").push(request);
                 let response = CompletionResponse::new(
                     vec![AssistantContent::text(&self.answer)],
-                    Usage::new(),
+                    Usage::default(),
                     "capturing",
                 );
                 rig_core::serve::Reply::Outcome(Ok(Outcome::Completion(response)))
@@ -123,11 +117,11 @@ impl Serve for NeverCalled {
 /// error level, the runner in `Update`.
 pub fn app() -> App {
     let mut app = App::new();
-    Bus::with_policy(ServingPolicy::default())
-        .ambiguity_detection(LogLevel::Error)
-        .install(app.world_mut());
-    install_agent(app.world_mut());
-    app.add_systems(Update, run_to_quiescence);
+    app.add_plugins(
+        rig_ecs::RigPlugin::with_policy(ServingPolicy::default())
+            .ambiguity_detection(LogLevel::Error),
+    );
+    app.add_plugins(rig_cassette::ecs::ReplayPlugin);
     app.finish();
     app.cleanup();
     app
@@ -280,7 +274,7 @@ impl Serve for Scripted {
                     .expect("turns")
                     .pop_front()
                     .unwrap_or_else(|| vec![AssistantContent::text("done")]);
-                let response = CompletionResponse::new(choice, Usage::new(), "scripted");
+                let response = CompletionResponse::new(choice, Usage::default(), "scripted");
                 rig_core::serve::Reply::Outcome(Ok(Outcome::Completion(response)))
             }
             other => rig_core::serve::Reply::Outcome(Err(ErrorReport::new(
@@ -355,4 +349,112 @@ impl Serve for Adder {
             )),
         }))
     }
+}
+
+/// The requests a registered model kept, shared with the test.
+pub type RequestsSeen = Arc<Mutex<Vec<CompletionRequest>>>;
+
+/// A [`Scripted`] model registered under `key`, and an agent over it.
+pub fn scripted_agent(
+    app: &mut App,
+    key: &str,
+    turns: Vec<Vec<AssistantContent>>,
+) -> (Entity, RequestsSeen) {
+    let (model, requests) = Scripted::new(key, turns);
+    let model = register(app, key, model);
+    (spawn_agent(app.world_mut(), "t", model), requests)
+}
+
+/// A [`Capturing`] model registered under `key`, labelled `label` in its
+/// own descriptor, and an agent over it.
+pub fn capturing_agent(
+    app: &mut App,
+    key: &str,
+    label: &str,
+    answer: &str,
+) -> (Entity, RequestsSeen) {
+    let (model, requests) = Capturing::new(label, answer);
+    let model = register(app, key, model);
+    (spawn_agent(app.world_mut(), "t", model), requests)
+}
+
+/// Tick until `run` settled or failed, or fail after [`GUARD`].
+pub fn ended(app: &mut App, run: Entity, what: &str) {
+    tick_until(app, what, |world| {
+        world.get::<Settled>(run).is_some() || world.get::<Failed>(run).is_some()
+    });
+}
+
+/// A bare world with the bus and the agent installed, an open completion
+/// handler under `model`, and one agent over it.
+pub fn open_model_world() -> (World, Entity) {
+    let mut world = World::new();
+    BusPlugin::with_policy(ServingPolicy::default()).install(&mut world);
+    AgentPlugin::install(&mut world);
+    rig_ecs::checkpoint::register_types(&mut world);
+    let model = Handlers::with(&mut world, |handlers| {
+        handlers.register_open(
+            "model",
+            FamilyDescriptor::Completion {
+                model: ModelRef::new("model"),
+                capabilities: ProviderCapabilities::default(),
+            },
+        )
+    })
+    .unwrap()
+    .unwrap();
+    let agent = world.spawn((Owner("owner".into()), UsesModel(model))).id();
+    (world, agent)
+}
+
+/// The one utterance `ChildOf` `run`.
+pub fn first_utterance(world: &mut World, run: Entity) -> Entity {
+    world
+        .query_filtered::<(Entity, &ChildOf), With<Utterance>>()
+        .iter(world)
+        .find(|(_, parent)| parent.parent() == run)
+        .unwrap()
+        .0
+}
+
+/// The utterances `ChildOf` `run`, in sibling (`Children`) order.
+pub fn utterances_of(world: &mut World, run: Entity) -> Vec<Entity> {
+    world
+        .get::<Children>(run)
+        .into_iter()
+        .flat_map(|children| children.iter())
+        .filter(|child| world.get::<Utterance>(*child).is_some())
+        .collect()
+}
+
+/// The fresh, uncached render of `run`'s history, as the DTOs the graph
+/// reconstructs.
+pub fn graph_messages(world: &mut World, run: Entity) -> Vec<Message> {
+    utterances_of(world, run)
+        .into_iter()
+        .map(|entity| read_message(world, entity).unwrap().to_message())
+        .collect()
+}
+
+/// The completion requests folded under `run`, by turn order (the run's
+/// sibling order).
+pub fn requests(world: &mut World, run: Entity) -> Vec<CompletionRequest> {
+    let turns: Vec<Entity> = world
+        .get::<Children>(run)
+        .into_iter()
+        .flat_map(|children| children.iter())
+        .collect();
+    let mut found: Vec<_> = world
+        .query::<(&PendingEffect, &ChildOf)>()
+        .iter(world)
+        .filter_map(|(effect, parent)| match &effect.kind {
+            EffectKind::Completion { request, .. } => {
+                let position = turns.iter().position(|turn| *turn == parent.parent())?;
+                Some((position, request.clone()))
+            }
+            _ => None,
+        })
+        .collect();
+    found.sort_by_key(|(position, _)| *position);
+    found.into_iter().map(|(_, request)| request).collect()
 }

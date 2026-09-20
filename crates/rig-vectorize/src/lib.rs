@@ -10,8 +10,8 @@
 //! use rig_core::providers::openai;
 //! use rig_vectorize::VectorizeVectorStore;
 //!
-//! let openai = openai::Client::from_env()?;
-//! let embedding_model = openai.embedding_model(openai::TEXT_EMBEDDING_3_SMALL);
+//! let openai = openai::wire::OpenAI::from_env()?.bound()?;
+//! let embedding_model = openai.embedding(openai::TEXT_EMBEDDING_3_SMALL, None);
 //!
 //! let vector_store = VectorizeVectorStore::new(
 //!     embedding_model,
@@ -34,8 +34,9 @@ use client::{QueryRequest as ApiQueryRequest, VectorInput as ApiVectorInput};
 use rig_core::embeddings::EmbeddingModel;
 use rig_core::vector_store::request::VectorSearchRequest;
 use rig_core::vector_store::{InsertDocuments, VectorStoreError, VectorStoreIndex};
+use rig_core::wasm_compat::WasmCompatSend;
 use rig_core::{Embed, embeddings::Embedding};
-use serde::{Deserialize, Serialize};
+use serde::{Serialize, de::DeserializeOwned};
 use uuid::Uuid;
 
 impl From<VectorizeError> for VectorStoreError {
@@ -115,7 +116,7 @@ impl<M: EmbeddingModel> VectorizeVectorStore<M> {
 impl<M: EmbeddingModel> VectorStoreIndex for VectorizeVectorStore<M> {
     type Filter = VectorizeFilter;
 
-    async fn top_n<T: for<'a> Deserialize<'a> + Send>(
+    async fn top_n<T: DeserializeOwned + WasmCompatSend>(
         &self,
         req: VectorSearchRequest<Self::Filter>,
     ) -> Result<Vec<(f64, String, T)>, VectorStoreError> {
@@ -146,7 +147,7 @@ impl<M: EmbeddingModel> VectorStoreIndex for VectorizeVectorStore<M> {
 }
 
 impl<M: EmbeddingModel> InsertDocuments for VectorizeVectorStore<M> {
-    async fn insert_documents<Doc: Serialize + Embed + Send>(
+    async fn insert_documents<Doc: Serialize + Embed + WasmCompatSend>(
         &self,
         documents: Vec<(Doc, Vec<Embedding>)>,
     ) -> Result<(), VectorStoreError> {

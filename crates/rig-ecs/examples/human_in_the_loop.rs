@@ -11,7 +11,6 @@
     clippy::unwrap_used,
     clippy::indexing_slicing,
     clippy::panic,
-    clippy::type_complexity,
     reason = "an example: user code, thirty lines, a mock behind it"
 )]
 
@@ -25,7 +24,7 @@ use rig_core::{
     message::AssistantContent,
 };
 use rig_ecs::{
-    agent::{Order, ToolCallSlot, Turn},
+    agent::{ToolCallSlot, Turn},
     bus::{Handlers, PendingEffect, RigSchedule},
     prelude::*,
     systems::RunCommands,
@@ -54,7 +53,7 @@ fn ask(mut handlers: Handlers, mut commands: Commands) {
         "You are an assistant with an email tool.",
         2,
     );
-    commands.spawn((Grant(tools[0]), Order(0), ChildOf(agent)));
+    commands.spawn((Grant(tools[0]), ChildOf(agent)));
     commands.queue(move |world: &mut World| {
         world.spawn_run(agent, &[], "Email Ada to say hello.", false, None);
     });

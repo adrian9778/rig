@@ -1,13 +1,12 @@
 //! Execution permissions are distinct from the request's advertisements.
 //! Synthetic models make denied and unadvertised calls deliberately; provider
 //! recordings cannot guarantee these adversarial choices on every recapture.
-#![allow(clippy::expect_used, clippy::indexing_slicing)]
 use crate::run_support;
 
 use bevy_ecs::prelude::*;
 use rig_core::{effect::HandlerKey, message::AssistantContent};
 use rig_ecs::{
-    agent::{Failed, Failure, Grant, Order, Settled, ToolAccess, Turn},
+    agent::{Failed, Failure, Grant, ToolAccess, Turn},
     systems::RunCommands,
 };
 use run_support::*;
@@ -28,8 +27,7 @@ fn empty_permission_set_denies_an_advertised_executable_tool() {
     let peak = tool.peak.clone();
     let tool = register(&mut app, "adder", tool);
     let agent = spawn_agent(app.world_mut(), "test", model);
-    app.world_mut()
-        .spawn((Grant(tool), Order(0), ChildOf(agent)));
+    app.world_mut().spawn((Grant(tool), ChildOf(agent)));
     app.world_mut().entity_mut(agent).insert(ToolAccess {
         allowed: Some(BTreeSet::new()),
         ..Default::default()
@@ -87,9 +85,7 @@ fn explicit_execution_binding_can_serve_an_unadvertised_tool() {
         allowed: None,
     });
     let run = app.world_mut().spawn_run(agent, &[], "add", false, Some(2));
-    tick_until(&mut app, "hidden tool completes", |world| {
-        world.get::<Settled>(run).is_some() || world.get::<Failed>(run).is_some()
-    });
+    ended(&mut app, run, "hidden tool completes");
     assert!(
         app.world().get::<Failed>(run).is_none(),
         "{:?}",
@@ -103,7 +99,7 @@ fn explicit_execution_binding_can_serve_an_unadvertised_tool() {
 
 #[test]
 fn permission_and_binding_changes_affect_replay_identity_and_required_row() {
-    use rig_ecs::replay::{required_row, spec_hash};
+    use rig_cassette::ecs::identity::{required_row, spec_hash};
     let mut app = app();
     let (model, _) = Capturing::new("model", "ok");
     let model = register(&mut app, "model", model);
@@ -181,9 +177,9 @@ fn unadvertised_execution_binding_cannot_impersonate_output_tool() {
 
 #[test]
 fn turn_snapshot_and_old_execution_dependency_survive_fresh_world() {
-    use rig_ecs::agent::{
-        Outputs, Run,
-        scene::{load_world, save_world},
+    use rig_ecs::{
+        agent::{Outputs, Run},
+        checkpoint::{Checkpoint, load_world, save_world},
     };
     let mut first = app();
     let (model, _) = Capturing::new("model", "unused");
@@ -201,7 +197,6 @@ fn turn_snapshot_and_old_execution_dependency_survive_fresh_world() {
     };
     first.world_mut().spawn((
         Turn,
-        Order(99),
         access.clone(),
         Outputs {
             stream_validated: 4,
@@ -214,15 +209,14 @@ fn turn_snapshot_and_old_execution_dependency_survive_fresh_world() {
         allowed: Some(BTreeSet::new()),
         ..Default::default()
     });
-    let row = rig_ecs::replay::required_row(first.world_mut(), run);
-    let scene = save_world(first.world_mut()).expect("save graph");
-    let scene =
-        serde_json::from_slice(&serde_json::to_vec(&scene).expect("encode")).expect("decode");
+    let row = rig_cassette::ecs::identity::required_row(first.world_mut(), run);
+    let checkpoint = save_world(first.world_mut()).expect("save graph");
+    let checkpoint = Checkpoint::from_json(&checkpoint.to_json().expect("encode")).expect("decode");
     drop(first);
     let mut restored = app();
     let (model, _) = Capturing::new("model", "unused");
     register(&mut restored, "model", model);
-    load_world(&scene, restored.world_mut()).expect("restore graph");
+    load_world(&checkpoint, restored.world_mut()).expect("restore graph");
     let run = restored
         .world_mut()
         .query_filtered::<Entity, With<Run>>()
@@ -237,7 +231,7 @@ fn turn_snapshot_and_old_execution_dependency_survive_fresh_world() {
     assert_eq!(outputs.stream_validated, 4);
     assert!(outputs.usage_recorded);
     assert_eq!(
-        rig_ecs::replay::required_row(restored.world_mut(), run),
+        rig_cassette::ecs::identity::required_row(restored.world_mut(), run),
         row
     );
     let mut expected = rig_core::effect::EffectRow::new();

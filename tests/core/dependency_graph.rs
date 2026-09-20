@@ -1,135 +1,157 @@
 //! Dependency-graph invariants for the runtime/transport-agnostic split.
 //!
-//! The crate boundaries that keep rig usable from non-tokio hosts are
-//! enforced here rather than by convention: rig-core and rig-agent carry no
-//! runtime or transport, MCP is an rig-core-only leaf, and the facade with
-//! only `agent` + `derive` pulls in none of tokio / reqwest / rmcp. Each check
-//! asks Cargo for the resolved normal (non-dev, non-build) dependency graph of
-//! one package and asserts the forbidden crates are absent.
+//! Runtime crates retain only execution mechanisms and the shared vocabulary.
+//! Concrete recording and replay live in rig-cassette, whose runtime adapters
+//! and native HTTP engine are independently selectable. Workspace graph checks
+//! cover runtime back-edges; separate downstream manifests prove cassette
+//! feature isolation without workspace dev-dependency unification.
 
 use std::process::Command;
 
-/// `cargo tree -e normal --prefix none` for `package` with extra `args`,
-/// returned as the set of package names in the graph.
-fn normal_dependency_names(package: &str, args: &[&str]) -> Vec<String> {
+use super::verification_checks;
+
+/// `(package, `cargo tree` feature arguments, forbidden dependency names,
+/// required dependency names)`. The three lists are space-separated; empty
+/// features select the package's defaults.
+type Graph = (&'static str, &'static str, &'static str, &'static str);
+
+/// The ECS runtime owns its tasks and Bevy schedules, never a concrete recorder,
+/// another agent runtime, or a provider transport.
+const ECS_LEAF: &str = "rig-agent rig-cassette rig-effect-log rig-rmcp rmcp bevy tokio reqwest";
+
+const GRAPHS: &[Graph] = &[
+    ("rig-core", "", "tokio reqwest rig-cassette", ""),
+    (
+        "rig-core",
+        "--all-features",
+        "tokio reqwest rig-agent rig-cassette rig-effect-log rig-ecs",
+        "",
+    ),
+    (
+        "rig-agent",
+        "",
+        "tokio reqwest rmcp rig-cassette rig-effect-log rig-ecs",
+        "rig-core",
+    ),
+    (
+        "rig-agent",
+        "--no-default-features",
+        "tokio reqwest rmcp rig-cassette rig-effect-log rig-ecs",
+        "rig-core",
+    ),
+    (
+        "rig-agent",
+        "--all-features",
+        "reqwest rmcp rig-cassette rig-effect-log rig-ecs",
+        "rig-core",
+    ),
+    (
+        "rig-ecs",
+        "",
+        "rig-agent rig-cassette rig-effect-log rig-rmcp rmcp bevy tokio reqwest bevy_asset",
+        "rig-core bevy_ecs bevy_tasks bevy_reflect bevy_app bevy_time bevy_diagnostic",
+    ),
+    (
+        "rig-ecs",
+        "--all-features",
+        ECS_LEAF,
+        "bevy_reflect bevy_asset bevy_app",
+    ),
+    ("rig-rmcp", "", "rig-agent rig-cassette", ""),
+    (
+        "rig",
+        "--no-default-features --features agent,derive",
+        "tokio reqwest rmcp rig-ecs",
+        "rig-core rig-agent rig-cassette",
+    ),
+];
+
+/// `cargo` with `args`, run from the workspace root; stdout on success.
+fn cargo_stdout(args: &[&str]) -> String {
     let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
     let output = Command::new(cargo)
         .current_dir(env!("CARGO_MANIFEST_DIR"))
-        .args([
-            "tree", "--locked", "-p", package, "-e", "normal", "--prefix", "none",
-        ])
         .args(args)
         .output()
-        .expect("cargo tree runs");
+        .expect("cargo runs");
     assert!(
         output.status.success(),
-        "cargo tree -p {package} failed:\n{}",
+        "cargo {} failed:\n{}",
+        args.join(" "),
         String::from_utf8_lossy(&output.stderr)
     );
-    String::from_utf8(output.stdout)
-        .expect("cargo tree output is utf-8")
+    String::from_utf8(output.stdout).expect("cargo output is utf-8")
+}
+
+/// `cargo tree -e normal --prefix none` for `package` under `features`, as the
+/// package names in the resolved graph.
+fn normal_dependency_names(package: &str, features: &str) -> Vec<String> {
+    let mut args = vec![
+        "tree", "--locked", "-p", package, "-e", "normal", "--target", "all", "--prefix", "none",
+    ];
+    args.extend(features.split_whitespace());
+    cargo_stdout(&args)
         .lines()
         .filter_map(|line| line.split_whitespace().next())
         .map(str::to_owned)
         .collect()
 }
 
-fn assert_absent(package: &str, args: &[&str], forbidden: &[&str]) {
-    let names = normal_dependency_names(package, args);
-    for crate_name in forbidden {
-        assert!(
-            !names.iter().any(|name| name == crate_name),
-            "`{package}` ({}) must not depend on `{crate_name}` through its normal dependencies",
-            if args.is_empty() {
-                "default features".to_owned()
-            } else {
-                args.join(" ")
-            }
-        );
+#[test]
+fn crate_boundaries_hold_in_the_resolved_dependency_graph() {
+    for (package, features, forbidden, required) in GRAPHS {
+        let names = normal_dependency_names(package, features);
+        let selection = if features.is_empty() {
+            "default features"
+        } else {
+            features
+        };
+        for crate_name in forbidden.split_whitespace() {
+            assert!(
+                !names.iter().any(|name| name == crate_name),
+                "`{package}` ({selection}) must not depend on `{crate_name}` through its normal dependencies"
+            );
+        }
+        for crate_name in required.split_whitespace() {
+            assert!(
+                names.iter().any(|name| name == crate_name),
+                "`{package}` ({selection}) must depend on `{crate_name}`"
+            );
+        }
     }
-}
 
-/// Shared cassette test support must remain usable outside either agent runtime.
-#[test]
-fn rig_cassette_does_not_depend_on_the_facade_or_agent_runtimes() {
-    let forbidden = ["rig", "rig-agent", "rig-ecs"];
-    assert_absent("rig-cassette", &[], &forbidden);
-    assert_absent("rig-cassette", &["--all-features"], &forbidden);
-    assert_absent(
-        "rig-cassette",
-        &["--no-default-features"],
-        &["aws-smithy-eventstream", "aws-smithy-types"],
-    );
-}
-
-#[test]
-fn rig_core_is_runtime_and_transport_free() {
-    assert_absent("rig-core", &[], &["tokio", "reqwest"]);
-    assert_absent("rig-core", &["--all-features"], &["tokio", "reqwest"]);
-}
-
-/// The frozen runtime's default graph carries no runtime or transport
-/// either (tokio is optional, under `test-utils`), and the dependency runs
-/// one way: rig-core knows nothing of the crates that drive its handlers.
-#[test]
-fn rig_agent_default_graph_is_runtime_free() {
-    assert_absent("rig-agent", &[], &["tokio", "reqwest"]);
-    assert_absent("rig-effect-log", &[], &["tokio", "reqwest"]);
-    assert_absent(
-        "rig-core",
-        &["--all-features"],
-        &["rig-agent", "rig-effect-log", "rig-ecs"],
-    );
-}
-
-/// The recorder is a handler-side seam (`rig_core::serve::Recorder`) and
-/// the serving policy a serve-side type (`rig_core::serve::ServingPolicy`),
-/// so the log crate needs no runtime at all: registering a log's replayers
-/// on a driver is each runtime's own (`rig_agent::bus::replay`, rig-ecs's
-/// `Replay`). rig-effect-log depends on rig-core alone, under every
-/// feature.
-#[test]
-fn rig_effect_log_depends_on_rig_core_only() {
-    let forbidden = ["rig-agent", "rig-ecs", "tokio", "reqwest", "bevy_ecs"];
-    assert_absent("rig-effect-log", &[], &forbidden);
-    assert_absent("rig-effect-log", &["--all-features"], &forbidden);
-    let names = normal_dependency_names("rig-effect-log", &[]);
-    assert!(
-        names.iter().any(|name| name == "rig-core"),
-        "rig-effect-log depends on rig-core"
-    );
-}
-
-/// rig-ecs is the bus in a Bevy `World`: on the rig side exactly rig-core
-/// and rig-effect-log (the `replay` feature), never rig-agent — its driver
-/// is a system, not a client of rig-agent's bus, and the agent half is a
-/// rewrite held to rig-agent's bytes by the corpus alone — never the `bevy` facade, no
-/// runtime, no transport, no MCP. On the Bevy side exactly `bevy_ecs` and
-/// `bevy_tasks`: the bus installs into a `World` and the host owns the
-/// loop, so `bevy_app` is absent by default and joins only with `assets`
-/// (`bevy_asset` is built on it). Reflection and assets are features:
-/// `bevy_reflect` and `bevy_asset` are absent by default and present with
-/// every feature on (programme stage 6), and nothing else joins either way.
-#[test]
-fn rig_ecs_is_rig_core_and_bevy_only() {
-    let forbidden = ["rig-agent", "rig-rmcp", "rmcp", "bevy", "tokio", "reqwest"];
-    assert_absent("rig-ecs", &[], &forbidden);
-    assert_absent("rig-ecs", &[], &["bevy_app", "bevy_reflect", "bevy_asset"]);
-    // Metadata includes optional and target-specific declarations, and names
-    // the package even when a dependency has been renamed in the manifest.
-    let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
-    let output = Command::new(cargo)
-        .current_dir(env!("CARGO_MANIFEST_DIR"))
-        .args(["metadata", "--locked", "--no-deps", "--format-version", "1"])
-        .output()
-        .expect("cargo metadata runs");
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let metadata: serde_json::Value =
-        serde_json::from_slice(&output.stdout).expect("metadata JSON");
+    // Optional and target-specific declarations, and manifest renames, show up
+    // only in the metadata: rig-ecs directly owns its handler tasks
+    // (`bevy_tasks`), its bounded private delivery queue (`futures`) and the
+    // explicit web runtime selection that browser task driving needs
+    // (`bevy_platform`) — and declares nothing else.
+    let metadata: serde_json::Value = serde_json::from_str(&cargo_stdout(&[
+        "metadata",
+        "--locked",
+        "--no-deps",
+        "--format-version",
+        "1",
+    ]))
+    .expect("metadata JSON");
+    for runtime in ["rig-agent", "rig-ecs"] {
+        let package = metadata["packages"]
+            .as_array()
+            .expect("packages")
+            .iter()
+            .find(|package| package["name"] == runtime)
+            .expect("runtime package");
+        for dependency in package["dependencies"].as_array().expect("dependencies") {
+            if dependency["kind"].is_null() {
+                assert!(
+                    !matches!(
+                        dependency["name"].as_str(),
+                        Some("rig-cassette" | "rig-effect-log")
+                    ),
+                    "{runtime} must not declare a concrete recording dependency, even optional or target-specific: {dependency}"
+                );
+            }
+        }
+    }
     let package = metadata["packages"]
         .as_array()
         .expect("packages")
@@ -149,97 +171,172 @@ fn rig_ecs_is_rig_core_and_bevy_only() {
             "rig-ecs must not depend directly on {forbidden}"
         );
     }
-    assert!(
-        direct.contains(&"futures"),
-        "ECS owns a bounded private delivery queue"
-    );
-    assert!(
-        direct.contains(&"bevy_platform"),
-        "browser task driving selects the web runtime explicitly"
-    );
-    assert!(
-        direct.contains(&"bevy_tasks"),
-        "rig-ecs directly owns handler tasks"
-    );
-    assert_absent("rig-ecs", &["--all-features"], &forbidden);
-    assert_absent("rig-ecs", &["--features", "reflect"], &["bevy_app"]);
-    assert_absent("rig-ecs", &["--no-default-features"], &["rig-effect-log"]);
-    let names = normal_dependency_names("rig-ecs", &[]);
-    for required in ["rig-core", "rig-effect-log", "bevy_ecs", "bevy_tasks"] {
+    for required in ["futures", "bevy_platform", "bevy_tasks"] {
         assert!(
-            names.iter().any(|name| name == required),
-            "`rig-ecs` must depend on `{required}`"
-        );
-    }
-    let with_features = normal_dependency_names("rig-ecs", &["--all-features"]);
-    for feature_dependency in ["bevy_reflect", "bevy_asset", "bevy_app"] {
-        assert!(
-            with_features.iter().any(|name| name == feature_dependency),
-            "`rig-ecs` (--all-features) must depend on `{feature_dependency}`"
+            direct.contains(&required),
+            "rig-ecs must depend directly on {required}"
         );
     }
 }
 
-/// With default features on, and — the shape a host that steps `AgentRun`
-/// itself depends on — with them off: rig-agent is a runtime-free crate.
 #[test]
-fn rig_agent_carries_no_runtime_or_mcp() {
-    assert_absent("rig-agent", &[], &["tokio", "rmcp"]);
-    assert_absent(
-        "rig-agent",
-        &["--no-default-features"],
-        &["tokio", "rmcp", "reqwest"],
-    );
-}
-
-/// rig-agent's `run` layer and rig-core's transcript invariants never await:
-/// they are data and transitions only, so a futures loop and an ECS schedule
-/// can step the same code. Checked at the source level because both crates
-/// legitimately depend on `futures` elsewhere.
-#[test]
-fn run_vocabulary_sources_contain_no_async() {
+fn cassette_features_are_isolated_for_downstream_consumers() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-    let sources = [
-        "crates/rig-core/src/transcript.rs",
-        "crates/rig-agent/src/run/mod.rs",
-        "crates/rig-agent/src/run/output.rs",
-        "crates/rig-agent/src/run/patch.rs",
-        "crates/rig-agent/src/run/policy.rs",
-        "crates/rig-agent/src/run/prepare.rs",
-        "crates/rig-agent/src/run/response.rs",
-        "crates/rig-agent/src/run/spec.rs",
-        "crates/rig-agent/src/run/streamed.rs",
-        "crates/rig-agent/src/run/transcript.rs",
-    ];
-    let mut offenders = Vec::new();
-    for relative in sources {
-        let path = root.join(relative);
-        let text = std::fs::read_to_string(&path)
-            .unwrap_or_else(|err| panic!("{relative} is readable: {err}"));
-        if text.contains("async fn")
-            || text.contains(".await")
-            || text.contains("async_stream")
-            || text.contains("futures::")
-        {
-            offenders.push(relative);
+    let path = serde_json::to_string(&root.join("crates/rig-cassette")).expect("manifest path");
+    for (features, forbidden, required) in [
+        (
+            "",
+            "rig rig-agent rig-ecs bevy_app bevy_ecs bevy_tasks tokio reqwest rig-reqwest axum httpmock aws-smithy-eventstream aws-smithy-types",
+            "rig-core",
+        ),
+        (
+            "agent",
+            "rig rig-ecs bevy_app bevy_ecs bevy_tasks tokio reqwest rig-reqwest axum httpmock aws-smithy-eventstream aws-smithy-types",
+            "rig-core rig-agent",
+        ),
+        (
+            "ecs",
+            "rig rig-agent tokio reqwest rig-reqwest axum httpmock aws-smithy-eventstream aws-smithy-types",
+            "rig-core rig-ecs bevy_app bevy_ecs",
+        ),
+        (
+            "agent,ecs",
+            "rig tokio reqwest rig-reqwest axum httpmock aws-smithy-eventstream aws-smithy-types",
+            "rig-core rig-agent rig-ecs",
+        ),
+        (
+            "http",
+            "rig rig-agent rig-ecs bevy_app bevy_ecs aws-smithy-eventstream aws-smithy-types",
+            "rig-core rig-reqwest reqwest tokio axum httpmock",
+        ),
+        (
+            "bedrock",
+            "rig rig-agent rig-ecs bevy_app bevy_ecs",
+            "rig-core rig-reqwest aws-smithy-eventstream aws-smithy-types",
+        ),
+    ] {
+        let scratch = assert_fs::TempDir::new().expect("isolated downstream package");
+        std::fs::create_dir(scratch.path().join("src")).expect("source directory");
+        std::fs::write(
+            scratch.path().join("src/lib.rs"),
+            "pub use rig_cassette::effect_log::EffectLog;\n",
+        )
+        .expect("consumer source");
+        let selected: Vec<_> = features
+            .split(',')
+            .filter(|feature| !feature.is_empty())
+            .collect();
+        let selected = serde_json::to_string(&selected).expect("feature list");
+        std::fs::write(
+            scratch.path().join("Cargo.toml"),
+            format!(
+                "[package]\nname = \"cassette-feature-probe\"\nversion = \"0.0.0\"\nedition = \"2024\"\n[workspace]\n[dependencies]\nrig-cassette = {{ path = {path}, features = {selected} }}\n"
+            ),
+        )
+        .expect("consumer manifest");
+        std::fs::copy(root.join("Cargo.lock"), scratch.path().join("Cargo.lock"))
+            .expect("seed locked dependency versions");
+        let output = Command::new(std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into()))
+            .current_dir(scratch.path())
+            .args([
+                "tree",
+                "--offline",
+                "-e",
+                "normal",
+                "--target",
+                "all",
+                "--prefix",
+                "none",
+                "--format",
+                "{p} {f}",
+            ])
+            .output()
+            .expect("resolve isolated downstream");
+        assert!(
+            output.status.success(),
+            "{features}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let graph = String::from_utf8(output.stdout).expect("graph UTF-8");
+        let names: Vec<_> = graph
+            .lines()
+            .filter_map(|line| line.split_whitespace().next())
+            .collect();
+        for name in forbidden.split_whitespace() {
+            assert!(
+                !names.contains(&name),
+                "{features} unexpectedly enables {name}:\n{graph}"
+            );
+        }
+        for name in required.split_whitespace() {
+            assert!(
+                names.contains(&name),
+                "{features} is missing {name}:\n{graph}"
+            );
+        }
+        if !matches!(features, "http" | "bedrock") {
+            let json = graph
+                .lines()
+                .find(|line| line.starts_with("serde_json "))
+                .expect("JSON dependency");
+            for feature in ["preserve_order", "float_roundtrip"] {
+                assert!(
+                    !json.contains(feature),
+                    "{features} must not enable serde_json/{feature}: {json}"
+                );
+            }
         }
     }
-    assert!(
-        offenders.is_empty(),
-        "the run vocabulary and AgentRun must stay sans-IO (no `async fn`/`.await`/`async_stream`/`futures::`); found in: {offenders:?}"
-    );
 }
 
 #[test]
-fn rig_rmcp_depends_on_rig_core_only() {
-    assert_absent("rig-rmcp", &[], &["rig-agent"]);
-}
-
-#[test]
-fn facade_agent_derive_is_runtime_transport_and_mcp_free() {
-    assert_absent(
-        "rig",
-        &["--no-default-features", "--features", "agent,derive"],
-        &["tokio", "reqwest", "rmcp"],
-    );
+fn standalone_verification_preserves_minimal_json_features() {
+    let checks = verification_checks::all();
+    let mut packages = std::collections::BTreeSet::new();
+    for id in ["bus-verification", "ecs-parity"] {
+        let check = checks
+            .iter()
+            .find(|check| check.id == id)
+            .expect("CI check");
+        let standalone = check
+            .steps
+            .iter()
+            .find(|step| step.args.windows(2).any(|pair| pair == ["--retries", "0"]))
+            .expect("standalone verification execution");
+        packages.insert(
+            standalone
+                .args
+                .windows(2)
+                .find(|pair| pair[0] == "-p")
+                .expect("standalone package selection")[1]
+                .as_str(),
+        );
+    }
+    for package in packages {
+        let graph = cargo_stdout(&[
+            "tree",
+            "--locked",
+            "--offline",
+            "-p",
+            package,
+            "--all-features",
+            "-e",
+            "normal,dev",
+            "--invert",
+            "serde_json",
+            "--depth",
+            "0",
+            "--prefix",
+            "none",
+            "--format",
+            "{p} {f}",
+        ]);
+        assert!(graph.lines().any(|line| line.starts_with("serde_json ")));
+        for feature in ["preserve_order", "float_roundtrip"] {
+            assert!(
+                !graph.contains(feature),
+                "{package} must replay goldens without serde_json/{feature}:\n{graph}"
+            );
+        }
+    }
 }

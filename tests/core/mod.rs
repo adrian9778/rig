@@ -1,11 +1,10 @@
 //! The root package's own tests: guards that scan the source tree and the
 //! fixture runners, which need the repository root. Behaviour of the bus and
-//! the agent over it is verified in `crates/rig-verify`; provider behaviour
+//! the agent over it is verified in `crates/rig-cassette`; provider behaviour
 //! in `tests/providers`; anything needing crate-private types stays a unit
 //! test in its crate.
 
 mod agent_run_stepper;
-mod bevy_pin;
 mod dependency_graph;
 #[cfg(feature = "derive")]
 mod embed_macro;
@@ -25,16 +24,15 @@ mod golden_pairing;
 mod golden_recovery;
 mod loaders;
 mod no_random_ids;
-mod one_erasure;
 mod prompt_response_messages;
-mod provider_layout;
 mod reasoning_stream_stats;
-mod rig_ecs_bus_module;
-mod stream_ids;
+#[cfg(feature = "derive")]
+mod rig_tool_facade;
 mod streaming_conformance;
 mod streaming_conformance_registry;
 mod streaming_conformance_suites;
-#[cfg(feature = "derive")]
-mod tool_macro;
+#[allow(dead_code)]
+#[path = "../../xtask/src/verify/checks.rs"]
+mod verification_checks;
 
 mod pull_parser;

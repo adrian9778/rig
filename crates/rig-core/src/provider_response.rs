@@ -26,10 +26,9 @@ pub struct ProviderResponseError {
     pub provider_request_id: Option<String>,
     /// The response's headers, verbatim, when the capture path had them in
     /// hand — the rate-limit metadata (`Retry-After`, `x-ratelimit-*`) a
-    /// caller needs to back off correctly after a 429 (rig#2210). Boxed to
-    /// keep this error small enough for `clippy::result_large_err`. `None`
+    /// caller needs to back off correctly after a 429 (rig#2210). `None`
     /// means "not captured", never "the response had no headers".
-    pub headers: Option<Box<http::HeaderMap>>,
+    pub headers: Option<http::HeaderMap>,
     /// The provider's own machine-readable code for the failure, when the
     /// transport reported one apart from the body: a gRPC status code name
     /// (`UNAVAILABLE`), an AWS exception type (`ThrottlingException`).
@@ -106,17 +105,23 @@ impl ProviderResponseError {
     }
 
     /// Whether the same call may reasonably be retried: by the status when
-    /// the reply has one ([`crate::error::retryable_status`]), else by the
-    /// transport's own verdict, else not — a reply that says nothing about
-    /// itself is not retried on a guess. A refusal is never retried: the
-    /// provider judged the content, and the same call gets the same verdict.
+    /// the reply has a non-success one ([`crate::error::retryable_status`]),
+    /// else by the transport's own verdict, else not — a reply that says
+    /// nothing about itself is not retried on a guess. A success status says
+    /// nothing either: an error envelope delivered under a 200 (a blocked
+    /// prompt, a 2xx error body) classifies by the verdict the decoder
+    /// attached, exactly as it would with no status at all. A refusal is
+    /// never retried: the provider judged the content, and the same call
+    /// gets the same verdict.
     pub fn is_retryable(&self) -> bool {
         if self.refusal {
             return false;
         }
         match self.status {
-            Some(status) => crate::error::retryable_status(Some(status.as_u16())),
-            None => self.transient.unwrap_or(false),
+            Some(status) if !status.is_success() => {
+                crate::error::retryable_status(Some(status.as_u16()))
+            }
+            _ => self.transient.unwrap_or(false),
         }
     }
 
@@ -136,7 +141,7 @@ impl ProviderResponseError {
 
     /// Attach the response's headers, so rate-limit metadata survives onto the
     /// error (rig#2210).
-    pub fn with_headers(mut self, headers: Option<Box<http::HeaderMap>>) -> Self {
+    pub fn with_headers(mut self, headers: Option<http::HeaderMap>) -> Self {
         self.headers = headers;
         self
     }
@@ -247,6 +252,29 @@ pub(crate) fn json(body: Option<&str>) -> Result<Option<serde_json::Value>, serd
         .transpose()
 }
 
+/// Preserve the error envelope a decoder read off a **2xx** body.
+///
+/// `body` is the reply's own bytes, verbatim. Never a re-serialization of a
+/// decoded event: re-encoding through `serde_json::Value` normalizes key
+/// order and silently drops every field the decoder's type does not model —
+/// Anthropic's top-level `request_id`, the one field a user quotes to
+/// provider support, is exactly such a field. A preserved provider response
+/// is the provider's response or it is a rendering of one, and only the
+/// former is worth preserving.
+///
+/// No status is attached here, and the name is literal rather than a
+/// shortfall: the decoder was handed a frame, not a reply, so it has none.
+/// On a unary call [`crate::driver::call`] decorates the fold failure with
+/// the reply's status, which is how a consumer ends up reading `Some(200)`
+/// off a 2xx envelope. A streamed reply is deliberately left alone — a
+/// preserved in-band error's status is the *classification* a wire read
+/// off the body there (Gemini's `error.code`), and stamping the transport's
+/// 200 over it would both overwrite that and flip a refusal's retry
+/// verdict.
+///
+/// A *non-success* reply never reaches this funnel: the transport rejects
+/// it before any frame is decoded, and it arrives as `ProviderResponse`
+/// with its own status already set.
 pub(crate) fn completion_error_from_body(
     body: impl Into<String>,
 ) -> crate::completion::CompletionError {
@@ -326,7 +354,7 @@ macro_rules! impl_provider_response_helpers {
             /// with no response to annotate. An error that already captured
             /// headers keeps the ones it has: the first capture is the one
             /// that saw the response, so this never overwrites.
-            pub fn with_response_headers(self, headers: Option<Box<http::HeaderMap>>) -> Self {
+            pub fn with_response_headers(self, headers: Option<http::HeaderMap>) -> Self {
                 let Some(headers) = headers else {
                     return self;
                 };
@@ -499,7 +527,7 @@ macro_rules! impl_provider_response_helpers {
             /// captured", never "the response had no headers".
             pub fn provider_response_headers(&self) -> Option<&http::HeaderMap> {
                 match self {
-                    Self::ProviderResponse(response) => response.headers.as_deref(),
+                    Self::ProviderResponse(response) => response.headers.as_ref(),
                     _ => None,
                 }
             }
@@ -728,6 +756,7 @@ macro_rules! provider_error_enum {
         }
 
         $crate::provider_response::impl_provider_response_helpers!($name);
+        $crate::wire::impl_wire_error!($name);
 
         impl From<$crate::http_client::Error> for $name {
             fn from(error: $crate::http_client::Error) -> Self {

@@ -1,77 +1,56 @@
 //! Provider bindings as data: a [`ProviderBinding`] component says *which*
-//! provider client serves a key — kind, model, base URL, a credential
+//! provider serves a key — a [`ProviderRef`], a label, a credential
 //! *reference* — and nothing executable. A scene saves it beside the
-//! handler's [`Bound`]; loading it spawns the same data and makes no
-//! network call and no credential lookup. The executable half is built
-//! later, on the host's word: [`materialize_bindings`] reads the
-//! host-installed [`Materializer`] (a credential resolver and a transport
-//! factory — rig-ecs reads no environment variable itself), builds the
-//! rig-core client for every binding that nothing serves yet, and registers
-//! a `CompletionAdapter` under the binding's key through the same
-//! [`Handlers`] API a hand-registered adapter goes through — so the bound
-//! descriptor, and with it the policy hash, is the one a hand-registered
-//! adapter would produce.
+//! handler's [`Bound`]; loading it spawns the same data and makes no network
+//! call and no credential lookup. The executable half is built later, on the
+//! host's word: [`materialize_bindings`] reads the host-installed
+//! [`Materializer`] (a credential resolver and a transport factory — rig-ecs
+//! reads no environment variable itself), builds the provider's completion
+//! wire for every binding that nothing serves yet, binds it to the host's
+//! transport, and registers a `CompletionAdapter` under the binding's key
+//! through the same [`Handlers`] API a hand-registered adapter goes through —
+//! so the bound descriptor, and with it the policy hash, is the one a
+//! hand-registered adapter would produce.
+//!
+//! The provider vocabulary is rig-core's
+//! ([`providers::registry`](rig_core::providers::registry)), not this
+//! crate's: a reference either names a registered selection
+//! (`deepseek/openai:deepseek-chat`, whose configuration is the registry's
+//! preset) or carries an explicit
+//! [`rig_core::providers::registry::ProviderConfig`] with its
+//! own host, route and typed options. Everything a binding can express is
+//! therefore something a provider configuration already expresses; there is
+//! no ECS provider enum, no dialect string and no untyped option bag.
 //!
 //! Secrets never enter the world: the component holds a [`CredentialRef`]
 //! (a name — an environment variable, a key id in the host's vault), the
-//! resolver returns a [`Secret`] whose `Debug` is redacted, and the secret
-//! lives only inside the built client.
+//! resolver returns a [`Secret`] whose `Debug` and serialized form are
+//! redacted, and the secret lives only inside the bound wire.
 
 use bevy_ecs::prelude::*;
+use bevy_reflect::Reflect;
 use rig_core::{
-    client::{CompletionClient, Provider},
     effect::{HandlerDescriptor, HandlerKey},
     http_client::BoxedHttpClient,
-    markers::Missing,
-    providers::{anthropic, deepseek, gemini, openai},
-    serve::{ErasedHandler, adapters::CompletionAdapter},
+    providers::registry::{ProviderConfig, ProviderRef, RefError},
+    serve::ErasedHandler,
 };
 use serde::{Deserialize, Serialize};
 
-use super::handlers::{Bound, HandlerTable, Handlers};
+use super::handlers::{Bound, Handler, Handlers};
 
-/// Which rig-core provider client a binding builds.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[cfg_attr(feature = "reflect", derive(bevy_reflect::Reflect))]
-#[serde(rename_all = "snake_case")]
-pub enum ProviderKind {
-    /// `rig_core::providers::anthropic` (the Messages API).
-    Anthropic,
-    /// `rig_core::providers::openai` over Chat Completions.
-    OpenAiChat,
-    /// `rig_core::providers::openai` over the Responses API.
-    OpenAiResponses,
-    /// `rig_core::providers::gemini` (GenerateContent).
-    Gemini,
-    /// `rig_core::providers::deepseek`.
-    DeepSeek,
-}
-
-impl ProviderKind {
-    /// The kind's serde spelling.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Anthropic => "anthropic",
-            Self::OpenAiChat => "openai_chat",
-            Self::OpenAiResponses => "openai_responses",
-            Self::Gemini => "gemini",
-            Self::DeepSeek => "deepseek",
-        }
-    }
-}
-
-impl std::fmt::Display for ProviderKind {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
+/// A resolved credential: what the host's resolver returns and the bound
+/// wire holds. rig-core's own, because a wire's credential and a binding's
+/// resolved credential are the same thing — it goes straight into the
+/// provider config, and its `Debug` and `Serialize` are redacted there for
+/// the same reason they are here.
+pub use rig_core::wire::Secret;
 
 /// A reference to a credential the host resolves — an environment variable
 /// name, a vault key id, a label the host's resolver knows. Never the
 /// secret: the reference is saved verbatim in scenes and printed verbatim
 /// in diagnostics, so whatever it names must be safe to print.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[cfg_attr(feature = "reflect", derive(bevy_reflect::Reflect))]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, Reflect)]
 #[serde(transparent)]
 pub struct CredentialRef(pub String);
 
@@ -99,91 +78,67 @@ impl std::fmt::Display for CredentialRef {
     }
 }
 
-/// A resolved credential: what the host's resolver returns and the built
-/// client consumes. `Debug` and `Display` are redacted; the only way out
-/// is [`expose`](Self::expose), which the materializer calls once, inside
-/// the client builder.
-#[derive(Clone, PartialEq, Eq)]
-pub struct Secret(String);
-
-impl Secret {
-    /// Wrap a resolved secret.
-    pub fn new(secret: impl Into<String>) -> Self {
-        Self(secret.into())
-    }
-
-    /// The secret, for the client builder and nothing else.
-    pub fn expose(&self) -> &str {
-        &self.0
-    }
-}
-
-impl std::fmt::Debug for Secret {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("Secret(<redacted>)")
-    }
-}
-
-/// The data half of a provider-served handler: which client serves the
+/// The data half of a provider-served handler: which provider serves the
 /// key. Lives on the handler entity beside [`Bound`] once materialized; on
 /// its own (a host spawned it, or a scene saved it before it was
 /// materialized) until then. A scene saves it with the bound descriptor,
 /// and a load spawns exactly that — the key resolves for the scene's links
 /// as any bound key does, and nothing is served until the host
 /// materializes.
-#[derive(Component, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[cfg_attr(feature = "reflect", derive(bevy_reflect::Reflect), reflect(Component))]
+#[derive(Component, Debug, Clone, PartialEq, Serialize, Deserialize, Reflect)]
+#[reflect(Component)]
 pub struct ProviderBinding {
     /// The key the built handler serves (`Bound.key` once materialized).
-    #[cfg_attr(feature = "reflect", reflect(remote = crate::bus::reflect::HandlerKeyReflect))]
+    #[reflect(remote = crate::bus::reflect::HandlerKeyReflect)]
     pub key: HandlerKey,
-    /// Which provider client.
-    pub kind: ProviderKind,
-    /// The provider's model id (`claude-haiku-4-5-20251001`, `gpt-4.1-mini`).
-    pub model: String,
+    /// Which provider and model. A registered selection writes as its
+    /// canonical `vendor/format:model` string; an explicit configuration
+    /// writes as an object and keeps every host, route and option it names.
+    #[reflect(remote = crate::bus::reflect::ProviderRefReflect)]
+    pub provider: ProviderRef,
     /// The adapter's label: the `ModelRef` the bound descriptor advertises
     /// (`CompletionAdapter::new(label, model)`), which is what the log's
-    /// header and the policy hash name. Defaults to `model`.
+    /// header and the policy hash name. Defaults to the reference's model.
     pub label: String,
-    /// The provider base URL; `None` is the provider's default.
-    pub base_url: Option<String>,
-    /// Which credential the host's resolver hands the client. A name, never
-    /// a secret.
+    /// Which credential the host's resolver hands the provider config. A
+    /// name, never a secret.
     pub credential: CredentialRef,
-    /// Provider-specific client settings, by kind — see
-    /// [`ProviderBinding::extra_params`](#extra-params). Unknown keys are
-    /// refused at materialization.
-    ///
-    /// # Extra params
-    ///
-    /// | kind | keys |
-    /// |---|---|
-    /// | `anthropic` | `anthropic_version: string`, `anthropic_betas: [string]` |
-    /// | `openai_responses` | `system_instructions_as_messages: bool` |
-    /// | `openai_chat`, `gemini`, `deepseek` | none |
-    #[cfg_attr(feature = "reflect", reflect(remote = crate::bus::reflect::ExtraParamsReflect))]
-    pub extra_params: Option<serde_json::Value>,
 }
 
 impl ProviderBinding {
-    /// A binding of `key` to `model` on `kind`, labelled by the model id,
-    /// on the provider's default base URL, with no extra params.
+    /// A binding of `key` to `provider`, labelled by the reference's model.
     pub fn new(
         key: impl Into<HandlerKey>,
-        kind: ProviderKind,
+        provider: ProviderRef,
+        credential: impl Into<CredentialRef>,
+    ) -> Self {
+        Self {
+            key: key.into(),
+            label: provider.model.clone(),
+            provider,
+            credential: credential.into(),
+        }
+    }
+
+    /// [`Self::new`] from a reference to parse — `vendor[/format]:model`,
+    /// shorthand accepted.
+    pub fn parse(
+        key: impl Into<HandlerKey>,
+        reference: &str,
+        credential: impl Into<CredentialRef>,
+    ) -> Result<Self, RefError> {
+        Ok(Self::new(key, ProviderRef::parse(reference)?, credential))
+    }
+
+    /// [`Self::new`] from an explicit configuration and a model: a host,
+    /// a route or a typed option the registry's preset does not name.
+    pub fn configured(
+        key: impl Into<HandlerKey>,
+        config: ProviderConfig,
         model: impl Into<String>,
         credential: impl Into<CredentialRef>,
     ) -> Self {
-        let model = model.into();
-        Self {
-            key: key.into(),
-            kind,
-            label: model.clone(),
-            model,
-            base_url: None,
-            credential: credential.into(),
-            extra_params: None,
-        }
+        Self::new(key, ProviderRef::configured(config, model), credential)
     }
 
     /// With the adapter's label.
@@ -192,21 +147,19 @@ impl ProviderBinding {
         self
     }
 
-    /// With a base URL.
-    pub fn at(mut self, base_url: impl Into<String>) -> Self {
-        self.base_url = Some(base_url.into());
-        self
-    }
-
-    /// With provider-specific client settings.
-    pub fn with_extra_params(mut self, params: serde_json::Value) -> Self {
-        self.extra_params = Some(params);
-        self
+    /// The provider's model identifier.
+    pub fn model(&self) -> &str {
+        &self.provider.model
     }
 }
 
 /// Why a materialization did not happen. Every variant is deterministic
 /// for a given world and resolver; none carries a secret.
+///
+/// There is no variant for a malformed provider selection or a wrong typed
+/// option: both are refused where the value is defined — by
+/// [`ProviderRef::parse`] or by the deserializer — so nothing that reaches
+/// here can name a provider this build does not have.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum MaterializeError {
     /// The world has no [`Materializer`].
@@ -250,26 +203,6 @@ pub enum MaterializeError {
         /// The built descriptor, as JSON.
         built: String,
     },
-    /// `extra_params` holds something the kind does not take.
-    #[error("`{key}`: extra params for {kind}: {detail}")]
-    ExtraParams {
-        /// The key.
-        key: HandlerKey,
-        /// The kind.
-        kind: ProviderKind,
-        /// What was wrong.
-        detail: String,
-    },
-    /// The rig-core client builder refused.
-    #[error("`{key}`: the {kind} client did not build: {detail}")]
-    Client {
-        /// The key.
-        key: HandlerKey,
-        /// The kind.
-        kind: ProviderKind,
-        /// The builder's reason.
-        detail: String,
-    },
     /// The bus refused the registration.
     #[error("`{key}`: the bus refused the handler: {detail}")]
     Register {
@@ -295,7 +228,7 @@ type Credentials = dyn Fn(&CredentialRef) -> Result<Secret, String> + Send + Syn
 type Transport = dyn Fn() -> BoxedHttpClient + Send + Sync;
 type Serving = dyn Fn(ErasedHandler) -> ErasedHandler + Send + Sync;
 
-/// How bindings become clients: the host's credential resolver and
+/// How bindings become handlers: the host's credential resolver and
 /// transport factory, installed as a resource. rig-ecs never reads an
 /// environment variable or picks a transport itself; a host that wants
 /// `std::env` writes a resolver that reads it.
@@ -310,7 +243,7 @@ impl Materializer {
     /// A materializer over `credentials` (a reference to its secret, or the
     /// reason it did not resolve — reported as
     /// [`MaterializeError::MissingCredential`] under the binding's key) and
-    /// `transport` (one fresh transport handle per client built; a factory
+    /// `transport` (one fresh transport handle per wire bound; a factory
     /// returning clones of one handle shares it).
     pub fn new(
         credentials: impl Fn(&CredentialRef) -> Result<Secret, String> + Send + Sync + 'static,
@@ -344,12 +277,16 @@ impl Materializer {
         (self.transport)()
     }
 
-    /// Build the adapter for `binding`: the client, the model, the
-    /// `CompletionAdapter` under the binding's label, wrapped as the host
-    /// serves it. What [`materialize_bindings`] registers; a host can also
-    /// build one to register itself.
+    /// Build the adapter for `binding`: the reference's configuration with
+    /// the resolved credential, its completion wire bound to a fresh
+    /// transport, the `CompletionAdapter` under the binding's label, wrapped
+    /// as the host serves it. What [`materialize_bindings`] registers; a host
+    /// can also build one to register itself.
+    ///
+    /// Resolving the credential is the only step that can fail: a provider
+    /// configuration is data, and binding it to a socket is a struct
+    /// literal.
     pub fn build(&self, binding: &ProviderBinding) -> Result<ErasedHandler, MaterializeError> {
-        validate_extra_params(binding)?;
         let secret = self.resolve(&binding.credential).map_err(|detail| {
             MaterializeError::MissingCredential {
                 key: binding.key.clone(),
@@ -357,7 +294,11 @@ impl Materializer {
                 detail,
             }
         })?;
-        let handler = build_adapter(binding, &secret, self.transport())?;
+        let handler = binding.provider.config(secret).completion_handler(
+            &binding.label,
+            binding.model(),
+            self.transport(),
+        );
         Ok((self.serving)(handler))
     }
 }
@@ -373,168 +314,47 @@ fn bound_descriptor(key: &HandlerKey, handler: &ErasedHandler) -> HandlerDescrip
     }
 }
 
-fn extra_object<'a>(
-    binding: &'a ProviderBinding,
-    allowed: &[&str],
-) -> Result<Option<&'a serde_json::Map<String, serde_json::Value>>, MaterializeError> {
-    let Some(params) = &binding.extra_params else {
-        return Ok(None);
-    };
-    let Some(object) = params.as_object() else {
-        return Err(MaterializeError::ExtraParams {
-            key: binding.key.clone(),
-            kind: binding.kind,
-            detail: "not an object".to_owned(),
-        });
-    };
-    if let Some(unknown) = object.keys().find(|k| !allowed.contains(&k.as_str())) {
-        return Err(MaterializeError::ExtraParams {
-            key: binding.key.clone(),
-            kind: binding.kind,
-            detail: format!("unknown key `{unknown}` (takes {allowed:?})"),
-        });
-    }
-    Ok(Some(object))
+/// Every `(entity, key)` a `Bound` in the world holds.
+///
+/// Archetype-filtered rather than a walk over every entity: a rig-ecs world
+/// holds an entity per message part, effect and run, and this runs on every
+/// materialization pass. `None` means no entity has ever carried a `Bound`,
+/// which is the empty answer.
+pub(crate) fn bound_keys(world: &World) -> Vec<(Entity, HandlerKey)> {
+    world
+        .try_query::<(Entity, &Bound)>()
+        .map(|mut bound| {
+            bound
+                .iter(world)
+                .map(|(entity, bound)| (entity, bound.key.clone()))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
-/// The keys a kind's `extra_params` may hold.
-fn allowed_extra_params(kind: ProviderKind) -> &'static [&'static str] {
-    match kind {
-        ProviderKind::Anthropic => &["anthropic_version", "anthropic_betas"],
-        ProviderKind::OpenAiResponses => &["system_instructions_as_messages"],
-        ProviderKind::OpenAiChat | ProviderKind::Gemini | ProviderKind::DeepSeek => &[],
-    }
+/// Whether this entity is itself serving: a handler the host registered on
+/// it by hand, or an earlier materialization of the binding it carries.
+///
+/// One half of the test that decides `MaterializeReport::kept`; a binding's
+/// own `Bound` is not it — only a live `Handler` is.
+pub(crate) fn serves_itself(world: &World, entity: Entity) -> bool {
+    world.get::<Handler>(entity).is_some()
 }
 
-/// Refuse `extra_params` the kind does not take, before any credential is
-/// resolved or transport built.
-fn validate_extra_params(binding: &ProviderBinding) -> Result<(), MaterializeError> {
-    extra_object(binding, allowed_extra_params(binding.kind)).map(|_| ())
-}
-
-fn client_error(binding: &ProviderBinding, error: impl std::fmt::Display) -> MaterializeError {
-    MaterializeError::Client {
-        key: binding.key.clone(),
-        kind: binding.kind,
-        detail: error.to_string(),
-    }
-}
-
-fn builder<P>(
-    binding: &ProviderBinding,
-    secret: &Secret,
-    transport: BoxedHttpClient,
-) -> rig_core::client::ClientBuilder<P, BoxedHttpClient>
-where
-    P: Provider,
-    P::ApiKey: From<String>,
-{
-    let mut builder = rig_core::client::Client::<P, Missing>::builder()
-        .api_key(secret.expose().to_owned())
-        .http_client(transport);
-    if let Some(base_url) = &binding.base_url {
-        builder = builder.base_url(base_url);
-    }
-    builder
-}
-
-fn build_adapter(
-    binding: &ProviderBinding,
-    secret: &Secret,
-    transport: BoxedHttpClient,
-) -> Result<ErasedHandler, MaterializeError> {
-    let label = binding.label.as_str();
-    let model = binding.model.as_str();
-    Ok(match binding.kind {
-        ProviderKind::Anthropic => {
-            let params = extra_object(binding, allowed_extra_params(binding.kind))?;
-            let mut builder = builder::<anthropic::client::Anthropic>(binding, secret, transport);
-            if let Some(params) = params {
-                if let Some(version) = params.get("anthropic_version") {
-                    let version =
-                        version
-                            .as_str()
-                            .ok_or_else(|| MaterializeError::ExtraParams {
-                                key: binding.key.clone(),
-                                kind: binding.kind,
-                                detail: "`anthropic_version` is not a string".to_owned(),
-                            })?;
-                    builder = builder.anthropic_version(version);
-                }
-                if let Some(betas) = params.get("anthropic_betas") {
-                    let betas: Vec<&str> = betas
-                        .as_array()
-                        .and_then(|items| items.iter().map(|v| v.as_str()).collect())
-                        .ok_or_else(|| MaterializeError::ExtraParams {
-                            key: binding.key.clone(),
-                            kind: binding.kind,
-                            detail: "`anthropic_betas` is not an array of strings".to_owned(),
-                        })?;
-                    builder = builder.anthropic_betas(&betas);
-                }
-            }
-            let client = builder.build().map_err(|e| client_error(binding, e))?;
-            ErasedHandler::new(CompletionAdapter::new(
-                label,
-                client.completion_model(model),
-            ))
-        }
-        ProviderKind::OpenAiChat => {
-            extra_object(binding, allowed_extra_params(binding.kind))?;
-            let client = builder::<openai::client::OpenAICompletions>(binding, secret, transport)
-                .build()
-                .map_err(|e| client_error(binding, e))?;
-            ErasedHandler::new(CompletionAdapter::new(
-                label,
-                client.completion_model(model),
-            ))
-        }
-        ProviderKind::OpenAiResponses => {
-            let params = extra_object(binding, allowed_extra_params(binding.kind))?;
-            let mut client = builder::<openai::client::OpenAIResponses>(binding, secret, transport)
-                .build()
-                .map_err(|e| client_error(binding, e))?;
-            if let Some(params) = params
-                && let Some(flag) = params.get("system_instructions_as_messages")
-            {
-                match flag.as_bool() {
-                    Some(true) => client = client.with_system_instructions_as_messages(),
-                    Some(false) => {}
-                    None => {
-                        return Err(MaterializeError::ExtraParams {
-                            key: binding.key.clone(),
-                            kind: binding.kind,
-                            detail: "`system_instructions_as_messages` is not a bool".to_owned(),
-                        });
-                    }
-                }
-            }
-            ErasedHandler::new(CompletionAdapter::new(
-                label,
-                client.completion_model(model),
-            ))
-        }
-        ProviderKind::Gemini => {
-            extra_object(binding, allowed_extra_params(binding.kind))?;
-            let client = builder::<gemini::client::Gemini>(binding, secret, transport)
-                .build()
-                .map_err(|e| client_error(binding, e))?;
-            ErasedHandler::new(CompletionAdapter::new(
-                label,
-                client.completion_model(model),
-            ))
-        }
-        ProviderKind::DeepSeek => {
-            extra_object(binding, allowed_extra_params(binding.kind))?;
-            let client = builder::<deepseek::DeepSeek>(binding, secret, transport)
-                .build()
-                .map_err(|e| client_error(binding, e))?;
-            ErasedHandler::new(CompletionAdapter::new(
-                label,
-                client.completion_model(model),
-            ))
-        }
-    })
+/// Whether `key` is already served or held on an entity other than
+/// `entity`'s own: the existing handler a materialization defers to.
+///
+/// The other half. A binding's own stale `Bound` — what a checkpoint load
+/// leaves — is neither, which is the point of the entity comparison: the
+/// binding is still the thing that will build the client.
+pub(crate) fn served_elsewhere(
+    bound: &[(Entity, HandlerKey)],
+    entity: Entity,
+    key: &HandlerKey,
+) -> bool {
+    bound
+        .iter()
+        .any(|(other, held)| *other != entity && held == key)
 }
 
 /// One binding the world holds, as [`materialize_bindings`] sees it.
@@ -567,7 +387,7 @@ struct Pending {
 /// | two binding entities with one key | `DuplicateKey` |
 /// | a binding beside a `Bound` of another key | `KeyMismatch` |
 /// | no `Materializer` | `NoMaterializer` |
-/// | a reference the resolver refuses, a kind's params it does not take, a builder that refuses | that error, nothing registered |
+/// | a reference the resolver refuses | `MissingCredential`, nothing registered |
 pub fn materialize_bindings(world: &mut World) -> Result<MaterializeReport, MaterializeError> {
     if !world.contains_resource::<Materializer>() {
         return Err(MaterializeError::NoMaterializer);
@@ -582,24 +402,15 @@ pub fn materialize_bindings(world: &mut World) -> Result<MaterializeReport, Mate
             taken: false,
         })
         .collect();
-    let bound: Vec<(Entity, HandlerKey)> = world
-        .query::<(Entity, &Bound)>()
-        .iter(world)
-        .map(|(entity, bound)| (entity, bound.key.clone()))
-        .collect();
-    {
-        let table = world.non_send::<HandlerTable>();
-        for item in &mut pending {
-            // Served on this entity (a hand registration, an earlier
-            // materialization), or bound on another — served there (what
-            // `Handlers::bind` would re-serve instead of this entity) or
-            // not: the existing handler wins, whether or not this entity
-            // carries a `Bound` of its own.
-            item.taken = table.served(item.entity).is_some()
-                || bound
-                    .iter()
-                    .any(|(entity, key)| *entity != item.entity && key == &item.binding.key);
-        }
+    let bound = bound_keys(world);
+    for item in &mut pending {
+        // Served on this entity (a hand registration, an earlier
+        // materialization), or bound on another — served there (what
+        // `Handlers::bind` would re-serve instead of this entity) or
+        // not: the existing handler wins, whether or not this entity
+        // carries a `Bound` of its own.
+        item.taken = serves_itself(world, item.entity)
+            || served_elsewhere(&bound, item.entity, &item.binding.key);
     }
     pending.sort_by(|a, b| a.binding.key.cmp(&b.binding.key));
     let mut report = MaterializeReport::default();
@@ -665,10 +476,10 @@ pub fn materialize_bindings(world: &mut World) -> Result<MaterializeReport, Mate
         for (entity, key, _, handler) in built {
             let served = handlers
                 .register_erased(key.clone(), handler)
-                .map_err(|error| Box::new((key, error)))?;
+                .map_err(|error| (key, error))?;
             debug_assert_eq!(served, entity, "the binding's entity is the handler's");
         }
-        Ok::<(), Box<(HandlerKey, rig_core::error::ErrorReport)>>(())
+        Ok::<(), (HandlerKey, rig_core::error::ErrorReport)>(())
     });
     let (key, error) = match registered {
         Ok(Ok(())) => {
@@ -677,7 +488,7 @@ pub fn materialize_bindings(world: &mut World) -> Result<MaterializeReport, Mate
                 .extend(plan.into_iter().map(|(_, key)| key));
             return Ok(report);
         }
-        Ok(Err(refused)) => *refused,
+        Ok(Err(refused)) => refused,
         Err(error) => (
             plan.first()
                 .map(|(_, key)| key.clone())
@@ -691,7 +502,7 @@ pub fn materialize_bindings(world: &mut World) -> Result<MaterializeReport, Mate
     // what registered before the refusal is unserved again, and every
     // `Bound` inserted here is taken out or put back as the scene saved it.
     for (entity, _) in &plan {
-        world.non_send_mut::<HandlerTable>().remove(*entity);
+        world.entity_mut(*entity).remove::<Handler>();
         let saved = todo
             .iter()
             .find(|item| item.entity == *entity)

@@ -1,5 +1,6 @@
 //! The effect entity's components: intent, order, identity, state, answer.
 
+use bevy_reflect::Reflect;
 use std::sync::Arc;
 
 use bevy_ecs::{lifecycle::HookContext, prelude::*, world::DeferredWorld};
@@ -20,16 +21,16 @@ use serde::{Deserialize, Serialize};
 /// Requires [`Seq`], stamped on add from the world's [`SeqCounter`] in spawn
 /// order, so a plain `commands.spawn(PendingEffect { .. })` is deterministic
 /// with no user effort.
-#[derive(Component, Debug, Clone, Serialize, Deserialize)]
+#[derive(Component, Debug, Clone, Serialize, Deserialize, Reflect)]
 #[require(Seq)]
 #[component(on_add = stamp_seq)]
-#[cfg_attr(feature = "reflect", derive(bevy_reflect::Reflect), reflect(Component))]
+#[reflect(Component)]
 pub struct PendingEffect {
     /// The handler key the effect is routed to.
-    #[cfg_attr(feature = "reflect", reflect(remote = crate::bus::reflect::HandlerKeyReflect))]
+    #[reflect(remote = crate::bus::reflect::HandlerKeyReflect)]
     pub key: HandlerKey,
     /// The effect.
-    #[cfg_attr(feature = "reflect", reflect(remote = crate::bus::reflect::EffectKindReflect))]
+    #[reflect(remote = crate::bus::reflect::EffectKindReflect)]
     pub kind: EffectKind,
 }
 
@@ -95,13 +96,14 @@ impl PendingEffect {
     Hash,
     Serialize,
     Deserialize,
+    Reflect,
 )]
-#[cfg_attr(feature = "reflect", derive(bevy_reflect::Reflect), reflect(Component))]
+#[reflect(Component)]
 pub struct Seq(pub u64);
 
 /// The world's one dispatch-order counter (see [`Seq`]).
-#[derive(Resource, Debug, Default)]
-#[cfg_attr(feature = "reflect", derive(bevy_reflect::Reflect), reflect(Resource))]
+#[derive(Resource, Debug, Default, Reflect)]
+#[reflect(Resource)]
 pub struct SeqCounter(pub u64);
 
 fn stamp_seq(mut world: DeferredWorld<'_>, context: HookContext) {
@@ -126,20 +128,17 @@ fn stamp_seq(mut world: DeferredWorld<'_>, context: HookContext) {
 /// then returns a request error without minting or recording an effect. The
 /// maximum allocatable ID is `u64::MAX - 1`; invalid direct component insertion
 /// saturates the counter rather than wrapping it.
-#[derive(Resource, Debug, Default)]
-#[cfg_attr(feature = "reflect", derive(bevy_reflect::Reflect), reflect(Resource))]
+#[derive(Resource, Debug, Default, Reflect)]
+#[reflect(Resource)]
 pub struct IdCounter(pub u64);
 
 /// An id the effect must be dispatched under: a scene's saved id, a
 /// replayed record's. Consumed by `Dispatch`, which bumps [`IdCounter`]
 /// past it so a minted id never collides with a reserved one.
-#[derive(Component, Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Component, Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Reflect)]
 #[component(on_insert = bump_ids_past_reserved)]
-#[cfg_attr(feature = "reflect", derive(bevy_reflect::Reflect), reflect(Component))]
-pub struct Reserved(
-    #[cfg_attr(feature = "reflect", reflect(remote = crate::bus::reflect::EffectIdReflect))]
-    pub  EffectId,
-);
+#[reflect(Component)]
+pub struct Reserved(#[reflect(remote = crate::bus::reflect::EffectIdReflect)] pub EffectId);
 
 fn bump_ids_past_reserved(mut world: DeferredWorld<'_>, context: HookContext) {
     if let Some(Reserved(id)) = world.get::<Reserved>(context.entity).copied() {
@@ -158,13 +157,10 @@ fn bump_ids_past_issued(mut world: DeferredWorld<'_>, context: HookContext) {
 /// The id the effect was dispatched under. Inserted by `Dispatch` and kept
 /// for the entity's life: what a child's record names as its `parent`, what
 /// a scene saves.
-#[derive(Component, Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Component, Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Reflect)]
 #[component(on_insert = bump_ids_past_issued)]
-#[cfg_attr(feature = "reflect", derive(bevy_reflect::Reflect), reflect(Component))]
-pub struct Issued(
-    #[cfg_attr(feature = "reflect", reflect(remote = crate::bus::reflect::EffectIdReflect))]
-    pub  EffectId,
-);
+#[reflect(Component)]
+pub struct Issued(#[reflect(remote = crate::bus::reflect::EffectIdReflect)] pub EffectId);
 
 /// A pending effect a user system is still deciding about: `Dispatch`
 /// leaves it alone until the marker is removed (approve), the effect is
@@ -174,28 +170,30 @@ pub struct Issued(
 /// [`super::release_hold`]; removing this marker directly bypasses all owners
 /// (the batch's own marker follows: a call the batch held and a host
 /// approved is dispatched and counted as active).
-#[derive(Component, Debug, Clone, Copy, Default, Serialize, Deserialize)]
-#[cfg_attr(feature = "reflect", derive(bevy_reflect::Reflect), reflect(Component))]
+#[derive(Component, Debug, Clone, Copy, Default, Serialize, Deserialize, Reflect)]
+#[reflect(Component)]
 pub struct Held;
 
 /// The effect was taken: a handler is serving it. Present from `Dispatch`
 /// until `settle` closes the record — for a stream, until the returned
 /// stream reaches EOF. Carries the key it occupies so serial serving is a
 /// query over this component. Never serialized: a scene stores intent.
-#[derive(Component, Debug, Clone)]
-#[cfg_attr(feature = "reflect", derive(bevy_reflect::Reflect), reflect(Component))]
+#[derive(Component, Debug, Clone, Reflect)]
+#[reflect(Component)]
 pub struct InFlight {
     /// The key the effect occupies.
-    #[cfg_attr(feature = "reflect", reflect(remote = crate::bus::reflect::HandlerKeyReflect))]
+    #[reflect(remote = crate::bus::reflect::HandlerKeyReflect)]
     pub key: HandlerKey,
 }
 
-/// An initial handler task owned by the world's non-send execution table.
-/// Removing `InFlight` or despawning the effect drops that task.
+/// The marker of an initial handler task, held for the entity in the
+/// world's [`Executions`] table.
 #[derive(Component)]
 pub struct Serving;
 
-/// Delivery receiver and fold for a stream driven by an effect-owned worker.
+/// Delivery receiver and fold for a stream driven by an effect-owned worker
+/// (held in [`Executions`]). Dropping the component drops the receiver, and
+/// the worker returns at its next send.
 #[derive(Component)]
 pub struct Streaming {
     /// Bounded worker delivery, exclusively consumed by Collect.
@@ -208,31 +206,90 @@ pub struct Streaming {
     pub delivered: usize,
 }
 
-impl Streaming {
-    /// Drive one owned stream on the pool with bounded delivery to Collect.
-    pub fn spawn(mut stream: StreamEvents, capacity: usize) -> (Self, Task<()>) {
-        use futures::{SinkExt, StreamExt};
-        let (mut sender, events) = futures::channel::mpsc::channel(capacity.max(1));
-        let task = bevy_tasks::IoTaskPool::get().spawn(async move {
-            while let Some(item) = stream.next().await {
-                if sender.send(item).await.is_err() {
-                    return;
-                }
+/// Drive one owned stream on the pool with bounded delivery to Collect;
+/// every delivered item raises `wake`. Returns the receiver half and the
+/// worker task.
+fn spawn_stream_worker(
+    mut stream: StreamEvents,
+    capacity: usize,
+    wake: super::plugin::Wake,
+) -> (
+    futures::channel::mpsc::Receiver<
+        Result<rig_core::streaming::StreamEvent, rig_core::error::ErrorReport>,
+    >,
+    Task<()>,
+) {
+    use futures::{SinkExt, StreamExt};
+    let (mut sender, events) = futures::channel::mpsc::channel(capacity.max(1));
+    let task = bevy_tasks::IoTaskPool::get().spawn(async move {
+        while let Some(item) = stream.next().await {
+            if sender.send(item).await.is_err() {
+                return;
             }
-        });
-        (
-            Self {
-                events,
-                fold: rig_core::serve::StreamTap::new(),
-                delivered: 0,
-            },
-            task,
-        )
+            wake.signal();
+        }
+        wake.signal();
+    });
+    (events, task)
+}
+
+/// The tasks behind [`Serving`] and [`Streaming`], rows in the non-send
+/// [`Executions`] table: a task is `!Send` on wasm and cannot be a
+/// component, and one storage keeps one code path on both targets.
+#[derive(bevy_ecs::system::SystemParam)]
+pub struct Tasks<'w> {
+    executions: NonSendMut<'w, Executions>,
+}
+
+impl Tasks<'_> {
+    /// The [`Serving`] component for `task`.
+    pub fn serving(&mut self, entity: Entity, task: Task<rig_core::serve::Reply>) -> Serving {
+        self.executions.tasks.insert(entity, task);
+        Serving
+    }
+
+    /// Whether the serving task finished: its reply, once.
+    pub fn poll(&mut self, entity: Entity) -> Option<rig_core::serve::Reply> {
+        let task = self.executions.tasks.get_mut(&entity)?;
+        let reply = bevy_tasks::futures::check_ready(task)?;
+        self.executions.tasks.remove(&entity);
+        Some(reply)
+    }
+
+    /// A [`Streaming`] component driving `stream` on the pool.
+    pub fn streaming(
+        &mut self,
+        entity: Entity,
+        stream: StreamEvents,
+        capacity: usize,
+        wake: super::plugin::Wake,
+    ) -> Streaming {
+        let (events, task) = spawn_stream_worker(stream, capacity, wake);
+        self.executions.streams.insert(entity, task);
+        Streaming {
+            events,
+            fold: rig_core::serve::StreamTap::new(),
+            delivered: 0,
+        }
+    }
+
+    /// The stream worker of `entity` is done with: dropped now.
+    pub fn forget_stream(&mut self, entity: Entity) {
+        self.executions.streams.remove(&entity);
+    }
+
+    /// The tasks of `world`, for an exclusive system. `None` when the bus
+    /// is not installed (the table is missing).
+    pub fn with<T>(world: &mut World, f: impl FnOnce(&mut Tasks<'_>) -> T) -> Option<T> {
+        let mut state = bevy_ecs::system::SystemState::<Tasks>::new(world);
+        let mut tasks = state.get_mut(world).ok()?;
+        Some(f(&mut tasks))
     }
 }
 
-/// Effect-owned execution on native and browser wasm. Keeping both here
-/// avoids requiring an owned stream or initial task output to be `Sync`.
+/// The tasks of in-flight effects, indexed by their effect entity and
+/// dropped by [`drop_execution`] when the effect leaves flight. Non-send
+/// because a task is `!Send` on wasm.
 #[derive(Default)]
 pub struct Executions {
     /// Initial tasks, indexed by their in-flight effect entity.
@@ -254,42 +311,41 @@ pub fn drop_execution(removed: On<Remove, InFlight>, mut executions: NonSendMut<
 /// when the stream reaches EOF, so a serial key stays busy until the
 /// handler is done, as it does on rig-agent's bus.
 ///
-/// Live collection checks at most 64 queue entries per effect per invocation,
-/// sharing 4,096 checks across a host tick. With the `replay` feature,
-/// `Replay::policy_visible()` preserves recorded delivery batches when the
-/// recorder kept event bytes. Keeping bytes alone in a driver without batch
-/// tracking promises event order only; folded recordings supply a final
-/// answer, not these partial states. Completed scenes restore all three
-/// fields. Loading an unfinished stream with delivered progress is refused
-/// because the scene has no cursor with which to resume after that prefix.
-#[derive(Component, Debug, Default, Clone, Serialize, Deserialize)]
-#[cfg_attr(feature = "reflect", derive(bevy_reflect::Reflect), reflect(Component))]
+/// Live collection checks at most 64 queue entries per effect per pass,
+/// sharing 4,096 checks across the pass. `Replay::policy_visible()`
+/// preserves recorded delivery batches when the recorder kept event bytes.
+/// Keeping bytes alone in a driver without batch tracking promises event
+/// order only; folded recordings supply a final answer, not these partial
+/// states. A checkpoint restores a completed stream's every field. Loading
+/// an unfinished stream with delivered progress is refused because the
+/// checkpoint has no cursor with which to resume after that prefix.
+#[derive(Component, Debug, Default, Clone, Serialize, Deserialize, Reflect)]
+#[reflect(Component)]
 pub struct Streamed {
     /// Every error item and its zero-based position among all stream items,
     /// including errors after the first terminal outcome. Live observation is
     /// independent of recorder event retention; `outcome` remains the first fold.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    #[cfg_attr(feature = "reflect", reflect(remote = crate::bus::reflect::StreamErrorsReflect))]
+    #[reflect(remote = crate::bus::reflect::StreamErrorsReflect)]
     pub errors: Vec<(usize, ErrorReport)>,
     /// Every event, in order.
-    #[cfg_attr(feature = "reflect", reflect(remote = crate::bus::reflect::StreamEventsReflect))]
+    #[reflect(remote = crate::bus::reflect::StreamEventsReflect)]
     pub events: Vec<StreamEvent>,
     /// The text deltas concatenated.
     pub text: String,
     /// The fold's outcome at the terminal record, or the error that ended
     /// the stream.
-    #[cfg_attr(feature = "reflect", reflect(remote = crate::bus::reflect::StreamedOutcomeReflect))]
+    #[reflect(remote = crate::bus::reflect::StreamedOutcomeReflect)]
     pub outcome: Option<Result<Outcome, ErrorReport>>,
 }
 
 /// The answer. Inserted by `Collect` when a handler's task or stream
 /// finished, by a `Gate` system that denies, or by a `Judge` system that
 /// replaces. Serde, so a scene keeps answered effects answered.
-#[derive(Component, Debug, Clone, Serialize, Deserialize)]
-#[cfg_attr(feature = "reflect", derive(bevy_reflect::Reflect), reflect(Component))]
+#[derive(Component, Debug, Clone, Serialize, Deserialize, Reflect)]
+#[reflect(Component)]
 pub struct EffectOutcome(
-    #[cfg_attr(feature = "reflect", reflect(remote = crate::bus::reflect::OutcomeReflect))]
-    pub  Result<Outcome, ErrorReport>,
+    #[reflect(remote = crate::bus::reflect::OutcomeReflect)] pub Result<Outcome, ErrorReport>,
 );
 
 /// An open world's submitted answer. Insert with [`WorldOutcome::new`];
@@ -365,21 +421,17 @@ impl EffectOutcome {
 /// the tool beside the effect (format 5: never in it), as data on the
 /// effect entity. `Dispatch` attaches it to the handler's dispatch context; absent,
 /// the tool runs under an empty context. A scene saves it.
-#[derive(Component, Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[cfg_attr(feature = "reflect", derive(bevy_reflect::Reflect), reflect(Component))]
-pub struct ToolInputs(
-    #[cfg_attr(feature = "reflect", reflect(remote = crate::bus::reflect::ToolContextReflect))]
-    pub ToolContext,
-);
+#[derive(Component, Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, Reflect)]
+#[reflect(Component)]
+pub struct ToolInputs(#[reflect(remote = crate::bus::reflect::ToolContextReflect)] pub ToolContext);
 
 /// What the tool published into its context: read off the dispatch's
 /// [`PublishedContext`] when the outcome lands (`Collect`), or inserted by
 /// the system that answers an open tool key. Data, beside the outcome.
-#[derive(Component, Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[cfg_attr(feature = "reflect", derive(bevy_reflect::Reflect), reflect(Component))]
+#[derive(Component, Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, Reflect)]
+#[reflect(Component)]
 pub struct ToolOutputs(
-    #[cfg_attr(feature = "reflect", reflect(remote = crate::bus::reflect::ToolContextReflect))]
-    pub ToolContext,
+    #[reflect(remote = crate::bus::reflect::ToolContextReflect)] pub ToolContext,
 );
 
 /// The slot a task-served tool call publishes into, shared with its dispatch context
@@ -393,8 +445,8 @@ pub struct Publishing(pub Arc<PublishedContext>);
 /// the nearest `Scope` up the `ChildOf` chain (the entity's own first) into
 /// the record's `scope`, so one log written by several programs in one
 /// world reads per program.
-#[derive(Component, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[cfg_attr(feature = "reflect", derive(bevy_reflect::Reflect), reflect(Component))]
+#[derive(Component, Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Reflect)]
+#[reflect(Component)]
 pub struct Scope(pub String);
 
 /// A [`CustomEffect`] a system can serve: its payload and its answer live
@@ -457,5 +509,7 @@ const _: () = {
     assert_send_sync::<ToolInputs>();
     assert_send_sync::<ToolOutputs>();
     assert_send_sync::<Publishing>();
+    assert_send_sync::<Serving>();
+    assert_send_sync::<Streaming>();
     assert_send_sync::<Typed<rig_core::effect::family::Completion>>();
 };

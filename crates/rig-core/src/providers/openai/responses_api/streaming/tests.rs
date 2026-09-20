@@ -1,23 +1,27 @@
 use super::{
-    ContentPartChunkPart, ItemChunk, ItemChunkKind, RawChoiceAccumulator, ResponsesStreamOptions,
-    StreamingCompletionChunk, classify_responses_frame, reasoning_from_done_item,
-    stream_events_from_sse_body,
+    ContentPartChunkPart, ItemChunk, ItemChunkKind, RawChoiceAccumulator, ResponsesDecoder,
+    ResponsesStreamOptions, StreamingCompletionChunk, classify_responses_frame,
+    reasoning_from_done_item,
 };
-use crate::completion::CompletionModel;
+use crate::completion::{CompletionError, CompletionModel};
+use crate::driver::{Bound, WireDriver};
 use crate::error::{ErrorKind, ErrorReport};
 use crate::message::{AssistantContent, ReasoningContent};
-use crate::providers::internal::adapter::AdapterOutput;
+use crate::operation::AdapterOutput;
+use crate::operation::Completion;
 use crate::providers::internal::openai_chat_completions_compatible::test_support::{
     sse_bytes_from_data_lines, sse_bytes_from_json_events,
 };
 use crate::providers::internal::wire::WireEvent;
+use crate::providers::openai::OpenAI;
 use crate::providers::openai::responses_api::{
     AdditionalParameters, CompletionResponse, IncompleteDetailsReason, OutputTokensDetails,
     ReasoningSummary, ResponseError, ResponseObject, ResponseStatus, ResponsesUsage,
 };
 use crate::streaming::{BlockClose, BlockId, BlockKind, Delta, StreamEvent};
 use crate::test_utils::MockStreamingClient;
-use crate::{client::CompletionClient, providers::openai};
+use crate::wire::WireFrame;
+use crate::wire::{Fold, Operation, Reply};
 use futures::StreamExt;
 use serde_json::{self, json};
 
@@ -97,7 +101,7 @@ fn classify_reasoning_text_done_is_known_and_decodes() {
 /// a no-op: replaying it would double every raw-reasoning block.
 #[test]
 fn reasoning_text_done_emits_nothing() {
-    let mut accumulator = RawChoiceAccumulator::new("openai", ResponsesUsage::new());
+    let mut accumulator = RawChoiceAccumulator::new("openai", None);
     let chunk: ItemChunk = serde_json::from_value(json!({
         "type": "response.reasoning_text.done",
         "item_id": "rs_1",
@@ -235,17 +239,84 @@ fn sample_response(status: ResponseStatus) -> CompletionResponse {
     }
 }
 
-async fn first_error_from_event(event: serde_json::Value) -> ErrorReport {
-    let client = openai::Client::builder()
-        .http_client(MockStreamingClient {
-            sse_bytes: sse_bytes_from_json_events(&[event]),
-        })
-        .api_key("test-key")
-        .build()
-        .expect("client should build");
-    let model = client.completion_model("gpt-5.4");
+/// The OpenAI Responses stream one scripted transport yields: the live
+/// loop, over a socket that answers from a script.
+async fn responses_stream<H: crate::driver::Socket>(
+    http: H,
+) -> crate::streaming::StreamingCompletionResponse {
+    let model = Bound::new(OpenAI::new("test-key").responses("gpt-5.4"), http);
     let request = model.completion_request("hello").build();
-    let mut stream = model.stream(request).await.expect("stream should start");
+    model.stream(request).await.expect("stream should start")
+}
+
+/// The same, for a body scripted as JSON events.
+async fn responses_stream_of(
+    events: &[serde_json::Value],
+) -> crate::streaming::StreamingCompletionResponse {
+    responses_stream(MockStreamingClient {
+        sse_bytes: sse_bytes_from_json_events(events),
+    })
+    .await
+}
+
+/// The events one buffered Responses SSE body decodes to.
+///
+/// The buffered twin of a stream: the SAME decoder the live loop runs,
+/// driven by the SAME [`WireDriver`], without a socket. There is no stream
+/// to carry `Err` items here, so the first data error fails the whole
+/// decode rather than returning a silently partial completion.
+fn stream_events_from_sse_body(
+    provider: &str,
+    body: &str,
+    initial_usage: Option<ResponsesUsage>,
+) -> Result<Vec<StreamEvent>, CompletionError> {
+    let mut driver: WireDriver<Completion, _> = WireDriver::new(
+        ResponsesDecoder::new(provider, ResponsesStreamOptions::strict())
+            .with_envelope_repair()
+            .with_initial_usage(initial_usage),
+    );
+    let mut events = Vec::new();
+    for line in body.lines() {
+        let Some(data) = line.strip_prefix("data:").map(str::trim) else {
+            continue;
+        };
+        if data.is_empty() || data == "[DONE]" {
+            continue;
+        }
+        driver.push(WireFrame::Text(data.to_owned()));
+        for item in driver.drain() {
+            events.push(item?);
+        }
+    }
+    driver.finish();
+    for item in driver.drain() {
+        events.push(item?);
+    }
+    Ok(events)
+}
+
+/// The response a decoded event sequence folds to: the operation's own
+/// fold — the one [`crate::driver::stream`] drains into — closed with the
+/// reply document the turn came from.
+fn folded_stream_events(
+    provider: &str,
+    events: Vec<StreamEvent>,
+    raw_response: &CompletionResponse,
+) -> Result<crate::completion::CompletionResponse, CompletionError> {
+    let reply = Reply {
+        provider: provider.to_owned(),
+        raw: serde_json::to_value(raw_response)?,
+        provider_request_id: raw_response.provider_request_id.clone(),
+    };
+    let mut fold = <Completion as Operation>::Fold::default();
+    for event in events {
+        fold.absorb(event)?;
+    }
+    fold.finish(reply)
+}
+
+async fn first_error_from_event(event: serde_json::Value) -> ErrorReport {
+    let mut stream = responses_stream_of(&[event]).await;
 
     stream
         .next()
@@ -257,16 +328,7 @@ async fn first_error_from_event(event: serde_json::Value) -> ErrorReport {
 /// The provider-native terminal record, recovered from the serialized
 /// `StreamFinal::raw` the stream's terminal carries.
 async fn final_response_from_event(event: serde_json::Value) -> super::StreamingCompletionResponse {
-    let client = openai::Client::builder()
-        .http_client(MockStreamingClient {
-            sse_bytes: sse_bytes_from_json_events(&[event]),
-        })
-        .api_key("test-key")
-        .build()
-        .expect("client should build");
-    let model = client.completion_model("gpt-5.4");
-    let request = model.completion_request("hello").build();
-    let mut stream = model.stream(request).await.expect("stream should start");
+    let mut stream = responses_stream_of(&[event]).await;
 
     while let Some(item) = stream.next().await {
         if let StreamEvent::Final(response) = item.expect("completed stream should not error") {
@@ -280,16 +342,7 @@ async fn final_response_from_event(event: serde_json::Value) -> super::Streaming
 
 /// The normalized terminal record, as `stream` exposes it.
 async fn stream_final_from_event(event: serde_json::Value) -> crate::streaming::StreamFinal {
-    let client = openai::Client::builder()
-        .http_client(MockStreamingClient {
-            sse_bytes: sse_bytes_from_json_events(&[event]),
-        })
-        .api_key("test-key")
-        .build()
-        .expect("client should build");
-    let model = client.completion_model("gpt-5.4");
-    let request = model.completion_request("hello").build();
-    let mut stream = model.stream(request).await.expect("stream should start");
+    let mut stream = responses_stream_of(&[event]).await;
 
     while let Some(item) = stream.next().await {
         if let StreamEvent::Final(response) = item.expect("completed stream should not error") {
@@ -334,7 +387,7 @@ async fn flushed_tool_call_then_error(
 }
 
 #[test]
-fn parse_sse_completion_body_preserves_error_payloads() {
+fn a_buffered_body_preserves_its_error_payloads() {
     let mut response = sample_response(ResponseStatus::Failed);
     response.error = Some(ResponseError {
         code: "server_error".to_string(),
@@ -359,7 +412,7 @@ fn parse_sse_completion_body_preserves_error_payloads() {
     for event in events {
         let payload = serde_json::to_string(&event).expect("event should serialize");
         let body = format!("data: {payload}\n");
-        let err = super::parse_sse_completion_body(&body, "ChatGPT")
+        let err = stream_events_from_sse_body("ChatGPT", &body, None)
             .expect_err("error payload should surface as provider response");
 
         assert!(matches!(
@@ -423,8 +476,8 @@ fn reasoning_output_item_done_emits_reasoning_text_content() {
         })
     );
 
-    let events = stream_events_from_sse_body("openai", &body, ResponsesUsage::new())
-        .expect("sse body should decode");
+    let events =
+        stream_events_from_sse_body("openai", &body, None).expect("sse body should decode");
 
     // The done item opens its block under the item's `rs_*` id and closes
     // it with one wire-sent end restatement whose single block is the
@@ -495,7 +548,7 @@ fn envelope_less_reasoning_then_text_decodes_without_violation() {
         }),
     );
 
-    let events = stream_events_from_sse_body("openai", &body, ResponsesUsage::new())
+    let events = stream_events_from_sse_body("openai", &body, None)
         .expect("sse body should decode without a sequence-law violation");
     assert!(events.iter().any(|event| matches!(
         event,
@@ -517,8 +570,8 @@ fn reasoning_text_delta_emits_reasoning_delta() {
         })
     );
 
-    let events = stream_events_from_sse_body("openai", &body, ResponsesUsage::new())
-        .expect("sse body should decode");
+    let events =
+        stream_events_from_sse_body("openai", &body, None).expect("sse body should decode");
 
     // The first delta for an unseen id opens its block, carrying the
     // wire's `rs_*` id as the durable provider id.
@@ -560,8 +613,8 @@ fn unknown_output_item_surfaces_as_raw_unknown_choice() {
         })
     );
 
-    let events = stream_events_from_sse_body("openai", &body, ResponsesUsage::new())
-        .expect("sse body should decode");
+    let events =
+        stream_events_from_sse_body("openai", &body, None).expect("sse body should decode");
 
     let unknown = events.iter().find_map(|event| match event {
         StreamEvent::Unknown(value) => Some(value),
@@ -796,16 +849,10 @@ async fn response_incomplete_chunk_is_a_successful_terminal_with_mapped_finish_r
         "response": response,
     });
 
-    let client = openai::Client::builder()
-        .http_client(MockStreamingClient {
-            sse_bytes: sse_bytes_from_json_events(&[text_delta, incomplete]),
-        })
-        .api_key("test-key")
-        .build()
-        .expect("client should build");
-    let model = client.completion_model("gpt-5.4");
-    let request = model.completion_request("hello").build();
-    let mut stream = model.stream(request).await.expect("stream should start");
+    let mut stream = responses_stream(MockStreamingClient {
+        sse_bytes: sse_bytes_from_json_events(&[text_delta, incomplete]),
+    })
+    .await;
 
     let mut text = String::new();
     let mut final_response = None;
@@ -828,9 +875,9 @@ async fn response_incomplete_chunk_is_a_successful_terminal_with_mapped_finish_r
         final_response.finish_reason,
         Some(crate::completion::FinishReason::Length)
     );
-    assert_eq!(final_response.usage.input_tokens, 10);
-    assert_eq!(final_response.usage.output_tokens, 5);
-    assert_eq!(final_response.usage.total_tokens, 15);
+    assert_eq!(final_response.usage.input_tokens, Some(10));
+    assert_eq!(final_response.usage.output_tokens, Some(5));
+    assert_eq!(final_response.usage.total_tokens, Some(15));
 }
 
 /// A multi-block reasoning done item (summaries + `encrypted_content`)
@@ -861,16 +908,10 @@ async fn multi_block_reasoning_done_item_yields_one_part() {
         "response": sample_response(ResponseStatus::Completed),
     });
 
-    let client = openai::Client::builder()
-        .http_client(MockStreamingClient {
-            sse_bytes: sse_bytes_from_json_events(&[reasoning_done, completed]),
-        })
-        .api_key("test-key")
-        .build()
-        .expect("client should build");
-    let model = client.completion_model("gpt-5.4");
-    let request = model.completion_request("hello").build();
-    let mut stream = model.stream(request).await.expect("stream should start");
+    let mut stream = responses_stream(MockStreamingClient {
+        sse_bytes: sse_bytes_from_json_events(&[reasoning_done, completed]),
+    })
+    .await;
 
     let mut completed_reasoning = Vec::new();
     while let Some(item) = stream.next().await {
@@ -943,16 +984,10 @@ async fn response_failed_flushes_delivered_tool_calls_before_the_error() {
         "response": response,
     });
 
-    let client = openai::Client::builder()
-        .http_client(MockStreamingClient {
-            sse_bytes: sse_bytes_from_json_events(&[tool_call_done, failed]),
-        })
-        .api_key("test-key")
-        .build()
-        .expect("client should build");
-    let model = client.completion_model("gpt-5.4");
-    let request = model.completion_request("hello").build();
-    let mut stream = model.stream(request).await.expect("stream should start");
+    let mut stream = responses_stream(MockStreamingClient {
+        sse_bytes: sse_bytes_from_json_events(&[tool_call_done, failed]),
+    })
+    .await;
 
     // The flushed call (its block start and its completed end) precedes
     // the terminal error.
@@ -980,7 +1015,6 @@ async fn response_failed_flushes_delivered_tool_calls_before_the_error() {
 /// the error, then the end — with no terminal record.
 #[tokio::test]
 async fn transport_error_flushes_delivered_tool_calls_before_the_error() {
-    use crate::http_client::sse::GenericEventSource;
     use crate::test_utils::SequencedStreamingHttpClient;
 
     let tool_call_done = json!({
@@ -1004,17 +1038,7 @@ async fn transport_error_flushes_delivered_tool_calls_before_the_error() {
             r#"{"error":{"message":"upstream unavailable"}}"#.to_string(),
         )),
     ];
-    let client = SequencedStreamingHttpClient::new(chunks);
-    let req = http::Request::builder()
-        .method("POST")
-        .uri("http://localhost/v1/responses")
-        .body(Vec::new())
-        .expect("request should build");
-    let event_source = GenericEventSource::new(client, req);
-    let mut stream = crate::streaming::StreamingCompletionResponse::stream(
-        "openai",
-        super::responses_stream_from_event_source("openai", event_source, tracing::Span::none()),
-    );
+    let mut stream = responses_stream(SequencedStreamingHttpClient::new(chunks)).await;
 
     let (tool_call, err) = flushed_tool_call_then_error(&mut stream).await;
     assert_eq!(tool_call.id.explicit(), Some("call_123"));
@@ -1044,16 +1068,7 @@ async fn known_terminal_with_malformed_usage_surfaces_error_without_terminal() {
     });
     event["response"]["usage"] = json!("banana");
 
-    let client = openai::Client::builder()
-        .http_client(MockStreamingClient {
-            sse_bytes: sse_bytes_from_json_events(&[event]),
-        })
-        .api_key("test-key")
-        .build()
-        .expect("client should build");
-    let model = client.completion_model("gpt-5.4");
-    let request = model.completion_request("hello").build();
-    let mut stream = model.stream(request).await.expect("stream should start");
+    let mut stream = responses_stream_of(&[event]).await;
 
     let mut saw_error = false;
     let mut saw_final = false;
@@ -1093,16 +1108,10 @@ async fn unknown_event_type_is_skipped_and_stream_completes() {
         "response": sample_response(ResponseStatus::Completed),
     });
 
-    let client = openai::Client::builder()
-        .http_client(MockStreamingClient {
-            sse_bytes: sse_bytes_from_json_events(&[unknown, completed]),
-        })
-        .api_key("test-key")
-        .build()
-        .expect("client should build");
-    let model = client.completion_model("gpt-5.4");
-    let request = model.completion_request("hello").build();
-    let mut stream = model.stream(request).await.expect("stream should start");
+    let mut stream = responses_stream(MockStreamingClient {
+        sse_bytes: sse_bytes_from_json_events(&[unknown, completed]),
+    })
+    .await;
 
     let mut saw_final = false;
     while let Some(item) = stream.next().await {
@@ -1162,22 +1171,16 @@ async fn refusal_content_part_frames_are_no_ops_and_refusal_text_streams() {
         "response": sample_response(ResponseStatus::Completed),
     });
 
-    let client = openai::Client::builder()
-        .http_client(MockStreamingClient {
-            sse_bytes: sse_bytes_from_json_events(&[
-                part_added,
-                refusal_delta,
-                part_done,
-                reasoning_part,
-                completed,
-            ]),
-        })
-        .api_key("test-key")
-        .build()
-        .expect("client should build");
-    let model = client.completion_model("gpt-5.4");
-    let request = model.completion_request("hello").build();
-    let mut stream = model.stream(request).await.expect("stream should start");
+    let mut stream = responses_stream(MockStreamingClient {
+        sse_bytes: sse_bytes_from_json_events(&[
+            part_added,
+            refusal_delta,
+            part_done,
+            reasoning_part,
+            completed,
+        ]),
+    })
+    .await;
 
     let mut texts = Vec::new();
     let mut saw_final = false;
@@ -1221,16 +1224,10 @@ async fn truncated_stream_does_not_synthesize_a_terminal_record() {
         }),
     ];
 
-    let client = openai::Client::builder()
-        .http_client(MockStreamingClient {
-            sse_bytes: sse_bytes_from_json_events(&deltas),
-        })
-        .api_key("test-key")
-        .build()
-        .expect("client should build");
-    let model = client.completion_model("gpt-5.4");
-    let request = model.completion_request("hello").build();
-    let mut stream = model.stream(request).await.expect("stream should start");
+    let mut stream = responses_stream(MockStreamingClient {
+        sse_bytes: sse_bytes_from_json_events(&deltas),
+    })
+    .await;
 
     let mut texts = Vec::new();
     let mut saw_terminal = false;
@@ -1267,16 +1264,10 @@ async fn streaming_error_event_preserves_full_payload_in_live_loop() {
         }
     });
 
-    let client = openai::Client::builder()
-        .http_client(MockStreamingClient {
-            sse_bytes: sse_bytes_from_json_events(&[payload]),
-        })
-        .api_key("test-key")
-        .build()
-        .expect("client should build");
-    let model = client.completion_model("gpt-5.4");
-    let request = model.completion_request("hello").build();
-    let mut stream = model.stream(request).await.expect("stream should start");
+    let mut stream = responses_stream(MockStreamingClient {
+        sse_bytes: sse_bytes_from_json_events(&[payload]),
+    })
+    .await;
 
     let err = stream
         .next()
@@ -1297,22 +1288,14 @@ async fn streaming_error_event_preserves_full_payload_in_live_loop() {
 
 #[tokio::test]
 async fn streaming_http_non_success_preserves_status_and_body() {
-    use crate::http_client::sse::GenericEventSource;
     use crate::test_utils::HttpErrorStreamingClient;
 
     let body = r#"{"error":{"message":"quota exceeded"}}"#;
-    let client = HttpErrorStreamingClient::new(http::StatusCode::TOO_MANY_REQUESTS, body);
-    let req = http::Request::builder()
-        .method("POST")
-        .uri("http://localhost/v1/responses")
-        .body(Vec::new())
-        .expect("request should build");
-    let event_source = GenericEventSource::new(client, req);
-    let span = tracing::Span::none();
-    let mut stream = crate::streaming::StreamingCompletionResponse::stream(
-        "openai",
-        super::responses_stream_from_event_source("openai", event_source, span),
-    );
+    let mut stream = responses_stream(HttpErrorStreamingClient::new(
+        http::StatusCode::TOO_MANY_REQUESTS,
+        body,
+    ))
+    .await;
 
     let err = stream
         .next()
@@ -1350,7 +1333,7 @@ fn corrupt_known_frame_fails_the_buffered_body() {
     });
     let body = format!("data: {corrupt}\ndata: {completed}\n");
 
-    let err = stream_events_from_sse_body("openai", &body, ResponsesUsage::new())
+    let err = stream_events_from_sse_body("openai", &body, None)
         .expect_err("a corrupt known frame must fail the buffered decode");
     assert!(
         err.to_string().contains("response.output_text.delta"),
@@ -1359,13 +1342,13 @@ fn corrupt_known_frame_fails_the_buffered_body() {
 
     // Syntactically invalid JSON fails too.
     let body = format!("data: {{not json\ndata: {completed}\n");
-    stream_events_from_sse_body("openai", &body, ResponsesUsage::new())
+    stream_events_from_sse_body("openai", &body, None)
         .expect_err("invalid JSON must fail the buffered decode");
 
     // Unknown event types stay skippable.
     let unknown = json!({ "type": "response.rocket_launch", "count": 3 });
     let body = format!("data: {unknown}\ndata: {completed}\n");
-    let events = stream_events_from_sse_body("openai", &body, ResponsesUsage::new())
+    let events = stream_events_from_sse_body("openai", &body, None)
         .expect("unknown event types must stay skippable");
     assert!(
         events
@@ -1390,7 +1373,7 @@ fn envelope_less_frames_repair_onto_the_shared_interpreter() {
         "data: {}\ndata: {completed}\n",
         json!({ "type": "response.output_text.delta", "delta": "hi" })
     );
-    let events = stream_events_from_sse_body("openai", &body, ResponsesUsage::new())
+    let events = stream_events_from_sse_body("openai", &body, None)
         .expect("an envelope-less delta must repair and decode");
     assert!(events.iter().any(|event| matches!(
         event,
@@ -1405,7 +1388,7 @@ fn envelope_less_frames_repair_onto_the_shared_interpreter() {
         "data: {}\ndata: {completed}\n",
         json!({ "type": "response.function_call_arguments.delta", "delta": "{}" })
     );
-    let events = stream_events_from_sse_body("openai", &body, ResponsesUsage::new())
+    let events = stream_events_from_sse_body("openai", &body, None)
         .expect("an id-less args delta must repair and decode");
     assert!(events.iter().any(|event| matches!(
         event,
@@ -1420,7 +1403,7 @@ fn envelope_less_frames_repair_onto_the_shared_interpreter() {
         "data: {}\ndata: {completed}\n",
         json!({ "type": "response.output_text.done", "text": "hi" })
     );
-    let events = stream_events_from_sse_body("openai", &body, ResponsesUsage::new())
+    let events = stream_events_from_sse_body("openai", &body, None)
         .expect("an envelope-less done event must repair to the live no-op");
     assert!(
         events
@@ -1434,7 +1417,7 @@ fn envelope_less_frames_repair_onto_the_shared_interpreter() {
         "data: {}\ndata: {completed}\n",
         json!({ "type": "response.reasoning_summary_text.delta", "delta": "think" })
     );
-    let events = stream_events_from_sse_body("openai", &body, ResponsesUsage::new())
+    let events = stream_events_from_sse_body("openai", &body, None)
         .expect("an envelope-less summary delta must repair and decode");
     assert!(events.iter().any(|event| matches!(
         event,
@@ -1480,7 +1463,7 @@ data: {done}
 "
     );
 
-    let events = stream_events_from_sse_body("openai", &body, ResponsesUsage::new())
+    let events = stream_events_from_sse_body("openai", &body, None)
         .expect("the truncated shape must decode");
     let raw_fragments: Vec<&str> = events
         .iter()
@@ -1522,7 +1505,7 @@ fn a_fragmentless_unparseable_restatement_still_reaches_the_buffer() {
 "
     );
 
-    let events = stream_events_from_sse_body("openai", &body, ResponsesUsage::new())
+    let events = stream_events_from_sse_body("openai", &body, None)
         .expect("the replayed truncated shape must decode");
     let raw_fragments = events
         .iter()
@@ -1581,8 +1564,8 @@ async fn mixed_id_and_id_less_reasoning_frames_share_one_slot_key() {
     });
     let body = format!("data: {with_id}\ndata: {id_less}\ndata: {done}\ndata: {completed}\n");
 
-    let raw_choices = stream_events_from_sse_body("openai", &body, ResponsesUsage::new())
-        .expect("the mixed slot must decode");
+    let raw_choices =
+        stream_events_from_sse_body("openai", &body, None).expect("the mixed slot must decode");
     let mut keys = std::collections::HashSet::new();
     for event in &raw_choices {
         match event {
@@ -1611,11 +1594,8 @@ async fn mixed_id_and_id_less_reasoning_frames_share_one_slot_key() {
     );
 
     let raw_response = sample_response(ResponseStatus::Completed);
-    let response =
-        super::completion_response_from_stream_events("openai", raw_choices, &raw_response)
-            .await
-            .expect("the mixed slot should normalize")
-            .expect("a reasoning-bearing stream is not empty");
+    let response = folded_stream_events("openai", raw_choices, &raw_response)
+        .expect("the mixed slot should normalize");
     let reasoning_parts = response
         .choice
         .iter()
@@ -1655,7 +1635,7 @@ async fn envelope_less_reasoning_deltas_are_superseded_by_their_done_item() {
     });
     let body = format!("data: {delta}\ndata: {done}\ndata: {completed}\n");
 
-    let raw_choices = stream_events_from_sse_body("openai", &body, ResponsesUsage::new())
+    let raw_choices = stream_events_from_sse_body("openai", &body, None)
         .expect("the envelope-less reasoning replay must decode");
     // The done item's restatement shares the minted per-slot identity.
     assert!(raw_choices.iter().any(|event| matches!(
@@ -1668,11 +1648,8 @@ async fn envelope_less_reasoning_deltas_are_superseded_by_their_done_item() {
     )));
 
     let raw_response = sample_response(ResponseStatus::Completed);
-    let response =
-        super::completion_response_from_stream_events("chatgpt", raw_choices, &raw_response)
-            .await
-            .expect("replay should normalize")
-            .expect("a reasoning-bearing replay is not empty");
+    let response = folded_stream_events("chatgpt", raw_choices, &raw_response)
+        .expect("replay should normalize");
 
     let reasoning: Vec<_> = response
         .choice
@@ -1746,7 +1723,7 @@ async fn same_item_text_resumes_as_one_part_across_interleaved_reasoning() {
         .map(|event| format!("data: {event}\n"))
         .collect::<String>();
 
-    let raw_choices = stream_events_from_sse_body("openai", &body, ResponsesUsage::new())
+    let raw_choices = stream_events_from_sse_body("openai", &body, None)
         .expect("the interleaved stream must decode");
     // The resumed item re-announces its block: two text `BlockStart { msg_1 }`.
     let starts = raw_choices
@@ -1765,11 +1742,8 @@ async fn same_item_text_resumes_as_one_part_across_interleaved_reasoning() {
     );
 
     let raw_response = sample_response(ResponseStatus::Completed);
-    let response =
-        super::completion_response_from_stream_events("openai", raw_choices, &raw_response)
-            .await
-            .expect("replay should normalize")
-            .expect("a text-bearing replay is not empty");
+    let response = folded_stream_events("openai", raw_choices, &raw_response)
+        .expect("replay should normalize");
     let texts: Vec<_> = response
         .choice
         .iter()
@@ -1848,7 +1822,7 @@ async fn mixed_id_and_id_less_events_share_one_slot_key() {
         .map(|event| format!("data: {event}\n"))
         .collect::<String>();
 
-    let raw_choices = stream_events_from_sse_body("openai", &body, ResponsesUsage::new())
+    let raw_choices = stream_events_from_sse_body("openai", &body, None)
         .expect("the mixed-id stream must decode");
 
     // Every tool event (block start, name delta, args delta, end) carries
@@ -1880,11 +1854,8 @@ async fn mixed_id_and_id_less_events_share_one_slot_key() {
     );
 
     let raw_response = sample_response(ResponseStatus::Completed);
-    let response =
-        super::completion_response_from_stream_events("openai", raw_choices, &raw_response)
-            .await
-            .expect("replay should normalize")
-            .expect("a tool-bearing replay is not empty");
+    let response = folded_stream_events("openai", raw_choices, &raw_response)
+        .expect("replay should normalize");
     let call = response
         .choice
         .iter()
@@ -1956,14 +1927,11 @@ async fn parallel_id_less_function_calls_assemble_distinctly() {
         .map(|event| format!("data: {event}\n"))
         .collect::<String>();
 
-    let raw_choices = stream_events_from_sse_body("openai", &body, ResponsesUsage::new())
+    let raw_choices = stream_events_from_sse_body("openai", &body, None)
         .expect("the id-less parallel-call stream must decode");
     let raw_response = sample_response(ResponseStatus::Completed);
-    let response =
-        super::completion_response_from_stream_events("openai", raw_choices, &raw_response)
-            .await
-            .expect("replay should normalize")
-            .expect("a tool-bearing replay is not empty");
+    let response = folded_stream_events("openai", raw_choices, &raw_response)
+        .expect("replay should normalize");
 
     let mut calls: Vec<_> = response
         .choice
@@ -2028,14 +1996,11 @@ async fn a_lost_done_frame_does_not_discard_a_provider_completed_call() {
         .map(|event| format!("data: {event}\n"))
         .collect::<String>();
 
-    let raw_choices = stream_events_from_sse_body("openai", &body, ResponsesUsage::new())
-        .expect("the stream must decode");
+    let raw_choices =
+        stream_events_from_sse_body("openai", &body, None).expect("the stream must decode");
     let raw_response = sample_response(ResponseStatus::Completed);
-    let response =
-        super::completion_response_from_stream_events("openai", raw_choices, &raw_response)
-            .await
-            .expect("replay should normalize")
-            .expect("a tool-bearing replay is not empty");
+    let response = folded_stream_events("openai", raw_choices, &raw_response)
+        .expect("replay should normalize");
 
     let calls: Vec<_> = response
         .choice
@@ -2086,7 +2051,7 @@ async fn id_less_args_deltas_surface_and_truncation_fabricates_no_call() {
         .map(|event| format!("data: {event}\n"))
         .collect::<String>();
 
-    let raw_choices = stream_events_from_sse_body("openai", &body, ResponsesUsage::new())
+    let raw_choices = stream_events_from_sse_body("openai", &body, None)
         .expect("the truncated id-less stream must decode");
     // The fragment flowed into assembly under the minted identity.
     assert!(
@@ -2103,13 +2068,12 @@ async fn id_less_args_deltas_surface_and_truncation_fabricates_no_call() {
     // No done restatement arrived: the truncation policy withholds the
     // call rather than fabricating one from partial arguments.
     let raw_response = sample_response(ResponseStatus::Completed);
-    let response =
-        super::completion_response_from_stream_events("openai", raw_choices, &raw_response)
-            .await
-            .expect("replay should normalize");
+    let response = folded_stream_events("openai", raw_choices, &raw_response)
+        .expect("the fold should not error");
     assert!(
-        response.is_none(),
-        "partial arguments must not fabricate a call: {response:?}"
+        response.choice.is_empty(),
+        "partial arguments must not fabricate a call: {:?}",
+        response.choice
     );
 }
 
@@ -2147,7 +2111,7 @@ data: {completed}
 "
     );
 
-    let events = stream_events_from_sse_body("openai", &body, ResponsesUsage::new())
+    let events = stream_events_from_sse_body("openai", &body, None)
         .expect("refusal content-part frames must not fail the buffered decode");
     assert!(
         events.iter().any(|event| matches!(
@@ -2158,63 +2122,97 @@ data: {completed}
     );
 }
 
-/// The replayed choice keeps its reasoning/tool calls, but message text
-/// present only in the terminal body's `output` must merge in when no text
-/// deltas were streamed (websocket replays hit exactly this quadrant).
-#[tokio::test]
-async fn terminal_body_message_text_merges_into_reasoning_only_replay() {
-    use crate::providers::openai::responses_api::Output;
+/// One `message` output item, as a terminal response body states it.
+fn message_output_item(id: &str, text: &str) -> crate::providers::openai::responses_api::Output {
+    serde_json::from_value(json!({
+        "type": "message",
+        "id": id,
+        "role": "assistant",
+        "status": "completed",
+        "content": [{ "type": "output_text", "annotations": [], "text": text }],
+    }))
+    .expect("output message should deserialize")
+}
 
-    let raw_choices = vec![
-        StreamEvent::BlockStart {
-            id: BlockId::wire("rs_1"),
-            kind: BlockKind::Reasoning {
-                provider_id: crate::streaming::non_empty_id("rs_1"),
-            },
-        },
-        StreamEvent::BlockDelta {
-            id: BlockId::wire("rs_1"),
-            delta: Delta::Reasoning {
-                text: "thinking".to_string(),
-            },
-        },
-    ];
-
-    let mut raw_response = sample_response(ResponseStatus::Completed);
-    raw_response.output = vec![
-        serde_json::from_value::<Output>(json!({
-            "type": "message",
-            "id": "msg_body_1",
-            "status": "completed",
-            "role": "assistant",
-            "content": [{ "type": "output_text", "annotations": [], "text": "full answer" }]
-        }))
-        .expect("output message should deserialize"),
-    ];
-
-    let response =
-        super::completion_response_from_stream_events("openai", raw_choices, &raw_response)
-            .await
-            .expect("replay should normalize")
-            .expect("a reasoning-bearing replay is not empty");
-
-    let text: String = response
+/// The visible text parts of a folded choice, in order.
+fn choice_text_parts(response: &crate::completion::CompletionResponse) -> Vec<String> {
+    response
         .choice
         .iter()
         .filter_map(|content| match content {
-            crate::completion::AssistantContent::Text(text) => Some(text.text.as_str()),
+            crate::completion::AssistantContent::Text(text) => Some(text.text.clone()),
             _ => None,
         })
-        .collect();
-    assert_eq!(text, "full answer");
-    assert!(
-        response
-            .choice
-            .iter()
-            .any(|content| matches!(content, crate::completion::AssistantContent::Reasoning(_))),
-        "the replayed reasoning must be kept"
+        .collect()
+}
+
+/// The terminal restates the whole turn, and its message text IS the turn's
+/// answer when nothing else stated it: a gateway that answers a unary call
+/// with a replayed event stream can deliver a message only inside
+/// `response.completed`'s `output` — no `output_text.delta`, no
+/// `output_item.done` for it — so dropping that text loses the reply
+/// entirely.
+///
+/// Driven on the plain `openai` provider: a body-only terminal is a shape
+/// any Responses dialect can send, so the merge is no dialect's quirk.
+#[test]
+fn terminal_body_message_text_merges_when_no_delta_delivered_it() {
+    let mut raw_response = sample_response(ResponseStatus::Completed);
+    raw_response.output = vec![message_output_item("msg_body_1", "from body")];
+    let completed = json!({
+        "type": "response.completed",
+        "sequence_number": 1,
+        "response": raw_response,
+    });
+    let body = format!("data: {completed}\n");
+
+    let events = stream_events_from_sse_body("openai", &body, None)
+        .expect("a body-only terminal must decode");
+    let response =
+        folded_stream_events("openai", events, &raw_response).expect("the fold should not error");
+
+    assert_eq!(
+        choice_text_parts(&response),
+        ["from body"],
+        "text stated only in the terminal body must reach the choice once"
     );
     assert_eq!(response.message_id.as_deref(), Some("msg_body_1"));
+}
+
+/// The other half of that boundary: a terminal restating text the deltas
+/// already delivered adds nothing. The merge publishes the terminal's
+/// content only where no delta delivered it, so an ungated merge — or one
+/// keyed on a slot the delta never opened — would state one turn's answer
+/// twice.
+#[test]
+fn terminal_body_message_text_restating_a_delta_is_not_duplicated() {
+    let text_delta = json!({
+        "type": "response.output_text.delta",
+        "item_id": "msg_body_1",
+        "output_index": 0,
+        "content_index": 0,
+        "sequence_number": 1,
+        "delta": "from body",
+    });
+    let mut raw_response = sample_response(ResponseStatus::Completed);
+    raw_response.output = vec![message_output_item("msg_body_1", "from body")];
+    let completed = json!({
+        "type": "response.completed",
+        "sequence_number": 2,
+        "response": raw_response,
+    });
+    let body = format!("data: {text_delta}\ndata: {completed}\n");
+
+    let events = stream_events_from_sse_body("openai", &body, None)
+        .expect("a restating terminal must decode");
+    let response =
+        folded_stream_events("openai", events, &raw_response).expect("the fold should not error");
+
+    assert_eq!(
+        choice_text_parts(&response),
+        ["from body"],
+        "the terminal's restatement must not duplicate the delta-built text"
+    );
 }
 
 #[test]
@@ -2222,7 +2220,7 @@ fn streaming_error_event_preserves_full_payload() {
     let payload = r#"{"type":"error","error":{"message":"boom","code":"server_error","type":"server_error"}}"#;
     let body = format!("data: {payload}\n");
 
-    let err = stream_events_from_sse_body("openai", &body, ResponsesUsage::new())
+    let err = stream_events_from_sse_body("openai", &body, None)
         .expect_err("error event should surface as a provider response error");
 
     assert_eq!(err.provider_response_status(), None);
@@ -2236,24 +2234,12 @@ fn streaming_error_event_preserves_full_payload() {
 
 #[tokio::test]
 async fn streaming_non_http_transport_error_stays_a_transport_error() {
-    use crate::http_client::sse::GenericEventSource;
     use crate::test_utils::SequencedStreamingHttpClient;
 
     let chunks = vec![Err(crate::http_client::Error::InvalidContentType(
         http::HeaderValue::from_static("application/json"),
     ))];
-    let client = SequencedStreamingHttpClient::new(chunks);
-    let req = http::Request::builder()
-        .method("POST")
-        .uri("http://localhost/v1/responses")
-        .body(Vec::new())
-        .expect("request should build");
-    let event_source = GenericEventSource::new(client, req);
-    let span = tracing::Span::none();
-    let mut stream = crate::streaming::StreamingCompletionResponse::stream(
-        "openai",
-        super::responses_stream_from_event_source("openai", event_source, span),
-    );
+    let mut stream = responses_stream(SequencedStreamingHttpClient::new(chunks)).await;
 
     let err = stream
         .next()
@@ -2289,9 +2275,42 @@ async fn response_completed_chunk_populates_final_usage() {
         "response": response,
     });
 
-    let usage = final_response_from_event(event).await.usage;
+    let usage = final_response_from_event(event)
+        .await
+        .usage
+        .expect("the terminal carries usage");
     assert_eq!(usage.input_tokens, 10);
     assert_eq!(usage.output_tokens, 5);
+    assert_eq!(usage.total_tokens, 15);
+}
+
+/// The terminal `response.completed` frame carries usage. An object-shaped
+/// `top_p` echoed on that frame (MiniMax-style endpoints, rig#2483) or a
+/// numeric one buffered under `serde_json/arbitrary_precision` (rig#2493)
+/// must not turn the terminal into a parse error — that both fails the turn
+/// and loses the usage. Contrast `known_terminal_with_malformed_usage_*`:
+/// a defect in a field rig reads is still an error.
+#[tokio::test]
+async fn response_completed_chunk_tolerates_object_shaped_top_p() {
+    let mut response = serde_json::to_value(sample_response(ResponseStatus::Completed))
+        .expect("sample response serializes");
+    response["top_p"] = json!({ "value": 0.95 });
+    response["usage"] = json!({
+        "input_tokens": 10,
+        "output_tokens": 5,
+        "total_tokens": 15
+    });
+    let event = json!({
+        "type": "response.completed",
+        "sequence_number": 1,
+        "response": response,
+    });
+
+    let usage = final_response_from_event(event)
+        .await
+        .usage
+        .expect("the terminal carries usage");
+    assert_eq!(usage.input_tokens, 10);
     assert_eq!(usage.total_tokens, 15);
 }
 
@@ -2351,9 +2370,9 @@ async fn terminal_record_normalizes_into_the_stream_final() {
         final_response.finish_reason,
         Some(crate::completion::FinishReason::Stop)
     );
-    assert_eq!(final_response.usage.input_tokens, 10);
-    assert_eq!(final_response.usage.output_tokens, 5);
-    assert_eq!(final_response.usage.total_tokens, 15);
+    assert_eq!(final_response.usage.input_tokens, Some(10));
+    assert_eq!(final_response.usage.output_tokens, Some(5));
+    assert_eq!(final_response.usage.total_tokens, Some(15));
 }
 
 #[tokio::test]
@@ -2377,16 +2396,10 @@ async fn terminal_record_reports_tool_calls_when_the_stream_called_a_tool() {
         "response": sample_response(ResponseStatus::Completed),
     });
 
-    let client = openai::Client::builder()
-        .http_client(MockStreamingClient {
-            sse_bytes: sse_bytes_from_json_events(&[tool_call_done, completed]),
-        })
-        .api_key("test-key")
-        .build()
-        .expect("client should build");
-    let model = client.completion_model("gpt-5.4");
-    let request = model.completion_request("hello").build();
-    let mut stream = model.stream(request).await.expect("stream should start");
+    let mut stream = responses_stream(MockStreamingClient {
+        sse_bytes: sse_bytes_from_json_events(&[tool_call_done, completed]),
+    })
+    .await;
 
     let mut final_response = None;
     while let Some(item) = stream.next().await {
@@ -2415,7 +2428,7 @@ fn terminal_record_preserves_an_unknown_incomplete_reason() {
         }),
         model: Some("gpt-5.4".to_string()),
         message_id: Some("msg_1".to_string()),
-        ..super::StreamingCompletionResponse::new(ResponsesUsage::new())
+        ..super::StreamingCompletionResponse::new(None)
     };
 
     let final_response =
@@ -2484,24 +2497,18 @@ async fn done_sentinel_is_ignored_without_debug_parse_noise() {
         .finish();
     let _guard = tracing::subscriber::set_default(subscriber);
 
-    let client = openai::Client::builder()
-        .http_client(MockStreamingClient {
-            sse_bytes: bytes::Bytes::from(format!(
-                "data: {}\n\ndata: [DONE]\n\n",
-                serde_json::to_string(&json!({
-                    "type": "response.completed",
-                    "sequence_number": 1,
-                    "response": response,
-                }))
-                .expect("response event should serialize")
-            )),
-        })
-        .api_key("test-key")
-        .build()
-        .expect("client should build");
-    let model = client.completion_model("gpt-5.4");
-    let request = model.completion_request("hello").build();
-    let mut stream = model.stream(request).await.expect("stream should start");
+    let mut stream = responses_stream(MockStreamingClient {
+        sse_bytes: bytes::Bytes::from(format!(
+            "data: {}\n\ndata: [DONE]\n\n",
+            serde_json::to_string(&json!({
+                "type": "response.completed",
+                "sequence_number": 1,
+                "response": response,
+            }))
+            .expect("response event should serialize")
+        )),
+    })
+    .await;
 
     let mut final_usage = None;
     while let Some(item) = stream.next().await {
@@ -2511,9 +2518,9 @@ async fn done_sentinel_is_ignored_without_debug_parse_noise() {
     }
 
     let usage = final_usage.expect("expected final response");
-    assert_eq!(usage.input_tokens, 4);
-    assert_eq!(usage.output_tokens, 2);
-    assert_eq!(usage.total_tokens, 6);
+    assert_eq!(usage.input_tokens, Some(4));
+    assert_eq!(usage.output_tokens, Some(2));
+    assert_eq!(usage.total_tokens, Some(6));
 
     let logs = String::from_utf8(
         captured
@@ -2551,14 +2558,7 @@ async fn malformed_frame_surfaces_error_and_stream_still_completes() {
             completed.to_string(),
         ]),
     };
-    let client = openai::Client::builder()
-        .http_client(http_client)
-        .api_key("test-key")
-        .build()
-        .expect("client should build");
-    let model = client.completion_model("gpt-5.4");
-    let request = model.completion_request("hello").build();
-    let mut stream = model.stream(request).await.expect("stream should start");
+    let mut stream = responses_stream(http_client).await;
 
     let mut text = String::new();
     let mut saw_error = false;
@@ -2628,7 +2628,7 @@ fn empty_item_ids_identify_nothing_and_do_not_panic() {
             },
         }),
     );
-    let events = stream_events_from_sse_body("openai", &body, ResponsesUsage::new())
+    let events = stream_events_from_sse_body("openai", &body, None)
         .expect("an empty id is not a decode failure");
     assert!(events.iter().any(|event| matches!(
         event,

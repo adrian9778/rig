@@ -1,27 +1,48 @@
 # Test Suites
 
-Default to minimal relevant local checks, independent review, prompt authorized PR publication, and comprehensive GitHub CI. Choose a focused regression test or narrow compile check for code; documentation/instruction edits need diff and links/consistency review, not Rust suites. `cargo xtask verify --pr` and `--full` are optional for explicit requests or debugging. `--changed` is optional too: inspect its dry-run selection when it could expand broadly; shared inputs can select the full plan, so choose explicit small checks or CI instead. Do not install expensive CI-only prerequisites to publish. See [development verification](../DEVELOPING.md) for check selection, review, publication, and committed-head CI completion.
+Run the smallest useful local check for changed behavior and leave comprehensive
+execution to CI; see [DEVELOPING.md](../DEVELOPING.md) for check selection,
+`cargo xtask verify` modes, review, and publication.
 
-Rig's root crate uses integration test targets under `tests/`.
+Provider test targets have two owners:
 
-- `tests/<provider>.rs` are provider-specific test targets.
-- `tests/providers/<provider>/cassette/` contains provider tests backed by committed HTTP cassettes.
-- `tests/providers/<provider>/live/` contains provider tests that still require a real service.
+- Cassette-backed suites are targets of `rig-cassette`, beside the corpus they
+  replay: `crates/rig-cassette/tests/<provider>.rs` with its modules under
+  `crates/rig-cassette/tests/providers/<provider>/cassette/` (and `/live/`
+  for the ignored live cells those suites still carry). The shared drivers they
+  include live in `crates/rig-cassette/tests/common/`.
+- Providers with no recorded corpus keep their live-only suites in the facade:
+  `tests/<provider>.rs` with `tests/providers/<provider>/`. These are ignored
+  tests that require a real service.
+- `tests/core.rs` contains provider-agnostic core behavior tests and the guards
+  that scan the source tree, which need the repository root.
 - `test-support/service-tests/integrations.rs` runs the vector-store suites from `tests/integrations/` as the unpublished `rig-service-tests` package. `tests/integrations.rs` retains the root Bedrock integrations.
-- `tests/core.rs` contains provider-agnostic core behavior tests.
 - The [ECS consumer harness](https://github.com/gold-silver-copper/rigcoder/tree/main/crates/rigcoder-verify)
   is owned by rigcoder. Run `cargo run --locked -p rigcoder-verify -- verify`
   there for its maintenance/repair cases, replay and supported resume checks.
   Rig retains its runtime and provider conformance suites.
 
-Most provider tests are ignored live tests unless they have been migrated to cassettes.
+Cassette suites require a checkout of this repository: `rig-cassette` excludes
+its fixtures and integration tests from the published package. The unpublished
+`rig-cassette-minimal` runner at
+`crates/rig-cassette/tests/minimal/Cargo.toml` executes the same `verify` and
+`world_replay` sources, plus the shared effect-log/classic-replay regressions.
+It selects only cassette's `agent,ecs` features: no native HTTP engine,
+`serde_json/preserve_order` or `serde_json/float_roundtrip`.
 
-Cassette suites require a checkout of this repository: their shared engine is
-the unpublished `rig-cassette` workspace crate, and their fixtures are excluded
-from the published `rig` archive. Cargo omits the path-only engine dev-dependency
-when packaging `rig`, so the archive's remaining cassette test sources are not
-standalone test targets. Run these suites from the workspace. The engine is not
-a normal dependency of the published facade.
+```sh
+RIG_PROVIDER_TEST_MODE=replay cargo nextest run --locked -p rig-cassette-minimal --all-features --retries 0
+```
+
+Keep `RIG_REGENERATE_GOLDEN` unset. This execution complements, rather than
+replaces, the unified verification runs through `rig-cassette`.
+The default/all-features cassette library still owns the unified library
+regressions; `core-all` also retains the migrated classic replay cases.
+Minimal verification runs with zero retries; unified verification and both
+standalone/default-member parity configurations retain their existing two.
+The standalone parity lane explicitly includes the `rig-test-support` ECS
+helper regressions. Source ownership includes the library tests shared by
+the minimal runner, not only its two verification entrypoints.
 
 ## Testing Doctrine
 
@@ -48,48 +69,89 @@ encodes the team's model of the wire and structurally cannot falsify it.
   404 mock miss — treat that as a first-class assertion, and when a change
   intentionally alters a request, update the recorded body deliberately and
   say so. (This is exactly what caught fabricated ids reaching request
-  serializers in #2258.)
+  serializers in #2258.) Body matching compares key-sorted canonical JSON,
+  so map reordering is invisible to it (Layer 0's determinism check below
+  exists for that), and a cassette cannot notice the provider changing its
+  behavior after record time (Layer 3 exists for that).
 - **Never weaken a cassette to make it pass.** Update assertions and
   recordings to the new intended behavior, or re-record; a scrubbed value
   must redact real data, never invent data that was not recorded.
 
 ## Core Tests
 
-Run provider-agnostic core tests with:
+Start with the owning package and a test-name filter. Confirm that the filter
+actually ran the intended tests; a successful command running zero tests is not
+verification.
 
 ```bash
-cargo test -p rig --test core
+cargo test --locked -p rig-core --lib <test-name-filter>
+cargo test --locked -p rig --test <provider> <test-name-filter>
+cargo clippy --locked -p rig-core --all-features --tests -- -D warnings
 ```
 
-Run all default non-ignored tests for the root crate with:
+The Clippy command is useful for core test changes involving lint-sensitive
+patterns, not a mandatory check for every edit. Use the owning package and
+relevant features for other changes. Broader facade test commands:
 
 ```bash
-cargo test -p rig
+cargo test -p rig --test core          # provider-agnostic core tests
+cargo test -p rig                      # all default non-ignored root-crate tests
+cargo test -p rig --all-features       # same, with all root crate features
 ```
 
-Run the same checks with all root crate features enabled:
+### Fallible test assertions
+
+Workspace Clippy denies `panic_in_result_fn`: `assert!` and `assert_eq!` inside
+a test returning `Result` fail that check even when the test itself passes.
+Use `anyhow::ensure!(actual == expected, "value changed")` in such tests,
+alongside `?` for fallible setup. Preserve each assertion's condition; do not
+add lint suppressions or weaken the test. Unit-returning tests can keep their
+existing assertion style.
+
+### Core feature isolation
+
+The core crate's dev-dependency on itself enables `test-utils`, `websocket`,
+and its default features. Consequently, a core unit-test run with
+`--no-default-features` does not prove those features are absent. For an actual
+feature-disabled library check, select core alone without test targets:
 
 ```bash
-cargo test -p rig --all-features
+cargo check --locked -p rig-core --no-default-features --lib
 ```
+
+When the change needs WASM coverage and the target is installed, add
+`--target wasm32-unknown-unknown`. Keep runtime test coverage and compilation
+coverage distinct in the report.
 
 ## Cassette Provider Tests
 
-Cassette tests replay committed HTTP interactions by default and do not require provider API
-keys. Cassette files live under `tests/cassettes/<provider>/...`.
+Cassette tests replay committed HTTP interactions by default and do not require
+provider API keys. Fixtures live under `crates/rig-cassette/fixtures/cassettes/<provider>/...`.
 
-Replay the migrated provider suites with:
+Replay one migrated provider suite (`anthropic`, `bedrock`, `chatgpt`, `cohere`,
+`copilot`, `deepseek`, `doubleword`, `gemini`, `groq`, `llamacpp`, `mistral`,
+`mistralrs`, `ollama`, `openai`, `openrouter`, `perplexity`, `venice`, `xai`)
+with:
 
 ```bash
-cargo test -p rig --all-features --test openai openai::cassette -- --nocapture --test-threads=1
-cargo test -p rig --all-features --test anthropic anthropic::cassette -- --nocapture --test-threads=1
-cargo test -p rig --all-features --test gemini gemini::cassette -- --nocapture --test-threads=1
-cargo test -p rig --all-features --test chatgpt chatgpt::cassette -- --nocapture --test-threads=1
-cargo test -p rig --all-features --test bedrock bedrock::cassette -- --nocapture --test-threads=1
-cargo test -p rig --all-features --test cohere cohere::cassette -- --nocapture --test-threads=1
-cargo test -p rig --all-features --test doubleword doubleword::cassette -- --nocapture --test-threads=1
-cargo test -p rig --all-features --test venice venice::cassette -- --nocapture --test-threads=1
+cargo test -p rig-cassette --all-features --test <provider> <provider>::cassette -- --nocapture --test-threads=1
 ```
+
+Record mode requires the relevant provider credentials in the environment and
+overwrites existing cassette files:
+
+```bash
+RIG_PROVIDER_TEST_MODE=record \
+cargo test -p rig-cassette --all-features --test <provider> <provider>::cassette -- --nocapture --test-threads=1
+```
+
+ChatGPT record mode additionally needs `CHATGPT_ACCESS_TOKEN=... CHATGPT_ACCOUNT_ID=...`.
+
+Bedrock cassette replay does not require AWS credentials. Bedrock record mode uses the AWS
+SDK credential provider chain and a direct SigV4-aware recorder, so it requires AWS credentials
+with Bedrock model access in `us-east-1`. The Bedrock recorder buffers streaming/event-stream
+responses and stores non-UTF-8 cassette bodies as base64; those opaque bodies are intended for
+replay fidelity, and safety checks also scan their decoded bytes for credential-shaped material.
 
 Venice's text-to-speech scenario records through the direct recorder rather than
 the httpmock proxy: the proxy exports bodies as strings, so a binary response
@@ -99,66 +161,26 @@ the *request's* multipart body — a cassette that recorded no body still matche
 a multipart request, and the multipart shape itself is pinned by unit tests
 beside the provider.
 
-Bedrock cassette replay does not require AWS credentials. Bedrock record mode uses the AWS
-SDK credential provider chain and a direct SigV4-aware recorder, so it requires AWS credentials
-with Bedrock model access in `us-east-1` and overwrites existing cassette files. The Bedrock
-recorder buffers streaming/event-stream responses and stores non-UTF-8 cassette bodies as base64;
-those opaque bodies are intended for replay fidelity, and safety checks also scan their decoded
-bytes for credential-shaped material.
-
-Record mode requires the relevant provider credentials in the environment and overwrites existing
-cassette files:
+Run one cassette test by passing a test-name substring after the test target;
+the filter is a substring match, so use the full module path only when the
+shorter name is ambiguous:
 
 ```bash
-RIG_PROVIDER_TEST_MODE=record \
-cargo test -p rig --all-features --test openai openai::cassette -- --nocapture --test-threads=1
-```
-
-```bash
-RIG_PROVIDER_TEST_MODE=record \
-cargo test -p rig --all-features --test anthropic anthropic::cassette -- --nocapture --test-threads=1
-```
-
-```bash
-RIG_PROVIDER_TEST_MODE=record \
-cargo test -p rig --all-features --test gemini gemini::cassette -- --nocapture --test-threads=1
-```
-
-```bash
-RIG_PROVIDER_TEST_MODE=record \
-cargo test -p rig --all-features --test cohere cohere::cassette -- --nocapture --test-threads=1
-```
-
-```bash
-RIG_PROVIDER_TEST_MODE=record \
-cargo test -p rig --all-features --test bedrock bedrock::cassette -- --nocapture --test-threads=1
-```
-
-```bash
-RIG_PROVIDER_TEST_MODE=record \
-cargo test -p rig --all-features --test doubleword doubleword::cassette -- --nocapture --test-threads=1
-```
-
-```bash
-RIG_PROVIDER_TEST_MODE=record \
-cargo test -p rig --all-features --test venice venice::cassette -- --nocapture --test-threads=1
-```
-
-```bash
-CHATGPT_ACCESS_TOKEN=... CHATGPT_ACCOUNT_ID=... RIG_PROVIDER_TEST_MODE=record \
-cargo test -p rig --all-features --test chatgpt chatgpt::cassette -- --nocapture --test-threads=1
-```
-
-Run one cassette test by passing a test-name substring:
-
-```bash
-cargo test -p rig --all-features --test gemini \
+cargo test -p rig-cassette --all-features --test gemini \
   streaming_tools_smoke \
   -- --nocapture --test-threads=1
 ```
 
-The test filter after `--test <target>` is a substring match. Use the full module path only when
-the shorter test name is ambiguous.
+### Cassette Safety
+
+Record mode scrubs and safety-checks cassette contents before writing fixtures,
+and the committed cassette safety tests enforce the same scrubbed form during
+normal test runs. Still review every cassette diff for:
+
+- no API keys, bearer tokens, cookies, or provider account identifiers;
+- expected request paths, methods, and bodies;
+- expected provider responses for the scenario;
+- no unrelated cassette churn.
 
 ## Prompt Cache Testing
 
@@ -172,7 +194,7 @@ Four layers guard this. Each catches something the others structurally cannot.
 
 ### Layer 0 — free, key-free, whole-corpus (`tests/cassette_cache_prefix.rs`)
 
-Three checks over cassettes that already exist, costing no provider traffic:
+Checks over cassettes that already exist, costing no provider traffic:
 
 - `recorded_conversations_do_not_move_their_cache_prefix` — for consecutive same-endpoint requests
   in one cassette, turn N-1's canonical blocks must be a prefix of turn N's. The rule lives in
@@ -209,13 +231,15 @@ Growth is asserted as a ratio, not a monotonic token count: providers cache in c
 the absolute figure drifts a few tokens as block boundaries re-align (Gemini was measured going
 3,765 -> 3,760 across a 21-token append) while a genuine prefix move collapses it to zero.
 
-### Layer 2 — per-provider cassettes (`tests/cassettes/<provider>/prompt_caching/`)
+### Layer 2 — per-provider cassettes (`crates/rig-cassette/fixtures/cassettes/<provider>/prompt_caching/`)
 
-Recorded live, replayed key-free. Record one scenario at a time:
+Recorded live, replayed key-free. Replay is not a tautology: the harness matches request bodies,
+so a rig change that perturbs the outbound prefix fails as a replay miss in CI with no API key.
+Record one scenario at a time:
 
 ```bash
 RIG_PROVIDER_TEST_MODE=record \
-cargo test -p rig --all-features --test openai openai::cassette::prompt_caching \
+cargo test -p rig-cassette --all-features --test openai openai::cassette::prompt_caching \
   -- --exact --nocapture --test-threads=1
 ```
 
@@ -226,7 +250,7 @@ its cache semantics under us. Each cell prints a `LIVE-CACHE-ECONOMICS` row, so 
 table can be regenerated rather than trusted as a transcription:
 
 ```bash
-cargo test -p rig --all-features --test openai live_cache_economics \
+cargo test -p rig-cassette --all-features --test openai live_cache_economics \
   -- --exact --ignored --nocapture --test-threads=1
 ```
 
@@ -237,8 +261,8 @@ cargo test -p rig --all-features --test openai live_cache_economics \
   a miss. That is the intended outcome — a recorded miss is worse than a failed recording.
 - **Some providers need a warm-up pass.** Gemini's implicit cache only serves a prefix once an
   entry for *that exact prefix* exists, so on a cold run the grown turn-3 prefix reads zero. Run
-  the scenario twice and keep the second recording. Mistral's cache is intermittent for a
-  different reason (routing without cache affinity) and may need several attempts.
+  every implicit-cache scenario twice and keep the second recording. Mistral's cache is
+  intermittent for a different reason (routing without cache affinity) and may need several attempts.
 - **Padding must be deterministic and committed** — no nonce, no timestamp. A nonce guarantees a
   turn-1 miss, churns the cassette on every re-record, and breaks body matching. The org-pre-warm
   risk it would avoid is already tolerated by `assert_warms`.
@@ -250,17 +274,6 @@ cargo test -p rig --all-features --test openai live_cache_economics \
 - **Never mark a cache scenario `.unordered()`.** Ordered replay is what lets two byte-identical
   requests replay two different recorded responses, which is the only reason a miss-then-hit pair
   is replayable at all.
-
-### What replay does and does not prove
-
-Replay is not a tautology: the harness *matches request bodies*, so a rig change that perturbs the
-outbound prefix fails as a replay miss in CI with no API key. That is what turns a recorded
-cassette into a permanent cache regression test.
-
-It has exactly two blind spots, both covered elsewhere rather than papered over: body matching
-compares key-sorted canonical JSON, so map reordering is invisible to it (Layer 0's determinism
-check exists for that), and a cassette cannot notice the provider changing its behavior after
-record time (Layer 3 exists for that).
 
 ### Gemini: two caching features, and they behave differently
 
@@ -281,9 +294,6 @@ rather than after a warm-up.
 
 Practical consequences for anyone touching these fixtures:
 
-- **Run every implicit-cache scenario twice and keep the second recording.** A
-  cold first pass records a turn-3 miss and fails, which is the intended
-  outcome — a recorded miss is worse than a failed recording session.
 - **Disable thinking** (`generationConfig.thinkingConfig.thinkingBudget: 0`) on
   every cell that is not specifically about thinking. Gemini 2.5 spends its
   output budget on thoughts first, so a small `max_tokens` yields a response
@@ -298,34 +308,16 @@ Practical consequences for anyone touching these fixtures:
   padding its meaning. If it ever starts caching, the documented 1,024-token
   minimum is wrong and every probe's padding needs revisiting.
 
-## Cassette Safety
-
-Record mode scrubs and safety-checks cassette contents before writing fixtures.
-The committed cassette safety tests enforce the same scrubbed form during normal
-test runs.
-
-Review cassette diffs for:
-
-- no API keys, bearer tokens, cookies, or provider account identifiers;
-- expected request paths, methods, and bodies;
-- expected provider responses for the scenario;
-- no unrelated cassette churn.
-
 ## Live Provider Tests
 
 Live provider tests use real provider APIs, local model servers, or account credentials. They are
 ignored by default unless a test file says otherwise.
 
-Run ignored tests for one provider target with:
-
 ```bash
-cargo test -p rig --all-features --test openrouter -- --ignored --nocapture --test-threads=1
-```
-
-Run one ignored provider test with:
-
-```bash
-cargo test -p rig --all-features --test openai \
+# all ignored tests for one provider target
+cargo test -p rig-cassette --all-features --test openrouter -- --ignored --nocapture --test-threads=1
+# one ignored provider test
+cargo test -p rig-cassette --all-features --test openai \
   responses_document_file_id_roundtrip_live \
   -- --ignored --nocapture --test-threads=1
 ```
@@ -377,41 +369,29 @@ must not weaken the universal assertions or silently mark the scenario passed.
 ## Integration Tests
 
 External-service integration tests are collected under the `integrations` target and are gated by
-feature flags.
-
-Run all enabled non-ignored integration tests with:
+feature flags. Some start Docker containers through `testcontainers`, so Docker must be running;
+others are ignored because they need external credentials or pre-provisioned services. Check each
+integration module for required environment variables (Vectorize requires `VECTORIZE_INDEX_NAME`;
+Bedrock needs AWS credentials plus access to the configured Bedrock models).
 
 ```bash
+# all enabled non-ignored integration tests
 cargo test -p rig-service-tests --all-features --test integrations
-```
-
-Run one feature-gated integration group with:
-
-```bash
+# one feature-gated group
 cargo test -p rig-service-tests --features qdrant --test integrations qdrant -- --nocapture
 cargo test -p rig-service-tests --features mongodb --test integrations mongodb -- --nocapture
 cargo test -p rig-service-tests --features sqlite --test integrations sqlite -- --nocapture
-```
-
-Some integration tests start Docker containers through `testcontainers`; Docker must be running.
-Other integrations are ignored because they need external credentials or pre-provisioned services.
-Run ignored integration tests explicitly:
-
-```bash
+# ignored groups
 cargo test -p rig --features bedrock --test integrations bedrock -- --ignored --nocapture --test-threads=1
 cargo test -p rig-service-tests --features vectorize --test integrations vectorize -- --ignored --nocapture --test-threads=1
 ```
-
-Check each integration module for required environment variables. For example, Vectorize requires
-`VECTORIZE_INDEX_NAME`, and Bedrock tests require AWS credentials plus access to the configured
-Bedrock models.
 
 ## Shared test implementation
 
 `test-support/rig-test-support` compiles neutral tools, cassette paths, cache and
 stream assertions, golden comparison, and the ECS harness once. Provider binaries
 import these modules; their cassette-safety tests remain registered in each binary.
-Generic ECS matrix drivers remain under `tests/common/ecs_matrix`: a cell edit
+Generic ECS matrix drivers live under `crates/rig-cassette/tests/common/ecs_matrix`: a cell edit
 then rebuilds its provider binaries without invalidating unrelated providers.
 Their long-loop regression tests stay with those modules. Other shared helper
 regressions run in the support crate; its ECS regressions also retain the
@@ -440,7 +420,7 @@ List registrations or run a native family, for example:
 
 ```sh
 cargo nextest list --locked -p rig --features bedrock
-RIG_PROVIDER_TEST_MODE=replay cargo test --locked -p rig --test anthropic ecs_outcome -- --nocapture
+RIG_PROVIDER_TEST_MODE=replay cargo test --locked -p rig-cassette --test anthropic ecs_outcome -- --nocapture
 ```
 
 ### Stream-fault cells
@@ -462,15 +442,8 @@ so a native cell reads the adapter's boundary facts (the request, the
 status, the provider's verdict, usage and error envelope, the closure) for
 Gemini, the OpenAI Chat Completions and Responses wires and Anthropic;
 Cohere, Ollama and the Gemini Interactions wire report the transport facts
-without a payload projection.
-A provider's error reply classifies the same on every wire —
-`ErrorKind::ProviderResponse`, status, body, headers and request id on the
-report — through the one funnel in `rig_core::provider_response`;
-`ErrorKind::Http` is a transport failure that produced no reply and carries
-no status: a transport never reports a status without the reply behind it.
+without a payload projection. Error classification follows the one funnel in
+`rig_core::provider_response` (see `AGENTS.md`, Error Handling).
 
-Historical execution logs, proof snapshots, review-application commands and
-archive infrastructure are intentionally not maintained. No historical download
-or cache is required for regression tests. Consumed cassettes and goldens remain
-in Git. Removing proof files from the current tree does not remove the old blobs
-from published Git history.
+Consumed cassettes and goldens remain in Git; historical execution logs, proof
+snapshots, and archive infrastructure are intentionally not maintained.

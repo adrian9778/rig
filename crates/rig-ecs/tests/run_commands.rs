@@ -1,5 +1,5 @@
 //! Runs as bundles and commands: `RunCommands` on `Commands` and `World`,
-//! `RunBundle` for a run assembled by hand, and `Ready` as the start.
+//! `(Run, RunOf(agent))` for a run assembled by hand, and `Ready` as the start.
 //!
 //! | claim | test |
 //! |---|---|
@@ -8,26 +8,22 @@
 //! | a queued despawn of a live run is refused by `RunDespawnRefused` on the run, and takes the run once it ended | `a_queued_despawn_is_refused_by_event_while_the_run_lives` |
 //! | a run despawned while the queued spawn populates it (a host `Add<Run>` observer refusing it) is simply gone: no panic, no orphan utterance, no request | `a_reserved_run_despawned_before_it_was_populated_is_gone` |
 //! | a second queued despawn of an id an earlier one already took is refused `NotARun` on the dead id, without panicking | `a_second_queued_despawn_of_a_gone_run_is_refused_as_not_a_run` |
-//! | a scene with `ready` or `prompt` on a non-run is refused before the destination changes | `a_scene_refuses_ready_and_prompt_off_a_run_before_it_loads` |
-//! | a run assembled by hand from `RunBundle` and `Prompt` is not read until `Ready`: no utterance, no phase, no request; `Ready` opens it, history first | `a_run_assembled_by_hand_starts_on_ready_with_its_history_first` |
+//! | a checkpoint with `ready` or `prompt` on a non-run is refused before the destination changes | `a_checkpoint_refuses_ready_and_prompt_off_a_run_before_it_loads` |
+//! | a run assembled by hand from `Run`, `RunOf` and `Prompt` is not read until `Ready`: no utterance, no phase, no request; `Ready` opens it, history first | `a_run_assembled_by_hand_starts_on_ready_with_its_history_first` |
 //! | a `Ready` run saved before it opened loads with its `Prompt` and `Ready`, opens in the second world and answers | `a_ready_run_saved_before_it_opened_starts_after_the_load` |
-#![allow(
-    clippy::expect_used,
-    clippy::unwrap_used,
-    clippy::panic,
-    clippy::indexing_slicing
-)]
-
 use crate::run_support;
+
+use std::any::type_name;
 
 use bevy_ecs::prelude::*;
 use rig_core::message::UserContent;
 use rig_ecs::{
     agent::{
-        Assembling, Failed, Failure, MessageParts, Prompt, Ready, Run, RunOf, Settled, Utterance,
-        scene::{RunScene, SceneKind, load_world, save_world},
+        Failed, Failure, MessageParts, Owner, Prompt, Ready, Run, RunOf, RunPhase, Settled,
+        Utterance,
     },
-    systems::{Fresh, RunBundle, RunBusy, RunCommands, RunDespawnRefused, spawn_utterance},
+    checkpoint::{Checkpoint, load_world, save_world},
+    systems::{Fresh, RunBusy, RunCommands, RunDespawnRefused, spawn_utterance},
 };
 use run_support::*;
 
@@ -43,9 +39,7 @@ fn utterances(world: &mut World, run: Entity) -> usize {
 #[test]
 fn a_run_queued_on_commands_exists_after_the_flush_and_advances_on_the_next_pass() {
     let mut app = app();
-    let (model, requests) = Capturing::new("m", "hello");
-    let model = register(&mut app, "t/model:m", model);
-    let agent = spawn_agent(app.world_mut(), "t", model);
+    let (agent, requests) = capturing_agent(&mut app, "t/model:m", "m", "hello");
 
     let world = app.world_mut();
     let run = world.commands().spawn_run(agent, &[], "hi", false, None);
@@ -57,7 +51,7 @@ fn a_run_queued_on_commands_exists_after_the_flush_and_advances_on_the_next_pass
     assert!(world.get::<Run>(run).is_some(), "spawned by the flush");
     assert!(world.get::<Ready>(run).is_some(), "ready by the flush");
     assert!(
-        world.get::<Assembling>(run).is_some(),
+        world.get::<RunPhase>(run) == Some(&RunPhase::Assembling),
         "opened by the flush: the command path opens the run it made"
     );
     assert!(
@@ -88,9 +82,7 @@ fn a_run_queued_on_commands_exists_after_the_flush_and_advances_on_the_next_pass
 #[test]
 fn a_cancel_queued_behind_the_spawn_ends_the_run_before_it_starts() {
     let mut app = app();
-    let (model, requests) = Capturing::new("m", "hello");
-    let model = register(&mut app, "t/model:m", model);
-    let agent = spawn_agent(app.world_mut(), "t", model);
+    let (agent, requests) = capturing_agent(&mut app, "t/model:m", "m", "hello");
 
     let world = app.world_mut();
     let mut commands = world.commands();
@@ -105,7 +97,7 @@ fn a_cancel_queued_behind_the_spawn_ends_the_run_before_it_starts() {
         "cancelled by the flush: {:?}",
         world.get::<Failed>(run)
     );
-    assert!(world.get::<Assembling>(run).is_none(), "the phase went");
+    assert!(world.get::<RunPhase>(run).is_none(), "the phase went");
 
     for _ in 0..3 {
         app.update();
@@ -142,9 +134,7 @@ fn a_queued_despawn_is_refused_by_event_while_the_run_lives() {
     let mut app = app();
     app.world_mut().init_resource::<Refusals>();
     app.world_mut().add_observer(note_refusal);
-    let (model, _) = Capturing::new("m", "hello");
-    let model = register(&mut app, "t/model:m", model);
-    let agent = spawn_agent(app.world_mut(), "t", model);
+    let (agent, _) = capturing_agent(&mut app, "t/model:m", "m", "hello");
 
     let world = app.world_mut();
     let mut commands = world.commands();
@@ -179,9 +169,7 @@ fn a_queued_despawn_is_refused_by_event_while_the_run_lives() {
 #[test]
 fn a_reserved_run_despawned_before_it_was_populated_is_gone() {
     let mut app = app();
-    let (model, requests) = Capturing::new("m", "hello");
-    let model = register(&mut app, "t/model:m", model);
-    let agent = spawn_agent(app.world_mut(), "t", model);
+    let (agent, requests) = capturing_agent(&mut app, "t/model:m", "m", "hello");
     let world = app.world_mut();
     let before = world.spawn_run(agent, &[], "first", false, None);
 
@@ -234,9 +222,7 @@ fn a_second_queued_despawn_of_a_gone_run_is_refused_as_not_a_run() {
     let mut app = app();
     app.world_mut().init_resource::<Refusals>();
     app.world_mut().add_observer(note_refusal);
-    let (model, _) = Capturing::new("m", "hello");
-    let model = register(&mut app, "t/model:m", model);
-    let agent = spawn_agent(app.world_mut(), "t", model);
+    let (agent, _) = capturing_agent(&mut app, "t/model:m", "m", "hello");
 
     let run = app.world_mut().spawn_run(agent, &[], "hi", false, None);
     tick_until(&mut app, "the run settles", |world| {
@@ -259,37 +245,37 @@ fn a_second_queued_despawn_of_a_gone_run_is_refused_as_not_a_run() {
 }
 
 #[test]
-fn a_scene_refuses_ready_and_prompt_off_a_run_before_it_loads() {
+fn a_checkpoint_refuses_ready_and_prompt_off_a_run_before_it_loads() {
     let mut app = app();
-    let (model, _) = Capturing::new("t/model:m", "hello");
-    let model = register(&mut app, "t/model:m", model);
-    let agent = spawn_agent(app.world_mut(), "t", model);
+    let (agent, _) = capturing_agent(&mut app, "t/model:m", "t/model:m", "hello");
     let world = app.world_mut();
-    let bundle = RunBundle::new(world, agent, false);
+    let bundle = (Run, RunOf(agent));
     world.spawn((bundle, Prompt::from("saved"), Ready));
-    let scene = RunScene::save(world).expect("every component serializes");
-    let run = scene
+    let checkpoint = save_world(world).expect("every component serializes");
+    let run = checkpoint
         .entities
         .iter()
-        .find(|entity| entity.kind == SceneKind::Run)
+        .find(|entity| entity.contains_key(type_name::<Run>()))
         .expect("the run");
     let prompt = run
-        .components
-        .get("prompt")
+        .get(type_name::<Prompt>())
         .expect("the unread prompt")
         .clone();
-    let ready = run.components.get("ready").expect("ready").clone();
+    let ready = run.get(type_name::<Ready>()).expect("ready").clone();
 
-    for (name, value) in [("ready", ready), ("prompt", prompt)] {
-        let mut misplaced = scene.clone();
+    for (name, path, value) in [
+        ("ready", type_name::<Ready>(), ready),
+        ("prompt", type_name::<Prompt>(), prompt),
+    ] {
+        let mut misplaced = checkpoint.clone();
         let agent = misplaced
             .entities
             .iter_mut()
-            .find(|entity| entity.kind == SceneKind::Agent)
+            .find(|entity| entity.contains_key(type_name::<Owner>()))
             .expect("the agent");
-        agent.components.insert(name.into(), value);
+        agent.insert(path.to_owned(), value);
         let count = app.world().entities().len();
-        let error = misplaced.load(app.world_mut()).unwrap_err();
+        let error = load_world(&misplaced, app.world_mut()).unwrap_err();
         assert!(
             error.message.contains(&format!("{name} is not on a run")),
             "{name}: {}",
@@ -306,12 +292,10 @@ fn a_scene_refuses_ready_and_prompt_off_a_run_before_it_loads() {
 #[test]
 fn a_run_assembled_by_hand_starts_on_ready_with_its_history_first() {
     let mut app = app();
-    let (model, requests) = Capturing::new("m", "hello");
-    let model = register(&mut app, "t/model:m", model);
-    let agent = spawn_agent(app.world_mut(), "t", model);
+    let (agent, requests) = capturing_agent(&mut app, "t/model:m", "m", "hello");
 
     let world = app.world_mut();
-    let bundle = RunBundle::new(world, agent, false);
+    let bundle = (Run, RunOf(agent));
     let run = world.spawn((bundle, Prompt::from("by hand"))).id();
     for _ in 0..3 {
         app.update();
@@ -323,7 +307,7 @@ fn a_run_assembled_by_hand_starts_on_ready_with_its_history_first() {
     );
     assert_eq!(utterances(world, run), 0, "no utterance before Ready");
     assert!(
-        world.get::<Assembling>(run).is_none(),
+        world.get::<RunPhase>(run).is_none(),
         "no phase before Ready"
     );
     assert!(
@@ -366,36 +350,29 @@ fn a_run_assembled_by_hand_starts_on_ready_with_its_history_first() {
 #[test]
 fn a_ready_run_saved_before_it_opened_starts_after_the_load() {
     let mut app = app();
-    let (model, _) = Capturing::new("t/model:m", "hello");
-    let model = register(&mut app, "t/model:m", model);
-    let agent = spawn_agent(app.world_mut(), "t", model);
+    let (agent, _) = capturing_agent(&mut app, "t/model:m", "t/model:m", "hello");
     let world = app.world_mut();
-    let bundle = RunBundle::new(world, agent, false);
+    let bundle = (Run, RunOf(agent));
     // Ready written by hand, saved before any pass opened the run.
     world.spawn((bundle, Prompt::from("saved"), Ready));
     let saved = save_world(world).expect("every component serializes");
-    let json = serde_json::to_string(&saved).expect("serde");
+    let json = saved.to_json().expect("serde");
     drop(app);
 
     let mut app = run_support::app();
     let (model, requests) = Capturing::new("t/model:m", "hello");
     register(&mut app, "t/model:m", model);
-    let saved = serde_json::from_str(&json).expect("serde");
+    let saved = Checkpoint::from_json(&json).expect("serde");
     let loaded = load_world(&saved, app.world_mut()).expect("the model is bound");
-    let run = loaded
-        .graph
-        .iter()
-        .copied()
-        .find(|entity| app.world().get::<Run>(*entity).is_some())
-        .expect("the run");
+    let run = loaded.with::<Run>(app.world())[0];
     let world = app.world_mut();
     assert!(
         world.get::<Ready>(run).is_some(),
-        "Ready survives the scene"
+        "Ready survives the checkpoint"
     );
     assert!(world.get::<Prompt>(run).is_some(), "the unread prompt too");
     assert!(
-        world.get::<Assembling>(run).is_none(),
+        world.get::<RunPhase>(run).is_none(),
         "loaded as saved: unopened"
     );
     tick_until(&mut app, "the loaded run settles", |world| {

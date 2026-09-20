@@ -7,24 +7,20 @@
 //! | `stamp_run` writes `programs[scope] = { required, policy }`; rig-agent's goldens carry none | `a_worlds_log_names_its_program_by_scope` |
 //! | a golden of another program is refused by policy, one with another row by the row's diff, one whose handlers do not serve the row by the gap | `check_replayable_refuses_a_foreign_log_by_name` |
 
-#![allow(
-    clippy::expect_used,
-    clippy::unwrap_used,
-    clippy::panic,
-    clippy::indexing_slicing
-)]
-
 use crate::run_support;
 
 use bevy_ecs::prelude::*;
+use rig_cassette::ecs::EffectLogResource;
+use rig_cassette::ecs::identity::{
+    check_replayable, required_row, spec_hash, stamp_legacy_builder_header, stamp_run,
+};
+use rig_cassette::effect_log::{EffectLog, EffectLogRecorder};
 use rig_core::effect::{EffectFamily, HandlerKey};
 use rig_ecs::{
-    agent::{Grant, Order, PolicyVersion, Preamble},
-    bus::{EffectLogResource, Scope},
-    replay::{check_replayable, required_row, spec_hash, stamp_legacy_builder_header, stamp_run},
+    agent::{Grant, PolicyVersion, Preamble},
+    bus::Scope,
     systems::RunCommands,
 };
-use rig_effect_log::{EffectLog, EffectLogRecorder};
 use run_support::*;
 
 const MODEL: &str = "t/model:default";
@@ -32,7 +28,7 @@ const ADD: &str = "t/tool:add#0";
 
 fn golden(name: &str) -> EffectLog {
     let path = format!(
-        "{}/../rig-verify/fixtures/{name}.effects.json",
+        "{}/../rig-cassette/fixtures/effects/{name}.effects.json",
         env!("CARGO_MANIFEST_DIR")
     );
     serde_json::from_str(&std::fs::read_to_string(path).expect("committed")).expect("loads")
@@ -119,10 +115,7 @@ fn check_replayable_refuses_a_foreign_log_by_name() {
             name: ADD.to_owned(),
         },
     );
-    let grant = app
-        .world_mut()
-        .spawn((Grant(tool), Order(0), ChildOf(agent)))
-        .id();
+    let grant = app.world_mut().spawn((Grant(tool), ChildOf(agent))).id();
     let mut wrong_row = smoke.clone();
     let scope = app.world().get::<Scope>(run).unwrap().0.clone();
     wrong_row.header.programs.get_mut(&scope).unwrap().policy =
@@ -142,7 +135,7 @@ fn check_replayable_refuses_a_foreign_log_by_name() {
     foreign.header.programs.clear();
     foreign.header.programs.insert(
         "other/run#0".to_owned(),
-        rig_effect_log::ProgramIdentity {
+        rig_cassette::effect_log::ProgramIdentity {
             required: foreign.header.required.clone(),
             policy: 1,
         },

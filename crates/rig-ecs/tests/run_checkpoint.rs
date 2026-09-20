@@ -1,25 +1,18 @@
 //! Checkpoint holds are durable tool-batch boundaries, independent of tick granularity.
-#![allow(
-    clippy::unwrap_used,
-    clippy::expect_used,
-    clippy::panic,
-    clippy::indexing_slicing,
-    clippy::type_complexity
-)]
 use crate::run_support;
 
 use bevy_ecs::prelude::*;
-use rig_core::{completion::CompletionRequest, message::AssistantContent};
+use rig_core::message::AssistantContent;
 use rig_ecs::{
     agent::{
-        Cancelled, Failed, Failure, Grant, MaxTurns, Order, Run, Settled,
+        Cancelled, Failed, Failure, Grant, MaxTurns, Run, Settled,
         checkpoint::{
             CheckpointError, ToolTurnCommit, ToolTurnCommitted, ToolTurnHolds, TurnAssistant,
             TurnResults, hold_after_tool_turn, release_tool_turn_hold,
         },
         content::parts::read_message,
-        scene::{WorldScene, load_world, save_world},
     },
+    checkpoint::{Checkpoint, load_world, save_world},
     systems::RunCommands,
 };
 use run_support::*;
@@ -27,10 +20,7 @@ use std::sync::{Arc, Mutex};
 const MODEL: &str = "t/model:default";
 const ADD: &str = "t/tool:add#0";
 
-fn setup(
-    turns: usize,
-    limit: usize,
-) -> (bevy_app::App, Entity, Arc<Mutex<Vec<CompletionRequest>>>) {
+fn setup(turns: usize, limit: usize) -> (bevy_app::App, Entity, RequestsSeen) {
     let mut app = app();
     let script = (0..turns)
         .map(|i| {
@@ -41,13 +31,10 @@ fn setup(
             )]
         })
         .collect();
-    let (model, requests) = Scripted::new(MODEL, script);
-    let model = register(&mut app, MODEL, model);
+    let (agent, requests) = scripted_agent(&mut app, MODEL, script);
     let add = register(&mut app, ADD, Adder::new(ADD));
-    let agent = spawn_agent(app.world_mut(), "t", model);
     app.world_mut().entity_mut(agent).insert(MaxTurns(limit));
-    app.world_mut()
-        .spawn((Grant(add), Order(0), ChildOf(agent)));
+    app.world_mut().spawn((Grant(add), ChildOf(agent)));
     let run = app.world_mut().spawn_run(agent, &[], "count", false, None);
     (app, run, requests)
 }
@@ -57,11 +44,7 @@ fn committed(world: &mut World, run: Entity, number: usize) -> bool {
         .iter(world)
         .any(|(parent, c)| parent.parent() == run && c.turn == number)
 }
-fn assert_stays_held(
-    app: &mut bevy_app::App,
-    requests: &Arc<Mutex<Vec<CompletionRequest>>>,
-    count: usize,
-) {
+fn assert_stays_held(app: &mut bevy_app::App, requests: &RequestsSeen, count: usize) {
     for _ in 0..8 {
         app.update();
     }
@@ -164,8 +147,8 @@ fn fresh_world_restore_preserves_holds_links_and_emits_only_new_commits() {
     assert_eq!(*a.lock().unwrap(), vec![1]);
     assert_eq!(*b.lock().unwrap(), vec![1]);
     assert_stays_held(&mut first, &requests, 1);
-    let scene = save_world(first.world_mut()).unwrap();
-    let scene: WorldScene = serde_json::from_str(&serde_json::to_string(&scene).unwrap()).unwrap();
+    let checkpoint = save_world(first.world_mut()).unwrap();
+    let checkpoint = Checkpoint::from_json(&checkpoint.to_json().unwrap()).unwrap();
     drop(first);
     let mut restored = app();
     let (model, requests) = Scripted::new(
@@ -178,12 +161,8 @@ fn fresh_world_restore_preserves_holds_links_and_emits_only_new_commits() {
     register(&mut restored, MODEL, model);
     register(&mut restored, ADD, Adder::new(ADD));
     let seen = observe(&mut restored);
-    load_world(&scene, restored.world_mut()).unwrap();
-    let run = restored
-        .world_mut()
-        .query_filtered::<Entity, With<Run>>()
-        .single(restored.world())
-        .unwrap();
+    let loaded = load_world(&checkpoint, restored.world_mut()).unwrap();
+    let run = loaded.with::<Run>(restored.world())[0];
     assert!(committed(restored.world_mut(), run, 1));
     let links: Vec<_> = restored
         .world_mut()
@@ -204,6 +183,13 @@ fn fresh_world_restore_preserves_holds_links_and_emits_only_new_commits() {
     });
     assert_eq!(*seen.lock().unwrap(), vec![2]);
     assert_eq!(requests.lock().unwrap().len(), 2);
+    // A run spawned after the load is sequenced after the loaded one.
+    let agent = loaded.with::<rig_ecs::agent::Owner>(restored.world())[0];
+    let later = restored
+        .world_mut()
+        .spawn_run(agent, &[], "later", false, None);
+    let seq = |world: &World, run: Entity| world.get::<rig_ecs::agent::RunSeq>(run).unwrap().0;
+    assert!(seq(restored.world(), later) > seq(restored.world(), run));
 }
 
 #[test]
@@ -264,7 +250,8 @@ impl rig_core::serve::Serve for GatedTool {
 #[test]
 fn partial_out_of_order_parallel_batch_has_no_commit_until_every_result_lands() {
     let mut app = app();
-    let (model, requests) = Scripted::new(
+    let (agent, requests) = scripted_agent(
+        &mut app,
         MODEL,
         vec![
             (0..3)
@@ -272,7 +259,6 @@ fn partial_out_of_order_parallel_batch_has_no_commit_until_every_result_lands() 
                 .collect(),
         ],
     );
-    let model = register(&mut app, MODEL, model);
     let completed = Arc::new(Mutex::new(Vec::new()));
     let mut gates = std::collections::BTreeMap::new();
     let mut senders = std::collections::BTreeMap::new();
@@ -289,12 +275,10 @@ fn partial_out_of_order_parallel_batch_has_no_commit_until_every_result_lands() 
             completed: completed.clone(),
         },
     );
-    let agent = spawn_agent(app.world_mut(), "t", model);
     app.world_mut()
         .entity_mut(agent)
         .insert((MaxTurns(2), rig_ecs::agent::ToolPolicy { concurrency: 3 }));
-    app.world_mut()
-        .spawn((Grant(tool), Order(0), ChildOf(agent)));
+    app.world_mut().spawn((Grant(tool), ChildOf(agent)));
     let run = app
         .world_mut()
         .spawn_run(agent, &[], "parallel", false, None);
@@ -347,23 +331,30 @@ fn partial_out_of_order_parallel_batch_has_no_commit_until_every_result_lands() 
 
 #[test]
 fn corrupt_commits_links_and_hold_owners_are_rejected_before_destination_mutation() {
-    use rig_ecs::agent::scene::{SceneKind, Target};
+    use std::any::type_name;
     let (mut source, run, _) = setup(1, 2);
     hold_after_tool_turn(source.world_mut(), run, "workspace", 1).unwrap();
     tick_until(&mut source, "held", |w| committed(w, run, 1));
     let good = save_world(source.world_mut()).unwrap();
     let turn = good
-        .graph
         .entities
         .iter()
-        .position(|e| e.components.contains_key("tool_turn_commit"))
+        .position(|e| e.contains_key(type_name::<ToolTurnCommit>()))
         .unwrap();
     let run = good
-        .graph
         .entities
         .iter()
-        .position(|e| e.kind == SceneKind::Run)
+        .position(|e| e.contains_key(type_name::<Run>()))
         .unwrap();
+    let holds = good.entities[run][type_name::<ToolTurnHolds>()].clone();
+    // The value's first object, whatever the reflected shape wraps it in.
+    fn object(value: &mut serde_json::Value) -> &mut serde_json::Map<String, serde_json::Value> {
+        match value {
+            serde_json::Value::Object(map) => map,
+            serde_json::Value::Array(items) => object(&mut items[0]),
+            other => panic!("no object in {other}"),
+        }
+    }
     for defect in [
         "missing_results",
         "wrong_role",
@@ -373,52 +364,45 @@ fn corrupt_commits_links_and_hold_owners_are_rejected_before_destination_mutatio
         "empty_owner",
         "zero_hold",
         "hold_on_turn",
+        "results_off_an_utterance",
     ] {
-        let mut scene = good.clone();
+        let mut checkpoint = good.clone();
         match defect {
-            "missing_results" => scene.graph.entities[turn]
-                .relations
-                .retain(|(name, _)| name != "turn_results"),
+            "missing_results" => {
+                checkpoint.entities[turn].remove(type_name::<TurnResults>());
+            }
             "wrong_role" => {
-                let assistant = scene.graph.entities[turn]
-                    .relations
-                    .iter()
-                    .find(|(name, _)| name == "turn_assistant")
-                    .unwrap()
-                    .1
-                    .clone();
-                let results = scene.graph.entities[turn]
-                    .relations
-                    .iter_mut()
-                    .find(|(name, _)| name == "turn_results")
-                    .unwrap();
-                results.1 = assistant;
+                let assistant = checkpoint.entities[turn][type_name::<TurnAssistant>()].clone();
+                checkpoint.entities[turn].insert(type_name::<TurnResults>().into(), assistant);
             }
             "zero_commit" | "future_commit" => {
-                scene.graph.entities[turn].components.insert(
-                    "tool_turn_commit".into(),
-                    serde_json::json!({"turn":if defect=="zero_commit" {0} else {99}}),
-                );
+                let commit = checkpoint.entities[turn]
+                    .get_mut(type_name::<ToolTurnCommit>())
+                    .unwrap();
+                object(commit)["turn"] = (if defect == "zero_commit" { 0 } else { 99 }).into();
             }
             "orphan_results" => {
-                scene.graph.entities[turn]
-                    .components
-                    .remove("tool_turn_commit");
+                checkpoint.entities[turn].remove(type_name::<ToolTurnCommit>());
             }
             "empty_owner" => {
-                scene.graph.entities[run]
-                    .components
-                    .insert("tool_turn_holds".into(), serde_json::json!({"":1}));
+                let mut holds = holds.clone();
+                let turn = object(&mut holds).remove("workspace").unwrap();
+                object(&mut holds).insert(String::new(), turn);
+                checkpoint.entities[run].insert(type_name::<ToolTurnHolds>().into(), holds);
             }
             "zero_hold" => {
-                scene.graph.entities[run]
-                    .components
-                    .insert("tool_turn_holds".into(), serde_json::json!({"workspace":0}));
+                let mut holds = holds.clone();
+                object(&mut holds)["workspace"] = 0.into();
+                checkpoint.entities[run].insert(type_name::<ToolTurnHolds>().into(), holds);
             }
             "hold_on_turn" => {
-                scene.graph.entities[turn]
-                    .components
-                    .insert("tool_turn_holds".into(), serde_json::json!({"workspace":1}));
+                checkpoint.entities[turn]
+                    .insert(type_name::<ToolTurnHolds>().into(), holds.clone());
+            }
+            // A link escaping the utterances is invalid even when its target
+            // is a real checkpoint entity.
+            "results_off_an_utterance" => {
+                checkpoint.entities[turn].insert(type_name::<TurnResults>().into(), run.into());
             }
             _ => panic!("unknown corruption"),
         }
@@ -429,7 +413,7 @@ fn corrupt_commits_links_and_hold_owners_are_rejected_before_destination_mutatio
         let sentinel = destination.world_mut().spawn_empty().id();
         let before = destination.world().entities().len();
         assert!(
-            load_world(&scene, destination.world_mut()).is_err(),
+            load_world(&checkpoint, destination.world_mut()).is_err(),
             "accepted {defect}"
         );
         assert_eq!(
@@ -439,19 +423,6 @@ fn corrupt_commits_links_and_hold_owners_are_rejected_before_destination_mutatio
         );
         assert!(destination.world().get_entity(sentinel).is_ok());
     }
-    // A link escaping the run is invalid even when the target is a real scene entity.
-    let mut scene = good;
-    scene.graph.entities[turn]
-        .relations
-        .iter_mut()
-        .find(|(name, _)| name == "turn_results")
-        .unwrap()
-        .1 = Target::Scene { index: run };
-    let mut destination = app();
-    let (model, _) = Scripted::new(MODEL, vec![]);
-    register(&mut destination, MODEL, model);
-    register(&mut destination, ADD, Adder::new(ADD));
-    assert!(load_world(&scene, destination.world_mut()).is_err());
 }
 
 struct CountedAdder(Arc<std::sync::atomic::AtomicUsize>);
@@ -470,7 +441,7 @@ impl rig_core::serve::Serve for CountedAdder {
     }
 }
 struct RetryModel {
-    requests: Arc<Mutex<Vec<CompletionRequest>>>,
+    requests: RequestsSeen,
 }
 impl rig_core::serve::Serve for RetryModel {
     type Family = rig_core::effect::family::Completion;
@@ -499,7 +470,7 @@ impl rig_core::serve::Serve for RetryModel {
         Reply::Outcome(match index {
             1 => Ok(Outcome::Completion(CompletionResponse::new(
                 vec![call("c1", "add", serde_json::json!({"x":1,"y":2}))],
-                Usage::new(),
+                Usage::default(),
                 "retry-model",
             ))),
             2 => Err(ErrorReport::new(ErrorKind::ProviderResponse, "transient")
@@ -507,7 +478,7 @@ impl rig_core::serve::Serve for RetryModel {
                 .with_retryable(true)),
             3 => Ok(Outcome::Completion(CompletionResponse::new(
                 vec![AssistantContent::text("done")],
-                Usage::new(),
+                Usage::default(),
                 "retry-model",
             ))),
             _ => panic!("unexpected repeated request"),
@@ -532,8 +503,7 @@ fn released_checkpoint_provider_retry_preserves_request_and_does_not_repeat_tool
     app.world_mut()
         .entity_mut(agent)
         .insert((MaxTurns(2), rig_ecs::agent::ProviderRetries(1)));
-    app.world_mut()
-        .spawn((Grant(tool), Order(0), ChildOf(agent)));
+    app.world_mut().spawn((Grant(tool), ChildOf(agent)));
     let run = app.world_mut().spawn_run(agent, &[], "add", false, None);
     let seen = observe(&mut app);
     hold_after_tool_turn(app.world_mut(), run, "checkpoint", 1).unwrap();
@@ -574,14 +544,11 @@ fn output_tool_settlement_commits_only_a_real_mixed_batch_and_ignores_hold() {
             parts.push(call("real", "add", serde_json::json!({"x":1,"y":2})));
         }
         parts.push(call("output", "submit", serde_json::json!({"answer":42})));
-        let (model, requests) = Scripted::new(MODEL, vec![parts]);
-        let model = register(&mut app, MODEL, model);
+        let (agent, requests) = scripted_agent(&mut app, MODEL, vec![parts]);
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let tool = register(&mut app, ADD, CountedAdder(calls.clone()));
-        let agent = spawn_agent(app.world_mut(), "t", model);
         app.world_mut().entity_mut(agent).insert((Output {mode:OutputKind::Tool,schema:Some(serde_json::json!({"type":"object","properties":{"answer":{"type":"integer"}},"required":["answer"]}))},OutputToolConfig {name:Some("submit".into()),description:None,augment_preamble:false}));
-        app.world_mut()
-            .spawn((Grant(tool), Order(0), ChildOf(agent)));
+        app.world_mut().spawn((Grant(tool), ChildOf(agent)));
         app.world_mut().add_observer(move |event: On<Add, Settled>, commits: Query<(&ChildOf, &ToolTurnCommit, &TurnAssistant, &TurnResults)>| {
             let count = commits.iter().filter(|(parent, _, assistant, results)| {
                 assert_ne!(assistant.0, results.0);
@@ -650,7 +617,8 @@ fn invalid_call_retry_feedback_is_not_a_completed_tool_batch() {
         .get_mut(RigSchedule)
         .unwrap()
         .add_systems(retry.in_set(RigSet::Judge));
-    let (model, requests) = Scripted::new(
+    let (agent, requests) = scripted_agent(
+        &mut app,
         MODEL,
         vec![
             vec![
@@ -661,10 +629,8 @@ fn invalid_call_retry_feedback_is_not_a_completed_tool_batch() {
             vec![AssistantContent::text("done")],
         ],
     );
-    let model = register(&mut app, MODEL, model);
     let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let tool = register(&mut app, ADD, CountedAdder(calls.clone()));
-    let agent = spawn_agent(app.world_mut(), "t", model);
     app.world_mut().entity_mut(agent).insert((
         MaxTurns(3),
         InvalidCalls {
@@ -672,8 +638,7 @@ fn invalid_call_retry_feedback_is_not_a_completed_tool_batch() {
             unhandled: Unhandled::Fail,
         },
     ));
-    app.world_mut()
-        .spawn((Grant(tool), Order(0), ChildOf(agent)));
+    app.world_mut().spawn((Grant(tool), ChildOf(agent)));
     let run = app.world_mut().spawn_run(agent, &[], "add", false, None);
     let seen = observe(&mut app);
     hold_after_tool_turn(app.world_mut(), run, "checkpoint", 1).unwrap();
@@ -698,19 +663,17 @@ fn invalid_call_retry_feedback_is_not_a_completed_tool_batch() {
 fn terminal_cleanup_suppresses_commit_notification_for_deleted_run() {
     use rig_ecs::agent::{Output, OutputKind, OutputToolConfig};
     let mut app = app();
-    let (model, requests) = Scripted::new(
+    let (agent, requests) = scripted_agent(
+        &mut app,
         MODEL,
         vec![vec![
             call("real", "add", serde_json::json!({"x":1,"y":2})),
             call("output", "submit", serde_json::json!({"answer":42})),
         ]],
     );
-    let model = register(&mut app, MODEL, model);
     let tool = register(&mut app, ADD, Adder::new(ADD));
-    let agent = spawn_agent(app.world_mut(), "t", model);
     app.world_mut().entity_mut(agent).insert((Output {mode:OutputKind::Tool,schema:Some(serde_json::json!({"type":"object","properties":{"answer":{"type":"integer"}},"required":["answer"]}))},OutputToolConfig {name:Some("submit".into()),description:None,augment_preamble:false}));
-    app.world_mut()
-        .spawn((Grant(tool), Order(0), ChildOf(agent)));
+    app.world_mut().spawn((Grant(tool), ChildOf(agent)));
     app.world_mut()
         .add_observer(|event: On<Add, Settled>, mut commands: Commands| {
             commands.entity(event.entity).despawn();

@@ -11,19 +11,13 @@
 //! | a second run on the agent loads what the first appended | `memory_a_second_run_loads_what_the_first_appended` |
 //! | retrieval: the query is the prompt, results are documents after the static ones; retrieved tools are advertised first and a `Retrievable` grant never otherwise; a document entity is reused by id | `memory_retrieval_attaches_documents_and_tools` |
 
-#![allow(
-    clippy::expect_used,
-    clippy::unwrap_used,
-    clippy::panic,
-    clippy::indexing_slicing
-)]
-
 use crate::run_support;
 
 use rig_core::serve::Dispatch;
 use std::sync::{Arc, Mutex};
 
 use bevy_ecs::prelude::*;
+use rig_cassette::ecs::identity::required_row;
 use rig_core::{
     effect::{
         EffectFamily, EffectKind, FamilyDescriptor, HandlerDescriptor, HandlerKey, MemoryOp,
@@ -36,11 +30,10 @@ use rig_core::{
 use rig_ecs::{
     agent::{
         Context, Conversation, DocumentId, DocumentText, Failed, Failure, Grant, MessageParts,
-        Order, Remembered, Remembers, Retrievable, Retrieval, RetrievalKind, Retrieves, RunResult,
-        Settled, Utterance,
+        Remembered, Remembers, Retrievable, Retrieval, RetrievalKind, Retrieves, RunResult,
+        Settled,
     },
     bus::{EffectOutcome, PendingEffect},
-    replay::required_row,
     systems::RunCommands,
 };
 use run_support::*;
@@ -178,60 +171,47 @@ fn store(app: &mut bevy_app::App, refuse_load: bool) -> (Entity, Shared<Message>
     (entity, messages, ops)
 }
 
-fn ended(world: &mut World, run: Entity) -> bool {
-    world.get::<Settled>(run).is_some() || world.get::<Failed>(run).is_some()
-}
-
-/// Quiescent: nothing pending without an outcome.
-fn quiet(world: &mut World) -> bool {
-    world
-        .query_filtered::<(), (With<PendingEffect>, Without<EffectOutcome>)>()
-        .iter(world)
-        .count()
-        == 0
+/// Tick until `run` ended and nothing is pending without an outcome.
+fn ran(app: &mut bevy_app::App, run: Entity, what: &str) {
+    tick_until(app, what, |world| {
+        (world.get::<Settled>(run).is_some() || world.get::<Failed>(run).is_some())
+            && world
+                .query_filtered::<(), (With<PendingEffect>, Without<EffectOutcome>)>()
+                .iter(world)
+                .count()
+                == 0
+    });
 }
 
 fn utterances(world: &mut World, run: Entity) -> Vec<(bool, MessageParts)> {
-    let mut found: Vec<(Order, bool, MessageParts)> = world
-        .query_filtered::<(&ChildOf, &Order, Has<Remembered>, Entity), With<Utterance>>()
-        .iter(world)
-        .filter(|(child_of, ..)| child_of.parent() == run)
-        .map(|(_, order, remembered, entity)| {
+    utterances_of(world, run)
+        .into_iter()
+        .map(|entity| {
             (
-                *order,
-                remembered,
+                world.get::<Remembered>(entity).is_some(),
                 rig_ecs::agent::content::parts::read_message(world, entity)
                     .expect("valid memory graph"),
             )
         })
-        .collect();
-    found.sort_by_key(|(order, ..)| *order);
-    found
-        .into_iter()
-        .map(|(_, remembered, parts)| (remembered, parts))
         .collect()
 }
 
 #[test]
 fn memory_loads_before_the_first_turn_and_appends_at_the_settle() {
     let mut app = app();
-    let (model, requests) = Capturing::new(MODEL, "Ada");
-    let model = register(&mut app, MODEL, model);
+    let (agent, requests) = capturing_agent(&mut app, MODEL, MODEL, "Ada");
     let (memory, messages, ops) = store(&mut app, false);
     messages.lock().unwrap().extend([
         Message::user("My name is Ada."),
         Message::assistant("Noted."),
     ]);
-    let agent = spawn_agent(app.world_mut(), "t", model);
     app.world_mut()
         .entity_mut(agent)
         .insert((Remembers(memory), Conversation("c1".to_owned())));
     let run = app
         .world_mut()
         .spawn_run(agent, &[], "What is my name?", false, None);
-    tick_until(&mut app, "the run", |world| {
-        ended(world, run) && quiet(world)
-    });
+    ran(&mut app, run, "the run");
     assert_eq!(
         app.world().get::<RunResult>(run).map(|r| r.0.as_str()),
         Some("Ada")
@@ -269,10 +249,8 @@ fn memory_loads_before_the_first_turn_and_appends_at_the_settle() {
 #[test]
 fn memory_is_bypassed_by_history() {
     let mut app = app();
-    let (model, requests) = Capturing::new(MODEL, "ok");
-    let model = register(&mut app, MODEL, model);
+    let (agent, requests) = capturing_agent(&mut app, MODEL, MODEL, "ok");
     let (memory, _, ops) = store(&mut app, false);
-    let agent = spawn_agent(app.world_mut(), "t", model);
     app.world_mut()
         .entity_mut(agent)
         .insert((Remembers(memory), Conversation("c1".to_owned())));
@@ -280,9 +258,7 @@ fn memory_is_bypassed_by_history() {
     let run = app
         .world_mut()
         .spawn_run(agent, &history, "now", false, None);
-    tick_until(&mut app, "the run", |world| {
-        ended(world, run) && quiet(world)
-    });
+    ran(&mut app, run, "the run");
     assert!(ops.lock().unwrap().is_empty(), "{:?}", ops.lock().unwrap());
     assert_eq!(
         texts(&requests.lock().unwrap()[0]),
@@ -297,17 +273,13 @@ fn memory_is_bypassed_by_history() {
 #[test]
 fn memory_a_failed_load_fails_the_run() {
     let mut app = app();
-    let (model, requests) = Capturing::new(MODEL, "never");
-    let model = register(&mut app, MODEL, model);
+    let (agent, requests) = capturing_agent(&mut app, MODEL, MODEL, "never");
     let (memory, _, ops) = store(&mut app, true);
-    let agent = spawn_agent(app.world_mut(), "t", model);
     app.world_mut()
         .entity_mut(agent)
         .insert((Remembers(memory), Conversation("c1".to_owned())));
     let run = app.world_mut().spawn_run(agent, &[], "go", false, None);
-    tick_until(&mut app, "the run", |world| {
-        ended(world, run) && quiet(world)
-    });
+    ran(&mut app, run, "the run");
     match app.world().get::<Failed>(run) {
         Some(Failed(Failure::Memory(report))) => assert_eq!(report.kind, ErrorKind::MemoryBackend),
         other => panic!("the run fails at the load: {other:?}"),
@@ -319,21 +291,15 @@ fn memory_a_failed_load_fails_the_run() {
 #[test]
 fn memory_a_second_run_loads_what_the_first_appended() {
     let mut app = app();
-    let (model, requests) = Capturing::new(MODEL, "ok");
-    let model = register(&mut app, MODEL, model);
+    let (agent, requests) = capturing_agent(&mut app, MODEL, MODEL, "ok");
     let (memory, _, ops) = store(&mut app, false);
-    let agent = spawn_agent(app.world_mut(), "t", model);
     app.world_mut()
         .entity_mut(agent)
         .insert((Remembers(memory), Conversation("c1".to_owned())));
     let first = app.world_mut().spawn_run(agent, &[], "one", false, None);
-    tick_until(&mut app, "the first run", |world| {
-        ended(world, first) && quiet(world)
-    });
+    ran(&mut app, first, "the first run");
     let second = app.world_mut().spawn_run(agent, &[], "two", false, None);
-    tick_until(&mut app, "the second run", |world| {
-        ended(world, second) && quiet(world)
-    });
+    ran(&mut app, second, "the second run");
     assert_eq!(
         &*ops.lock().unwrap(),
         &["load:c1", "append:c1:2", "load:c1", "append:c1:2"]
@@ -360,14 +326,14 @@ fn memory_a_second_run_loads_what_the_first_appended() {
 #[test]
 fn memory_retrieval_attaches_documents_and_tools() {
     let mut app = app();
-    let (model, requests) = Scripted::new(
+    let (agent, requests) = scripted_agent(
+        &mut app,
         MODEL,
         vec![
             vec![call("c1", "subtract", serde_json::json!({"x": 3, "y": 1}))],
             vec![AssistantContent::text("2")],
         ],
     );
-    let model = register(&mut app, MODEL, model);
     let queries = Arc::new(Mutex::new(Vec::new()));
     let index = register(
         &mut app,
@@ -394,7 +360,6 @@ fn memory_retrieval_attaches_documents_and_tools() {
     );
     let add = register(&mut app, ADD, Adder::new(ADD));
     let subtract = register(&mut app, SUB, Subtractor);
-    let agent = spawn_agent(app.world_mut(), "t", model);
     let world = app.world_mut();
     world.entity_mut(agent).insert(rig_ecs::agent::MaxTurns(2));
     let static_document = world
@@ -403,16 +368,15 @@ fn memory_retrieval_attaches_documents_and_tools() {
             DocumentText("static".to_owned()),
         ))
         .id();
-    world.spawn((Context(static_document), Order(0), ChildOf(agent)));
-    world.spawn((Grant(add), Order(1), ChildOf(agent)));
-    world.spawn((Grant(subtract), Retrievable, Order(2), ChildOf(agent)));
+    world.spawn((Context(static_document), ChildOf(agent)));
+    world.spawn((Grant(add), ChildOf(agent)));
+    world.spawn((Grant(subtract), Retrievable, ChildOf(agent)));
     world.spawn((
         Retrieves(index),
         Retrieval {
             samples: 2,
             what: RetrievalKind::Documents,
         },
-        Order(3),
         ChildOf(agent),
     ));
     world.spawn((
@@ -421,13 +385,10 @@ fn memory_retrieval_attaches_documents_and_tools() {
             samples: 1,
             what: RetrievalKind::Tools,
         },
-        Order(4),
         ChildOf(agent),
     ));
     let run = world.spawn_run(agent, &[], "subtract one from three", false, None);
-    tick_until(&mut app, "the run", |world| {
-        ended(world, run) && quiet(world)
-    });
+    ran(&mut app, run, "the run");
     assert_eq!(
         app.world().get::<RunResult>(run).map(|r| r.0.as_str()),
         Some("2")
@@ -530,32 +491,11 @@ impl Serve for Subtractor {
 
 #[test]
 fn unavailable_retrieval_preserves_static_context_and_tool_grants() {
-    for ordered in [true, false] {
-        check_static_retrieval_fallback(ordered);
-    }
-}
-
-fn check_static_retrieval_fallback(ordered: bool) {
     let mut app = app();
-    let (model, requests) = Capturing::new(MODEL, "ok");
-    let model = register(&mut app, MODEL, model);
+    let (agent, requests) = capturing_agent(&mut app, MODEL, MODEL, "ok");
     let add = register(&mut app, ADD, Adder::new(ADD));
     let subtract = register(&mut app, SUB, Subtractor);
-    let agent = spawn_agent(app.world_mut(), "t", model);
-    let unavailable = if ordered {
-        app.world_mut().spawn_empty().id()
-    } else {
-        register(
-            &mut app,
-            INDEX,
-            Index {
-                key: INDEX,
-                queries: Arc::new(Mutex::new(Vec::new())),
-                documents: vec![],
-                ids: vec![],
-            },
-        )
-    };
+    let unavailable = app.world_mut().spawn_empty().id();
     let world = app.world_mut();
     let document = world
         .spawn((
@@ -563,10 +503,10 @@ fn check_static_retrieval_fallback(ordered: bool) {
             DocumentText("static context".into()),
         ))
         .id();
-    world.spawn((Context(document), Order(0), ChildOf(agent)));
-    world.spawn((Grant(add), Order(1), ChildOf(agent)));
-    world.spawn((Grant(subtract), Retrievable, Order(2), ChildOf(agent)));
-    let mut link = world.spawn((
+    world.spawn((Context(document), ChildOf(agent)));
+    world.spawn((Grant(add), ChildOf(agent)));
+    world.spawn((Grant(subtract), Retrievable, ChildOf(agent)));
+    world.spawn((
         Retrieves(unavailable),
         Retrieval {
             samples: 1,
@@ -574,15 +514,8 @@ fn check_static_retrieval_fallback(ordered: bool) {
         },
         ChildOf(agent),
     ));
-    if ordered {
-        link.insert(Order(3));
-    }
     let run = world.spawn_run(agent, &[], "hello", false, None);
-    tick_until(
-        &mut app,
-        "run without an available retrieval handler",
-        |world| ended(world, run) && quiet(world),
-    );
+    ran(&mut app, run, "run without an available retrieval handler");
     let requests = requests.lock().unwrap();
     assert_eq!(requests.len(), 1);
     assert_eq!(

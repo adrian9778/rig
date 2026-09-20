@@ -14,10 +14,10 @@ fn tool_call(id: &str, name: &str, arguments: serde_json::Value) -> AssistantCon
 
 fn usage(input: u64, output: u64) -> Usage {
     Usage {
-        input_tokens: input,
-        output_tokens: output,
-        total_tokens: input + output,
-        ..Usage::new()
+        input_tokens: Some(input),
+        output_tokens: Some(output),
+        total_tokens: Some(input + output),
+        ..Usage::default()
     }
 }
 
@@ -206,7 +206,7 @@ fn invalid_tool_diagnostics_require_rejected_call_history() {
         tool_name: "missing".to_string(),
         available_tools: vec!["add".to_string()],
         allowed_tools: Vec::new(),
-        chat_history: Box::new(history),
+        chat_history: history,
     };
     assert!(validate_unknown_tool_failure(&error, "missing", &[]).is_ok());
     assert!(validate_unknown_tool_failure(&error, "other", &[]).is_err());

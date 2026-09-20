@@ -12,8 +12,9 @@ use std::{
     time::Duration,
 };
 
-use bevy_app::{App, Update};
+use bevy_app::App;
 use bevy_ecs::prelude::*;
+use rig_cassette::effect_log::EffectLogRecorder;
 use rig_core::{
     completion::CompletionModel,
     effect::{EffectKind, HandlerDescriptor},
@@ -25,19 +26,28 @@ use rig_core::{
 };
 use rig_ecs::{
     agent::{
-        DefaultMaxTurns, Failed, Failure, Grant, MaxTurns, Order, Owner, Preamble, RunResult,
-        Settled, UsesModel,
+        DefaultMaxTurns, Failed, Failure, Grant, MaxTurns, Owner, Preamble, RunResult, Settled,
+        UsesModel,
     },
-    bus::{Handlers, Recording, run_to_quiescence},
-    systems::{RunCommands, install_agent},
+    bus::{Handlers, Recording},
+    systems::RunCommands,
 };
-use rig_effect_log::EffectLogRecorder;
 
 /// Transport runtime driven independently of the test's `app.update()` loop.
 ///
 /// The static owns the runtime for the process lifetime, so handles remain valid
 /// across tests. Building it requires neither entering nor blocking a runtime,
 /// including when first called from a current-thread Tokio test.
+/// The position of `entity` among its parent's children: the sibling
+/// order every ordered read of the graph uses.
+pub fn sibling_index(world: &World, entity: Entity) -> Option<usize> {
+    let parent = world.get::<ChildOf>(entity)?.parent();
+    world
+        .get::<Children>(parent)?
+        .iter()
+        .position(|child| child == entity)
+}
+
 pub fn io_runtime() -> tokio::runtime::Handle {
     static IO: LazyLock<tokio::runtime::Runtime> = LazyLock::new(|| {
         tokio::runtime::Builder::new_multi_thread()
@@ -139,9 +149,7 @@ impl EcsAgent {
         setup: impl FnOnce(&mut World),
     ) -> Self {
         let mut app = App::new();
-        rig_ecs::bus::Bus::with_policy(ServingPolicy::default()).install(app.world_mut());
-        install_agent(app.world_mut());
-        app.add_systems(Update, run_to_quiescence);
+        app.add_plugins(rig_ecs::RigPlugin::with_policy(ServingPolicy::default()));
         app.finish();
         app.cleanup();
         let recorder = if keep_events {
@@ -210,7 +218,7 @@ impl EcsAgent {
         .expect("fresh tool key");
         self.app
             .world_mut()
-            .spawn((Grant(handler), Order(order), ChildOf(self.agent)));
+            .spawn((Grant(handler), ChildOf(self.agent)));
         self.tool_count += 1;
     }
 
@@ -242,7 +250,7 @@ impl EcsAgent {
     }
 
     /// Return the recorder's current effect-log snapshot.
-    pub fn effect_log(&self) -> rig_effect_log::EffectLog {
+    pub fn effect_log(&self) -> rig_cassette::effect_log::EffectLog {
         self.recorder.log()
     }
 
@@ -292,14 +300,14 @@ impl EcsAgent {
     pub async fn wait_for_outcome(&mut self, run: Entity) -> Result<String, Failure> {
         if self.golden_identity {
             let bus = self.app.world().resource::<rig_ecs::bus::Policy>().0;
-            rig_ecs::replay::stamp_legacy_builder_header(
+            rig_cassette::ecs::identity::stamp_legacy_builder_header(
                 self.app.world_mut(),
                 self.agent,
                 &self.recorder,
                 self.declare_bus_policy.then_some(bus),
                 self.declared_policies.clone(),
             );
-            rig_ecs::replay::stamp_run(self.app.world_mut(), run, &self.recorder)
+            rig_cassette::ecs::identity::stamp_run(self.app.world_mut(), run, &self.recorder)
                 .expect("the run stamps its program identity");
         }
         tokio::time::timeout(Duration::from_secs(30), async {

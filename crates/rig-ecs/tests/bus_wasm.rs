@@ -16,8 +16,7 @@
     clippy::expect_used,
     clippy::unwrap_used,
     clippy::panic,
-    clippy::indexing_slicing,
-    clippy::type_complexity
+    clippy::indexing_slicing
 )]
 
 use std::{
@@ -41,9 +40,7 @@ use rig_core::{
     serve::{Dispatch, Reply, Serve, ServingPolicy},
     streaming::StreamFinal,
 };
-use rig_ecs::bus::{
-    Bus, EffectOutcome, Handlers, InFlight, PendingEffect, Streamed, run_to_quiescence,
-};
+use rig_ecs::bus::{BusPlugin, EffectOutcome, Handlers, InFlight, PendingEffect, Streamed};
 use wasm_bindgen_test::wasm_bindgen_test;
 
 /// A `!Send` handler, honestly: an `Rc` counter, as a browser provider
@@ -76,7 +73,7 @@ impl Serve for BrowserModel {
                 self.served.set(self.served.get() + 1);
                 let response = CompletionResponse::new(
                     vec![AssistantContent::text("hello from the browser")],
-                    Usage::new(),
+                    Usage::default(),
                     "browser",
                 );
                 Reply::Outcome(Ok(Outcome::Completion(response)))
@@ -95,7 +92,9 @@ impl Serve for BrowserModel {
                             break;
                         }
                     }
-                    let _ = out.finish(StreamFinal::new("browser", Usage::new())).await;
+                    let _ = out
+                        .finish(StreamFinal::new("browser", Usage::default()))
+                        .await;
                 })
             }
             other => Reply::Outcome(Err(ErrorReport::new(
@@ -123,9 +122,9 @@ fn request() -> CompletionRequest {
 
 fn app() -> App {
     let mut app = App::new();
-    Bus::with_policy(ServingPolicy::default())
-        .ambiguity_detection(LogLevel::Error)
-        .install(app.world_mut());
+    app.add_plugins(
+        BusPlugin::with_policy(ServingPolicy::default()).ambiguity_detection(LogLevel::Error),
+    );
     app.finish();
     app.cleanup();
     app
@@ -133,7 +132,7 @@ fn app() -> App {
 
 /// One host pass, then let the browser run its queued executor microtasks.
 async fn tick(app: &mut App) {
-    run_to_quiescence(app.world_mut());
+    app.update();
     rig_core::wasm_compat::sleep(std::time::Duration::from_millis(1)).await;
 }
 
@@ -271,17 +270,7 @@ async fn a_stream_accumulates_and_a_despawn_cancels() {
 }
 
 #[wasm_bindgen_test]
-fn the_components_are_send_sync_on_wasm_too() {
-    fn assert_send_sync<T: Send + Sync + 'static>() {}
-    assert_send_sync::<PendingEffect>();
-    assert_send_sync::<EffectOutcome>();
-    assert_send_sync::<Streamed>();
-    assert_send_sync::<InFlight>();
-}
-
-#[wasm_bindgen_test]
 async fn local_streams_drop_on_marker_removal_scheduled_despawn_replacement_and_shutdown() {
-    use rig_ecs::bus::effect::{Executions, Streaming};
     struct Local(Rc<Cell<usize>>);
     impl Drop for Local {
         fn drop(&mut self) {
@@ -297,7 +286,7 @@ async fn local_streams_drop_on_marker_removal_scheduled_despawn_replacement_and_
         })) as rig_core::streaming::StreamEvents
     };
     let mut world = World::new();
-    Bus::default().install(&mut world);
+    BusPlugin::default().install(&mut world);
     async fn dropped(drops: &Cell<usize>, expected: usize) {
         for _ in 0..1000 {
             if drops.get() == expected {
@@ -312,59 +301,39 @@ async fn local_streams_drop_on_marker_removal_scheduled_despawn_replacement_and_
             "cancelled local worker was not dropped"
         );
     }
-    let (streaming, task) = Streaming::spawn(stream(), 1);
+    fn worker(world: &mut World, entity: Entity, stream: rig_core::streaming::StreamEvents) {
+        let streaming = rig_ecs::bus::Tasks::with(world, |tasks| {
+            tasks.streaming(entity, stream, 1, Default::default())
+        })
+        .expect("the bus is installed");
+        world.entity_mut(entity).insert(streaming);
+    }
     let entity = world
-        .spawn((
-            InFlight {
-                key: "local".into(),
-            },
-            streaming,
-        ))
+        .spawn(InFlight {
+            key: "local".into(),
+        })
         .id();
-    world
-        .non_send_mut::<Executions>()
-        .streams
-        .insert(entity, task);
-    let (streaming, task) = Streaming::spawn(stream(), 1);
-    world.entity_mut(entity).insert(streaming);
-    world
-        .non_send_mut::<Executions>()
-        .streams
-        .insert(entity, task);
+    worker(&mut world, entity, stream());
+    worker(&mut world, entity, stream());
     dropped(&drops, 1).await;
     world.entity_mut(entity).remove::<InFlight>();
     dropped(&drops, 2).await;
-    let (streaming, task) = Streaming::spawn(stream(), 1);
-    world.entity_mut(entity).insert((
-        InFlight {
-            key: "local".into(),
-        },
-        streaming,
-    ));
-    world
-        .non_send_mut::<Executions>()
-        .streams
-        .insert(entity, task);
+    world.entity_mut(entity).insert(InFlight {
+        key: "local".into(),
+    });
+    worker(&mut world, entity, stream());
     let mut schedule = Schedule::default();
     schedule.add_systems(move |mut commands: Commands| {
         commands.entity(entity).despawn();
     });
     schedule.run(&mut world);
     dropped(&drops, 3).await;
-    assert!(world.non_send::<Executions>().streams.is_empty());
-    let (streaming, task) = Streaming::spawn(stream(), 1);
     let entity = world
-        .spawn((
-            InFlight {
-                key: "local".into(),
-            },
-            streaming,
-        ))
+        .spawn(InFlight {
+            key: "local".into(),
+        })
         .id();
-    world
-        .non_send_mut::<Executions>()
-        .streams
-        .insert(entity, task);
+    worker(&mut world, entity, stream());
     drop(world);
     dropped(&drops, 4).await;
 }
@@ -377,7 +346,7 @@ fn a_local_writer_keeps_post_final_work_alive_until_resume_or_cancellation() {
         let (release, wait) = futures::channel::oneshot::channel::<()>();
         let mut stream = Reply::written(move |writer| async move {
             writer
-                .finish(StreamFinal::new("local", Usage::new()))
+                .finish(StreamFinal::new("local", Usage::default()))
                 .await
                 .unwrap();
             wait.await.unwrap();

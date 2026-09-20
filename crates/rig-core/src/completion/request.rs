@@ -7,14 +7,14 @@
 //!
 //! ```ignore
 //! use rig_core::{
-//!     client::CompletionClient,
 //!     completion::{AssistantContent, CompletionModel},
-//!     providers::openai,
+//!     providers::openai::{self, wire::OpenAI},
 //! };
+//! // rig-core ships no transport; `.bound()` builds the bundled `reqwest` one.
+//! use rig_reqwest::prelude::*;
 //!
 //! # async fn run() -> Result<(), Box<dyn std::error::Error>> {
-//! let client = openai::Client::from_env()?;
-//! let model = client.completion_model(openai::GPT_5_2);
+//! let model = OpenAI::from_env()?.bound()?.completion(openai::GPT_5_2);
 //!
 //! let request = model
 //!     .completion_request("Who are you?")
@@ -118,18 +118,10 @@ pub enum CompletionError {
 }
 
 crate::provider_response::impl_provider_response_helpers!(CompletionError);
+crate::wire::impl_wire_error!(CompletionError);
 
 impl From<http_client::Error> for CompletionError {
     fn from(error: http_client::Error) -> Self {
-        Self::from_transport_error(error)
-    }
-}
-
-impl CompletionError {
-    /// Maps an SSE transport error like every other transport error: the
-    /// provider's reply becomes [`Self::ProviderResponse`], a response-less
-    /// failure stays [`Self::HttpError`] with its own retryability.
-    pub(crate) fn from_stream_transport(error: http_client::Error) -> Self {
         Self::from_transport_error(error)
     }
 }
@@ -328,13 +320,15 @@ impl FinishReason {
 /// response metadata. The completion choice contains one or more assistant
 /// content items.
 ///
-/// This type is concrete — it carries no provider-typed payload. Callers who
-/// hold a concrete model and need a provider's own wire response *typed* call
-/// that model's inherent `raw_completion` method, which performs the same
-/// request and returns the provider's native type. Callers who do not hold the
-/// concrete model — an agent erases it at construction — read the same value,
-/// serialized, from [`CompletionResponse::raw`], which every provider seam
-/// populates.
+/// This type is concrete — it carries no provider-typed payload. A caller who
+/// needs the provider's own reply *typed* deserializes it out of
+/// [`CompletionResponse::raw`], which every provider seam populates with the
+/// document its decoder folded; provider reply types are `Deserialize`, so the
+/// typed read is one `serde_json::from_value` away, and it needs no concrete
+/// model — an agent erases the model at construction and still has the value.
+/// A provider over a non-HTTP transport (the Bedrock SDK, a local Candle
+/// model) may additionally expose an inherent method returning its SDK's
+/// typed reply.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(from = "CompletionResponseRepr")]
 pub struct CompletionResponse {
@@ -392,11 +386,10 @@ pub struct CompletionResponse {
     /// requested; it is `None` when the provider reports no identifier.
     #[serde(default)]
     pub model: Option<String>,
-    /// The provider's own response for this call: the value the model's
-    /// inherent `raw_completion` would have returned, serialized. It is the
-    /// response as rig's wire type parsed it — fields that type does not model
-    /// are not here. Every provider seam populates it, unconditionally — the
-    /// same parity the pre-normalization `raw_response: T` had.
+    /// The provider's own response for this call: its reply document as the
+    /// provider's decoder parsed it — fields that wire type does not model are
+    /// not here. Every provider seam populates it, unconditionally — the same
+    /// parity the pre-normalization `raw_response: T` had.
     ///
     /// An escape hatch for provider-specific data rig does not normalize — it
     /// never replaces a normalized field, and every normalized field means the
@@ -406,10 +399,11 @@ pub struct CompletionResponse {
     /// persisted before the field existed — never that the provider sent
     /// nothing: no provider seam produces `Null`.
     ///
-    /// Typed access is recoverable: provider raw types are `Deserialize`, so
-    /// `provider::CompletionResponse::deserialize(&raw)` returns the
-    /// provider's own type, and [`NormalizeCompletionResponse`] converts
-    /// forward.
+    /// Typed access is recoverable: provider reply types are `Deserialize`,
+    /// so `provider::CompletionResponse::deserialize(&raw)` returns the
+    /// provider's own type. There is no second mapping to convert it
+    /// forward — this response IS the fold of that document, produced once
+    /// by the provider's decoder.
     #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
     pub raw: serde_json::Value,
 }
@@ -548,74 +542,49 @@ impl From<CompletionResponseRepr> for CompletionResponse {
     }
 }
 
-/// Convert a provider's own completion payload into the normalized
-/// [`CompletionResponse`].
+/// The token usage a provider reported for one completion.
 ///
-/// The provider descriptor name is an *input* rather than something the
-/// conversion knows, because several providers share one wire shape — the
-/// OpenAI chat-completions payload is used by more than a dozen of them. A
-/// conversion that hardcoded a name would mislabel every provider but one, and
-/// a placeholder overwritten by the caller would be correct only by convention.
-///
-/// This is a trait rather than `TryFrom<(&str, T)>` for a concrete reason:
-/// a tuple is not a local type, so `impl TryFrom<(&str, TheirResponse)> for
-/// CompletionResponse` is rejected by the orphan rule in any crate other than
-/// `rig-core`. Implementing this trait on a provider's own response type is
-/// allowed anywhere, which keeps provider extensions implementable outside this
-/// crate.
-pub trait NormalizeCompletionResponse {
-    /// Normalize this payload, attributing it to `provider`.
-    fn normalize(self, provider: &str) -> Result<CompletionResponse, CompletionError>;
-}
-
-/// Struct representing the token usage for a completion request.
-/// If tokens used are `0`, then the provider failed to supply token usage metrics.
-#[derive(Debug, PartialEq, Eq, Clone, Copy, Serialize, Deserialize)]
+/// A counter the provider did not send is `None`; a reported zero is
+/// `Some(0)`. Serialized as the same keys, absent when `None`.
+#[derive(Debug, Default, PartialEq, Eq, Clone, Copy, Serialize, Deserialize)]
 pub struct Usage {
     /// The number of input ("prompt") tokens used in a given request.
-    pub input_tokens: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_tokens: Option<u64>,
     /// The number of output ("completion") tokens used in a given request.
-    pub output_tokens: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_tokens: Option<u64>,
     /// We store this separately as some providers may only report one number
-    pub total_tokens: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_tokens: Option<u64>,
     /// The number of input tokens read from a provider-managed cache
-    pub cached_input_tokens: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cached_input_tokens: Option<u64>,
     /// The number of input tokens written to a provider-managed cache
-    pub cache_creation_input_tokens: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_creation_input_tokens: Option<u64>,
     /// The number of tool-use prompt tokens used in a given request.
-    #[serde(default)]
-    pub tool_use_prompt_tokens: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_use_prompt_tokens: Option<u64>,
     /// The number of tokens spent on internal reasoning / "thoughts" by reasoning-capable
     /// models (e.g. Gemini thinking, Anthropic extended thinking, OpenAI o-series).
-    pub reasoning_tokens: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_tokens: Option<u64>,
 }
 
 impl Usage {
-    /// Creates a new instance of `Usage`.
-    pub fn new() -> Self {
-        Self {
-            input_tokens: 0,
-            output_tokens: 0,
-            total_tokens: 0,
-            cached_input_tokens: 0,
-            cache_creation_input_tokens: 0,
-            tool_use_prompt_tokens: 0,
-            reasoning_tokens: 0,
-        }
-    }
-
-    /// Whether any usage values are set and non-zero.
-    ///
-    /// Zero-valued usage is this type's documented sentinel for "the provider
-    /// supplied no usage metrics", so `false` means usage was not reported.
-    pub fn has_values(&self) -> bool {
-        *self != Self::new()
+    /// Whether the provider reported any counter at all.
+    pub fn is_reported(&self) -> bool {
+        *self != Self::default()
     }
 }
 
-impl Default for Usage {
-    fn default() -> Self {
-        Self::new()
+/// Sum two counters where an unreported side does not turn a reported one
+/// into "unreported".
+fn add_counter(lhs: Option<u64>, rhs: Option<u64>) -> Option<u64> {
+    match (lhs, rhs) {
+        (None, None) => None,
+        (lhs, rhs) => Some(lhs.unwrap_or(0) + rhs.unwrap_or(0)),
     }
 }
 
@@ -630,13 +599,17 @@ impl Add for Usage {
 
 impl AddAssign for Usage {
     fn add_assign(&mut self, other: Self) {
-        self.input_tokens += other.input_tokens;
-        self.output_tokens += other.output_tokens;
-        self.total_tokens += other.total_tokens;
-        self.cached_input_tokens += other.cached_input_tokens;
-        self.cache_creation_input_tokens += other.cache_creation_input_tokens;
-        self.tool_use_prompt_tokens += other.tool_use_prompt_tokens;
-        self.reasoning_tokens += other.reasoning_tokens;
+        self.input_tokens = add_counter(self.input_tokens, other.input_tokens);
+        self.output_tokens = add_counter(self.output_tokens, other.output_tokens);
+        self.total_tokens = add_counter(self.total_tokens, other.total_tokens);
+        self.cached_input_tokens = add_counter(self.cached_input_tokens, other.cached_input_tokens);
+        self.cache_creation_input_tokens = add_counter(
+            self.cache_creation_input_tokens,
+            other.cache_creation_input_tokens,
+        );
+        self.tool_use_prompt_tokens =
+            add_counter(self.tool_use_prompt_tokens, other.tool_use_prompt_tokens);
+        self.reasoning_tokens = add_counter(self.reasoning_tokens, other.reasoning_tokens);
     }
 }
 
@@ -684,10 +657,12 @@ impl ProviderCapabilities {
 /// either from a third party provider (e.g.: OpenAI) or a local model.
 ///
 /// Implementations return Rig's normalized [`CompletionResponse`] and
-/// [`StreamingCompletionResponse`]; a provider's own wire types stay on the
-/// provider's side of this boundary, reachable through its inherent
-/// `raw_completion`/`raw_stream` methods. Model construction belongs to
-/// [`crate::client::completion::CompletionClient`], not to this trait.
+/// [`StreamingCompletionResponse`]; the provider's own reply document travels
+/// serialized on [`CompletionResponse::raw`]. Construction is not this trait's
+/// business: a provider names its completion wire through
+/// [`HasCompletion`](crate::wire::HasCompletion), and a caller reaches the
+/// model as `completion(model)` on the [`Bound`](crate::driver::Bound) that
+/// joins that config to a transport.
 ///
 /// The trait demands only async service behavior — no `Clone` supertrait, in
 /// the spirit of `tower::Service`: cloning or sharing a model is the caller's
@@ -1069,14 +1044,13 @@ fn merge_provider_tools_into_additional_params(
 /// Example usage:
 /// ```ignore
 /// use rig_core::{
-///     client::CompletionClient,
-///     providers::openai::{Client, self},
 ///     completion::{CompletionModel, CompletionRequestBuilder},
+///     providers::openai::{self, wire::OpenAI},
 /// };
+/// use rig_reqwest::prelude::*;
 ///
 /// # async fn run() -> Result<(), Box<dyn std::error::Error>> {
-/// let openai = Client::new("your-openai-api-key")?;
-/// let model = openai.completion_model(openai::GPT_5_2);
+/// let model = OpenAI::new("your-openai-api-key").bound()?.completion(openai::GPT_5_2);
 ///
 /// // Create the completion request and execute it separately
 /// let request = CompletionRequestBuilder::new(model.clone(), "Who are you?".to_string())
@@ -1092,14 +1066,13 @@ fn merge_provider_tools_into_additional_params(
 /// Alternatively, you can execute the completion request directly from the builder:
 /// ```ignore
 /// use rig_core::{
-///     client::CompletionClient,
-///     providers::openai::{Client, self},
 ///     completion::CompletionRequestBuilder,
+///     providers::openai::{self, wire::OpenAI},
 /// };
+/// use rig_reqwest::prelude::*;
 ///
 /// # async fn run() -> Result<(), Box<dyn std::error::Error>> {
-/// let openai = Client::new("your-openai-api-key")?;
-/// let model = openai.completion_model(openai::GPT_5_2);
+/// let model = OpenAI::new("your-openai-api-key").bound()?.completion(openai::GPT_5_2);
 ///
 /// // Create the completion request and execute it directly
 /// let response = CompletionRequestBuilder::new(model, "Who are you?".to_string())
