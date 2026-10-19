@@ -22,35 +22,13 @@ pub use golden_matrix;
 
 /// Emit registered test rows with the shared execution body.
 #[macro_export]
-macro_rules! resume_matrix {
-    (
-        wrapper: $wrapper:path, wire: $wire:path, run: $run:path;
-        $( $(#[$attribute:meta])* $name:ident: ($scenario:literal, $cell:path, $resume:expr, $oracle:path); )*
-    ) => {
-        $(
-            $(#[$attribute])*
-            async fn $name() {
-                $wrapper($scenario, |client| async move {
-                    let mut cell = $cell;
-                    cell.resume_after = $resume;
-                    $run(&$wire(&client), &cell, $oracle).await;
-                }).await;
-            }
-        )*
-    };
-}
-
-pub use resume_matrix;
-
-/// Emit registered test rows with the shared execution body.
-#[macro_export]
 macro_rules! case_matrix {
     (
         family: $family:ident;
-        $( $(#[$attribute:meta])* $name:ident: $case:ident; )*
+        $( $(#[$attribute:meta])* $name:ident: $case:ident $(=> $golden:literal)?; )*
     ) => {
         $(
-            $crate::matrix::$family!($(#[$attribute])* $name, $case);
+            $crate::matrix::$family!($(#[$attribute])* $name, $case $(, $golden)?);
         )*
     };
     (
@@ -68,14 +46,7 @@ pub use case_matrix;
 #[path = "matrix/agent_tool_sessions.rs"]
 mod agent_tool_sessions;
 pub use agent_tool_sessions::agent_tool_sessions_case;
-
-#[path = "matrix/ecs_faults.rs"]
-mod ecs_faults;
-pub use ecs_faults::ecs_faults_case;
-
-#[path = "matrix/ecs_termination.rs"]
-mod ecs_termination;
-pub use ecs_termination::ecs_termination_case;
+pub use agent_tool_sessions::session_agent;
 
 #[path = "matrix/turn_termination_matrix.rs"]
 mod turn_termination_matrix;
@@ -92,6 +63,14 @@ pub use streaming_logprobs_matrix::streaming_logprobs_matrix_case;
 #[path = "matrix/history_roundtrip_matrix.rs"]
 mod history_roundtrip_matrix;
 pub use history_roundtrip_matrix::history_roundtrip_matrix_case;
+
+#[path = "matrix/history_survival_matrix.rs"]
+mod history_survival_matrix;
+pub use history_survival_matrix::history_survival_case;
+
+#[path = "matrix/portability_matrix.rs"]
+mod portability_matrix;
+pub use portability_matrix::portability_case;
 
 #[path = "matrix/terminal_metadata_matrix.rs"]
 mod terminal_metadata_matrix;

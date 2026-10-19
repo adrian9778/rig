@@ -8,18 +8,29 @@
         clippy::unreachable
     )
 )]
-//! Google Cloud Vertex AI provider integration for Rig.
+//! The Vertex AI completion wires and the [`VertexAi`] transport they are
+//! sent through: Gemini's `GenerateContent`, and Claude through
+//! [`anthropic`]. Configure Application Default Credentials or supply
+//! credentials or a prediction service through [`VertexAiBuilder`]. ADC
+//! construction requires a Tokio runtime that remains alive and driven for
+//! the transport's lifetime.
 //!
-//! This crate exposes Vertex AI hosted model completions through Rig's
-//! completion traits. Configure Google Cloud Application Default Credentials or
-//! provide credentials through Google Cloud's standard environment before
-//! constructing a client.
+//! ```no_run
+//! use rig_core::Model;
+//! use rig_vertexai::{VertexAi, completion::{GEMINI_2_5_FLASH, GenerateContent}};
 //!
-//! The root `rig` facade re-exports this crate as `rig::vertexai` when the
-//! `vertexai` feature is enabled.
+//! # async fn example() -> Result<(), rig_vertexai::client::VertexAiClientError> {
+//! let model = VertexAi::from_env()?.completion(GEMINI_2_5_FLASH);
+//! # let _ = model;
+//! # Ok(())
+//! # }
+//! ```
 
+pub mod anthropic;
+mod auth;
 pub mod client;
 pub mod completion;
+pub mod extension;
 pub(crate) mod types;
 
-pub use client::{Client, ClientBuilder};
+pub use client::{VertexAi, VertexAiBuilder};

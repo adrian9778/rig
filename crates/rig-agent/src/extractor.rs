@@ -1,30 +1,14 @@
-//! Typed extraction: an [`Agent`] configured to answer through a `submit`
-//! tool whose arguments are the value to extract, run as a
-//! [`TypedRun`].
+//! Typed extraction through an agent's `submit` output tool, with configurable retries.
 //!
-//! The target type must implement `serde::Deserialize`, `serde::Serialize`,
-//! and `schemars::JsonSchema`; all three derive.
-//!
-//! # Example
 //! ```no_run
-//! use rig_agent::prelude::*;
-//! use rig_core::providers::openai::{self, OpenAI};
-//! use rig_reqwest::prelude::*;
-//!
+//! use rig_agent::extractor::ExtractorBuilder;
+//! use rig_core::{Model, providers::openai::{self, OpenAI}};
 //! # async fn run() -> Result<(), Box<dyn std::error::Error>> {
-//! let openai = OpenAI::new("your-open-ai-api-key").bound()?;
-//!
 //! #[derive(serde::Deserialize, serde::Serialize, schemars::JsonSchema)]
-//! struct Person {
-//!    name: Option<String>,
-//!    age: Option<u8>,
-//!    profession: Option<String>,
-//! }
-//!
-//! let extractor = openai.extractor::<Person>(openai::GPT_4O).retries(2).build();
-//!
-//! // `.await` gives a `TypedPromptResponse<Person>`; `.output` is the value.
-//! let person = extractor.extract("John Doe is a 30 year old doctor.").await?.output;
+//! struct Person { name: String, age: u8 }
+//! let model = OpenAI::from_env()?.completion(openai::GPT_4O);
+//! let extractor = ExtractorBuilder::<Person>::new(model).retries(2).build();
+//! let person = extractor.extract("John is 30.").await?.output;
 //! # Ok(())
 //! # }
 //! ```
@@ -40,10 +24,7 @@ use rig_core::{
     wasm_compat::{WasmCompatSend, WasmCompatSync},
 };
 
-use crate::{
-    agent::{Agent, AgentBuilder, AgentHook, ModelRef, OutputMode, TypedRun},
-    completion::CompletionModel,
-};
+use crate::agent::{Agent, AgentBuilder, AgentHook, ModelRef, OutputMode, TypedRun};
 
 const SUBMIT_TOOL_NAME: &str = "submit";
 
@@ -55,7 +36,7 @@ where
     T: JsonSchema + DeserializeOwned + WasmCompatSend + WasmCompatSync,
 {
     agent: Agent,
-    retries: u64,
+    retries: usize,
     _t: PhantomData<T>,
 }
 
@@ -64,17 +45,17 @@ where
     T: JsonSchema + DeserializeOwned + WasmCompatSend + WasmCompatSync,
 {
     /// Set a different default model for this extractor's subsequent runs.
-    /// Use the model registered under `label` on the extractor's bus.
-    pub fn with_model_ref(mut self, label: impl Into<ModelRef>) -> Self {
-        self.agent.set_model_ref(label);
+    /// Use the model registered under `label` in the extractor's handler table.
+    pub fn with_model_label(mut self, label: impl Into<ModelRef>) -> Self {
+        self.agent.set_model_label(label);
         self
     }
 
-    /// Register `model` on the extractor's bus and use it.
-    pub fn with_model<M>(mut self, model: M) -> Self
-    where
-        M: CompletionModel + 'static,
-    {
+    /// Register `model` in the extractor's handler table and use it.
+    pub fn with_model(
+        mut self,
+        model: impl Into<rig_core::DynModel<rig_core::operation::Completion>>,
+    ) -> Self {
         self.agent.set_model(model);
         self
     }
@@ -86,9 +67,8 @@ where
 
     /// Extract structured data from `text`.
     ///
-    /// The returned run can be configured further — `.history(..)` for chat
-    /// context, `.using_model(..)` for a per-run default model, `.retries(..)`
-    /// to override the extractor's budget — and `.await`ed for a
+    /// The returned run supports history, a per-run model, and retry overrides,
+    /// and can be awaited for a
     /// [`TypedPromptResponse<T>`](crate::agent::TypedPromptResponse). The
     /// model must call the `submit` tool; a run in which it does not is an
     /// empty response and, within the retry budget, is retried from scratch.
@@ -112,13 +92,10 @@ where
 {
     agent_builder: AgentBuilder,
     _t: PhantomData<T>,
-    retries: Option<u64>,
+    retries: Option<usize>,
 }
 
-/// Generate the `ExtractorBuilder` setters that forward verbatim to the inner
-/// [`AgentBuilder`] method of the same name. Doc comments live at each
-/// invocation; `preamble` (which wraps its argument) and `retries`
-/// (builder-local) stay hand-written.
+/// Generate setters forwarding to the matching inner [`AgentBuilder`] methods.
 macro_rules! forward_agent_builder {
     ($( $(#[$attr:meta])* $name:ident $([$gen:ident : $($bound:tt)+])?
         ( $($arg:ident : $ty:ty),* );)+) => {$(
@@ -137,14 +114,14 @@ where
     T: JsonSchema + DeserializeOwned + Serialize + WasmCompatSend + WasmCompatSync + 'static,
 {
     /// An extractor of `T` over `model`.
-    pub fn new<M>(model: M) -> Self
-    where
-        M: CompletionModel + 'static,
-    {
+    pub fn new(model: impl Into<rig_core::DynModel<rig_core::operation::Completion>>) -> Self {
         Self::from_agent_builder(AgentBuilder::new(model))
     }
 
-    /// Create an extractor builder from an opaque runtime model handle.
+    /// Configure an agent builder for extraction of `T`, replacing its preamble,
+    /// output schema, tool choice, and output mode. The tool choice is always
+    /// [`ToolChoice::Required`], since an extraction is one turn that must call
+    /// the `submit` tool.
     pub fn from_agent_builder(builder: AgentBuilder) -> Self {
         Self {
             agent_builder: builder
@@ -183,9 +160,6 @@ where
         /// Set the maximum number of tokens for the completion
         max_tokens(max_tokens: u64);
 
-        /// Set the `tool_choice` option for the inner Agent.
-        tool_choice(choice: ToolChoice);
-
         /// Add a provider-independent lifecycle hook to every extraction attempt.
         ///
         /// Completion-response hooks receive canonical Rig content, usage, prompt,
@@ -207,7 +181,7 @@ where
     }
 
     /// Set the maximum number of retries for the extractor.
-    pub fn retries(mut self, retries: u64) -> Self {
+    pub fn retries(mut self, retries: usize) -> Self {
         self.retries = Some(retries);
         self
     }

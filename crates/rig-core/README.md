@@ -14,10 +14,15 @@ More information about this crate can be found in the [crate documentation](http
   - [Who is using Rig?](#who-is-using-rig)
 
 ## Features
-- Portable contracts for agent runtimes, including completions, messages, tools, and memory
+- Portable contracts for agent runtimes, including completions, messages, conversations, and tools
+- `conversation`: one conversation type with stable message ids, authors, asides, branches and a change log a store replays; `rig-memory` saves it
+- Provider facts a host acts on: calls a provider cut off, prefill support, foreign reasoning
+- `Model::check`: a dry run that lists the options a model would drop
 - Full [GenAI Semantic Convention](https://opentelemetry.io/docs/specs/semconv/gen-ai/) compatibility
 - 20+ model providers, all under one singular unified interface
-- Providers selectable as data: `providers::registry` names a vendor and a protocol family (`deepseek/openai:deepseek-chat`) or carries a whole typed configuration, and both round-trip through serde without a credential
+- Built-in providers selectable as data: `Catalog::connect("anthropic/claude-opus-5-5")` builds a model from a `vendor/model` reference with the key from the environment, in the protocol family the model catalog names, and the model encodes and prices with that catalog's facts. `providers::registry` references name a model or carry a whole typed configuration, and both round-trip through serde without a credential. Model references discard embedded credentials and reject empty identifiers; a configuration's `id()` returns a catalog selection only when its dialect name is registered. Providers outside this catalog can use a `Model` and `ModelAdapter` directly.
+- A model catalog an application can correct: lay a fetched copy of models.dev (`Catalog::from_models_dev`, which skips what it cannot read) and the user's override file (`Catalog::from_overrides`, which rejects a misspelt vendor, field or model id with a "did you mean" hint) over `Catalog::builtin()` with `with_models_dev` (which keeps rig's hand-reviewed facts) and `with_overrides`, and connect through the result.
+- `catalog::Connector`: reach a catalog's models by `vendor/model`, with keys or a sign-in
 - 10+ vector store integrations, all under one singular unified interface
 - Full support for LLM completion and embedding workflows
 - Support for transcription, audio generation and image generation model capabilities
@@ -26,8 +31,12 @@ More information about this crate can be found in the [crate documentation](http
 
 ## Installation
 ```bash
-cargo add rig-core
+cargo add rig-core --features reqwest
 ```
+
+The `reqwest` feature gives provider clients a default HTTP transport, so
+`OpenAI::from_env()` needs no client of yours. Without it, pass a transport
+with `OpenAIConfig::from_env()?.connect(http)`.
 
 ## WASM target support
 
@@ -39,27 +48,20 @@ Node.js 19 or later do. WASI targets are not supported.
 ## Simple example
 ```rust
 use rig_core::{
-    completion::{AssistantContent, CompletionModel},
+    completion::CompletionRequest,
     providers::openai::{self, OpenAI},
 };
-// rig-core ships no transport; `.bound()` builds the bundled `reqwest` one.
-use rig_reqwest::prelude::*;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Read `OPENAI_API_KEY` into the provider's configuration, bind it to a
-    // transport, and pick a model: a model is a wire plus its socket.
-    // OpenAI's default completion route is the Responses API;
-    // `.with_route(Route::Chat)` on the configuration selects Chat Completions.
-    let model = OpenAI::from_env()?.bound()?.completion(openai::GPT_5_2);
+    // The client reads `OPENAI_API_KEY` and sends through the bundled reqwest
+    // client (rig-core's `reqwest` feature). A config's `connect(http)` uses another.
+    let model = OpenAI::from_env()?.completion(openai::GPT_5_2);
 
-    let request = model.completion_request("Who are you?").build();
-    let response = model.completion(request).await?;
-    for item in response.choice {
-        if let AssistantContent::Text(text) = item {
-            println!("{}", text.text);
-        }
-    }
+    let response = model
+        .call(CompletionRequest::new("Who are you?").temperature(0.2))
+        .await?;
+    println!("{}", response.text());
 
     Ok(())
 }
@@ -97,6 +99,10 @@ Rig supports the following LLM providers out of the box:
 - Xiaomi MiMo
 - Z.ai
 
+The built-in `rig_core::vector_store::in_memory_store::InMemoryVectorStore`
+stores serializable documents without requiring `Eq` or `Default`. Its custom
+ID callbacks accept closures that capture and mutate application state.
+
 Vector stores are available as separate companion-crates and as feature-gated modules on the root `rig` facade:
 
 ```toml
@@ -123,32 +129,131 @@ The following providers are available as separate companion-crates:
 - Google Vertex: [`rig-vertexai`](https://github.com/0xPlaygrounds/rig/tree/main/crates/rig-vertexai)
 
 ## Who is using Rig?
-Below is a non-exhaustive list of companies and people who are using Rig:
-- [St Jude](https://www.stjude.org/) - Using Rig for a chatbot utility as part of [`proteinpaint`](https://github.com/stjude/proteinpaint), a genomics visualisation tool.
-- [Coral Protocol](https://www.coralprotocol.org/) - Using Rig extensively, both internally as well as part of the [Coral Rust SDK.](https://github.com/Coral-Protocol/coral-rs)
-- [VT Code](https://github.com/vinhnx/vtcode) - VT Code is a Rust-based terminal coding agent with semantic code intelligence via Tree-sitter and ast-grep. VT Code uses `rig` for simplifying LLM calls and implement model picker.
-- [Dria](https://dria.co/) - a decentralised AI network. Currently using Rig as part of their [compute node.](https://github.com/firstbatchxyz/dkn-compute-node)
-- [Nethermind](https://www.nethermind.io/) - Using Rig as part of their [Neural Interconnected Nodes Engine](https://github.com/NethermindEth/nine) framework.
-- [Neon](https://neon.com) - Using Rig for their [app.build](https://github.com/neondatabase/appdotbuild-agent) V2 reboot in Rust.
-- [Listen](https://github.com/piotrostr/listen) - A framework aiming to become the go-to framework for AI portfolio management agents. Powers [the Listen app.](https://app.listen-rs.com/)
-- [Cairnify](https://cairnify.com/) - helps users find documents, links, and information instantly through an intelligent search bar. Rig provides the agentic foundation behind Cairnify’s AI search experience, enabling tool-calling, reasoning, and retrieval workflows.
-- [Ironclaw](https://github.com/nearai/ironclaw) - A secure personal AI assistant
+Companies, applications, libraries and articles built on Rig are listed in [awesome-rig](https://github.com/0xPlaygrounds/awesome-rig), a community-maintained list. Using Rig? Open a pull request there to add your project.
 
-Are you also using Rig in production? [Open an issue](https://www.github.com/0xPlaygrounds/rig/issues) to have your name added!
+## Provider selection persistence
+
+Registry references distinguish registered presets from explicit configurations.
+Qualified `vendor/format:model` strings remain unambiguous when a vendor gains
+another protocol family, but do not freeze preset defaults, endpoint availability,
+or model names. Explicit configurations retain host, route, and typed options and
+serialize as objects rather than lossy labels. References remove credentials;
+standalone configurations may hold them at runtime. Deserialization requires a
+self-describing format such as JSON.
+
+Copilot presets accept already-exchanged session tokens and derive their endpoint
+from those tokens. Explicit configurations keep their host and instruction
+placement. Token exchange and asynchronous SDK setup belong to the host. The
+catalog is not exhaustive: other models can use `ModelAdapter` directly.
+Registry-qualified names do not replace the provider names used in telemetry.
+
+## Provider implementation
+
+A provider has a serializable configuration (`OpenAIConfig`) and a client
+(`OpenAI`), the configuration on a transport. The client builds one `Model`
+per capability: the capability's wire, which says what to send and how to
+read the reply, on the client's transport. One driver runs every model.
+Chat-compatible dialects use the shared `Chat` wire and decoder with
+`Dialect` data and `BodyRewrite` hooks rather than duplicating request conversion.
+This keeps normalization, retry classification, and telemetry consistent.
+
+An operation (`wire::Operation`) names its request, event and response types,
+which event ends a reply, and the fold one reply's events pass through; it is
+written once, and every provider of it is interchangeable behind a `DynModel`.
+A crate outside Rig adds an operation and serves it with its own wire and
+decoder over HTTP, or with `driver::Local` and a transport of its own for an
+in-process runtime.
+
+Each wire encodes requests without transport access and creates a fresh decoder
+for each reply. Buffered and streaming replies use the same classifier and event
+mapping. A buffered response with a distinct shape is another classified event,
+not a separate normalization path. The driver owns framing and asynchronous I/O;
+decoders can be exercised directly with frames without opening a connection.
+Credentials stored in configuration use `Secret`, whose serialized redaction
+must be replaced with a credential when the host reloads the configuration.
+
+Construct normalized completion responses through their builders so finish
+reasons reconcile with tool output. Preserve unknown terminal reasons in `Other`,
+use the selected descriptor's provider name, and retain the decoded provider
+payload in `raw` for typed inspection without a second request. Preserve error
+bodies through `ProviderError::from_http_response` for failed HTTP responses and
+`ProviderError::from_provider_body` for error envelopes on successful HTTP
+responses.
+Credentials require redacted debug output. Provider changes need coverage for
+supported streaming, usage, tool and multimodal content, with examples and facade
+exposure matching the configured capabilities.
+
+Request serialization must use stable map ordering. Randomized `HashMap`
+iteration can change request bytes and serialized schemas embedded in prompts,
+reducing prefix-cache reuse. Compare raw serialized bytes when testing this;
+canonicalized cassette JSON can hide ordering differences. The JSON helpers sort
+map keys and recursively sort rendered values regardless of serde_json's
+`preserve_order` feature.
+
+## Anthropic prompt caching
+
+Manual caching marks the system prompt, final tool definition, and final message
+block. Automatic caching delegates the moving conversation breakpoint to the
+provider. Combined mode retains static-prefix markers within the four-marker
+budget, including any markers already supplied on provider-specific tools.
+
+A longer TTL can keep shared tools and instructions cached across conversations
+without paying the longer storage lifetime for every conversation tail. Set
+`with_static_prefix_cache_ttl(CacheTtl::OneHour)` with automatic five-minute
+caching for this arrangement. One-hour markers must precede five-minute markers;
+request encoding rejects the inverse ordering. Cache-write prices differ by TTL,
+so choose a lifetime based on actual reuse.
+
+Caching is skipped when the prefix through a marker is below the model's minimum:
+
+| Model | Minimum tokens |
+| --- | ---: |
+| `claude-opus-4-7`, `claude-opus-4-6`, `claude-opus-4-5` | 4096 |
+| `claude-sonnet-4-6` | 2048 |
+| `claude-sonnet-4-5`, `claude-opus-4-1`, `claude-opus-4`, `claude-sonnet-4` | 1024 |
+| `claude-haiku-4-5` | 4096 |
+
+## Gemini explicit caching
+
+Explicit caching uploads reusable content and returns a `cachedContents` handle.
+Requests can reuse it immediately, including across conversations. Storage is
+billed per token-hour until deletion or expiry, in addition to cached-input
+charges. Implicit prefix caching is automatic and best-effort; it does not
+provide a handle or guarantee a warm first request.
+
+A request using an explicit cache cannot also send `systemInstruction`, `tools`,
+or `toolConfig`. Rig rejects these conflicts before sending. Agents therefore
+need no preamble, advertised tools, or configured tool choice on those turns.
+An empty `RequestPatch::active_tools` allow-list suppresses tool advertisements,
+but does not make cached function declarations executable by the agent. Agent
+advertisement and dispatch share a registry snapshot. To execute functions
+specified in a cache, drive `GenerateContent` directly and append matching
+function responses yourself. Provider-hosted tools such as `codeExecution`
+need no caller-side dispatch.
+
+Native structured output and context documents can accompany a cache because
+neither adds those conflicting fields. `OutputMode::Tool` adds a synthetic tool
+and extends the preamble; `OutputMode::Prompted` adds schema instructions to the
+preamble. Neither can accompany a cache. Extractors select tool output mode.
+
+Cache resource paths accept a bare id or a `cachedContents/` handle. Validation
+rejects path separators, query delimiters, fragments, and traversal segments
+rather than escaping them, so lookup, expiry updates, and deletion cannot be
+retargeted by an invalid handle. A 403 or 404 on an existing handle maps to
+`ProviderError::CacheExpired`, preserving the provider's reply because 403 can
+also indicate credential or quota problems. Cache creation does not apply this
+mapping, so authorization failures do not become recreation loops.
 
 ## Provider observations
 
 `observe::AdapterContext` carries a caller-owned operation identity and a
 `Witness` sink. Pass it separately from request data through
-`CompletionModel::completion_with_context(request, Some(context))` or
-`stream_with_context(request, Some(context))`. Ordinary `completion(request)`
-and `stream(request)` are the required provider methods. The observed methods
-have defaults that delegate to them without emitting facts, so ordinary providers
-need no context boilerplate. Request builders and
-request literals contain only provider request data.
+`Model::call_observed(request, context)` or `Model::stream_observed(request,
+context)`; `Model::call` and `Model::stream` record nothing. Request builders
+and request literals contain only provider request data.
 
-Bus-backed `ModelHandle` calls use `complete_with_context` and
-`stream_with_context`. `CompletionAdapter` forwards `Dispatch::adapter_context`;
+Bus-backed `ModelHandle::call_observed` and `ModelHandle::stream_observed`
+take the same context. `ModelAdapter` forwards `Dispatch::adapter_context`;
 explicit caller context takes precedence over Recorder/Observe context for
 that invocation, including through handler layers. It is never serialized into
 provider data or effect records and is not inherited by child calls.
@@ -202,6 +307,5 @@ otherwise-empty frames still count. Corrupt-frame ordinals start at one using
 the same counting rule. `TransportEof`
 records body completeness independently: a provider terminal followed by
 an incomplete trailing frame retains both its terminal closure and partial
-EOF evidence. The context does not promise cross-execution identity. The ECS completion adapter
-forwards its driver's context when the invocation supplies no explicit context. Response bodies and
+EOF evidence. The context does not promise cross-execution identity. Response bodies and
 credentials are not copied into these boundary facts.

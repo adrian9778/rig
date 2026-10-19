@@ -1,76 +1,63 @@
 //! The route's options, reached the way a caller reaches them.
 //!
-//! `Bound<OpenAI>::completion` yields a `Bound<OpenAiWire>`, so every
-//! per-route option has to be reachable through `Bound::map_wire` or it is
-//! not reachable at all. Each test below asserts on the *encoded request*:
+//! `OpenAI::completion` yields an `OpenAiWire`, so every per-route option
+//! has to be reachable on that wire or it is not reachable at all. Each test below asserts on the *encoded request*:
 //! an option that only sets a field the encoder ignores is not forwarded.
 
 use super::*;
 use crate::completion::ToolDefinition;
-use crate::driver::Bound;
 use crate::message::{AssistantContent, Message, ToolResultContent, UserContent};
-
-use super::super::OPENROUTER;
+use crate::test_utils::json_body;
 
 /// A turn with a system prompt, a tool and a tool result, so each option
 /// under test has something in the body it could change.
 fn request() -> CompletionRequest {
-    CompletionRequest {
-        model: None,
-        chat_history: vec![
-            Message::system("be brief"),
-            "probe".into(),
-            Message::Assistant {
-                id: None,
-                content: vec![AssistantContent::tool_call(
-                    "call_1",
-                    "lookup",
-                    serde_json::json!({"q": "x"}),
-                )],
-            },
-            Message::User {
-                content: vec![UserContent::tool_result_from_wire(
-                    "call_1",
-                    "lookup",
-                    vec![ToolResultContent::text("the answer")],
-                )],
-            },
-        ],
-        documents: vec![],
-        tools: vec![ToolDefinition {
-            name: "lookup".to_owned(),
-            description: "look something up".to_owned(),
-            parameters: serde_json::json!({
-                "type": "object",
-                "properties": {"q": {"type": "string"}}
-            }),
-        }],
-        temperature: None,
-        max_tokens: None,
-        tool_choice: None,
-        additional_params: None,
-        output_schema: None,
-        record_telemetry_content: false,
-    }
+    CompletionRequest::from(vec![
+        Message::system("be brief"),
+        "probe".into(),
+        Message::Assistant(crate::message::AssistantMessage::new(vec![
+            AssistantContent::tool_call(
+                "call_1",
+                crate::message::ToolName::new("lookup").expect("tool name"),
+                serde_json::json!({"q": "x"}),
+            ),
+        ])),
+        Message::User {
+            content: vec![UserContent::tool_result(
+                crate::message::CallId::from_wire("call_1"),
+                crate::message::ToolName::new("lookup").expect("tool name"),
+                vec![ToolResultContent::text("the answer")],
+            )],
+        },
+    ])
+    .tools(vec![ToolDefinition {
+        name: crate::message::ToolName::new("lookup").expect("tool name"),
+        description: "look something up".to_owned(),
+        parameters: serde_json::json!({
+            "type": "object",
+            "properties": {"q": {"type": "string"}}
+        }),
+        annotations: Default::default(),
+    }])
 }
 
-/// What `provider`'s route sends after `option` went through
-/// [`Bound::map_wire`].
-fn body(provider: OpenAI, option: impl FnOnce(OpenAiWire) -> OpenAiWire) -> serde_json::Value {
-    let bound = Bound::new(provider, ())
-        .completion("gpt-5.2")
-        .map_wire(option);
-    let encoded = bound
-        .wire
-        .encode(request(), Mode::Unary)
+/// What `provider`'s route sends after `option` rewrote its wire.
+fn body(
+    provider: OpenAIConfig,
+    option: impl FnOnce(OpenAiWire) -> OpenAiWire,
+) -> serde_json::Value {
+    body_with_request(provider, option, request())
+}
+
+fn body_with_request(
+    provider: OpenAIConfig,
+    option: impl FnOnce(OpenAiWire) -> OpenAiWire,
+    request: CompletionRequest,
+) -> serde_json::Value {
+    let encoded = option(provider.completion("gpt-5.2"))
+        .encode(request, Mode::Unary)
         .expect("the request encodes");
-    let [request] = encoded.requests.as_slice() else {
-        panic!("a completion route sends one request");
-    };
-    match request.body() {
-        Body::Bytes(bytes) => serde_json::from_slice(bytes).expect("the body is JSON"),
-        Body::Multipart(_) => panic!("neither completion route sends a multipart body"),
-    }
+    json_body(&encoded.request)
 }
 
 /// The wire unchanged, as the baseline every assertion compares against.
@@ -80,7 +67,11 @@ fn untouched(wire: OpenAiWire) -> OpenAiWire {
 
 /// `option` changes what `changes` sends and leaves `unchanged` as it was —
 /// a route without the option is a no-op, not a panic and not a type error.
-fn only_on(changes: OpenAI, unchanged: OpenAI, option: impl Fn(OpenAiWire) -> OpenAiWire + Copy) {
+fn only_on(
+    changes: OpenAIConfig,
+    unchanged: OpenAIConfig,
+    option: impl Fn(OpenAiWire) -> OpenAiWire + Copy,
+) {
     assert_ne!(
         body(changes.clone(), option),
         body(changes, untouched),
@@ -93,12 +84,12 @@ fn only_on(changes: OpenAI, unchanged: OpenAI, option: impl Fn(OpenAiWire) -> Op
     );
 }
 
-fn chat() -> OpenAI {
-    OpenAI::new("sk-test").with_route(Route::Chat)
+fn chat() -> OpenAIConfig {
+    OpenAIConfig::new("sk-test").with_route(Route::Chat)
 }
 
-fn responses() -> OpenAI {
-    OpenAI::new("sk-test").with_route(Route::Responses)
+fn responses() -> OpenAIConfig {
+    OpenAIConfig::new("sk-test").with_route(Route::Responses)
 }
 
 fn tool() -> ResponsesToolDefinition {
@@ -134,17 +125,6 @@ fn map_wire_reaches_tool_result_array_content_on_the_chat_route_only() {
     );
 }
 
-/// Prompt caching is OpenRouter's `cache_control` on the chat body, so that
-/// is the dialect whose request it changes.
-#[test]
-fn map_wire_reaches_prompt_caching_on_the_chat_route_only() {
-    only_on(
-        OpenAI::with_key(&OPENROUTER, "sk-test").with_route(Route::Chat),
-        OpenAI::with_key(&OPENROUTER, "sk-test").with_route(Route::Responses),
-        OpenAiWire::with_prompt_caching,
-    );
-}
-
 #[test]
 fn map_wire_reaches_a_wire_level_tool_on_the_responses_route_only() {
     only_on(responses(), chat(), |wire| wire.with_tool(tool()));
@@ -175,4 +155,80 @@ fn map_wire_reaches_system_instructions_as_messages_on_the_responses_route_only(
         ),
         body(responses(), as_messages),
     );
+}
+
+/// The document `frames` rebuild through `wire`'s decoder on `reassembler`.
+fn rebuilt<W: Wire<Frame = WireFrame>>(
+    wire: &W,
+    reassembler: W::Reassembler,
+    frames: &[serde_json::Value],
+) -> serde_json::Value {
+    crate::wire::document::rebuild(
+        &wire.decoder(),
+        reassembler,
+        frames
+            .iter()
+            .map(|frame| WireFrame::Text(frame.to_string())),
+    )
+}
+
+/// Each route rebuilds a streamed reply with its own wire's reassembler,
+/// and a default one is the chat route's, as the default route is.
+#[test]
+fn each_route_rebuilds_its_own_document() {
+    let chunk = serde_json::json!({
+        "id": "chatcmpl-1",
+        "object": "chat.completion.chunk",
+        "created": 1,
+        "model": "model",
+        "choices": [{"index": 0, "delta": {"role": "assistant", "content": "hi"}, "finish_reason": "stop"}]
+    });
+    let completed = serde_json::json!({
+        "type": "response.completed",
+        "sequence_number": 0,
+        "response": {"id": "resp_1", "object": "response", "status": "completed", "output": []}
+    });
+    for (provider, frame) in [(chat(), &chunk), (responses(), &completed)] {
+        let wire = OpenAiWire::new(provider, "model");
+        let own = match &wire {
+            OpenAiWire::Chat(chat) => {
+                rebuilt(chat, chat.reassembler(), std::slice::from_ref(frame))
+            }
+            OpenAiWire::Responses(responses) => rebuilt(
+                responses,
+                responses.reassembler(),
+                std::slice::from_ref(frame),
+            ),
+        };
+        let routed = rebuilt(&wire, wire.reassembler(), std::slice::from_ref(frame));
+        assert!(!routed.is_null(), "{routed}");
+        assert_eq!(routed, own);
+    }
+    assert!(matches!(
+        OpenAiReassembler::default(),
+        OpenAiReassembler::Chat(_)
+    ));
+    let chat = chat().chat("model");
+    assert_eq!(
+        rebuilt(
+            &OpenAiWire::Chat(chat.clone()),
+            OpenAiReassembler::default(),
+            std::slice::from_ref(&chunk)
+        ),
+        rebuilt(&chat, <Chat as Wire>::Reassembler::default(), &[chunk]),
+    );
+}
+
+/// A route's reassembler builds its document from its own route's events:
+/// one from the other route, which the driver never feeds it, changes
+/// nothing.
+#[test]
+fn a_reassembler_ignores_the_other_routes_events() {
+    let mut chat = OpenAiReassembler::default();
+    chat.absorb(&OpenAiEvent::Responses(ResponsesEvent::Frame {
+        kind: "response.created".to_owned(),
+        frame: serde_json::json!({"type": "response.created", "response": {"id": "resp_1"}}),
+        raw: None,
+    }));
+    assert_eq!(chat.finish(), OpenAiReassembler::default().finish());
 }

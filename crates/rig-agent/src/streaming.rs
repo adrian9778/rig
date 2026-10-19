@@ -1,7 +1,15 @@
-//! Streaming values for the classic agent runtime.
+//! Portable streaming types re-exported for classic runtime users.
 //!
-//! Streaming is a terminal of the runner: [`Agent::prompt`](crate::agent::Agent::prompt)
-//! returns it, and its [`stream`](crate::agent::AgentRunner::stream) yields
-//! [`MultiTurnStreamItem`](crate::agent::MultiTurnStreamItem)s.
+//! ```
+//! use rig_agent::streaming::{Item, StreamEvent};
+//!
+//! fn text(item: &Item<StreamEvent>) -> Option<&str> {
+//!     match item {
+//!         Item::Event(StreamEvent::Text { text, .. }) => Some(text),
+//!         _ => None,
+//!     }
+//! }
+//! # let _ = text;
+//! ```
 
 pub use rig_core::streaming::*;

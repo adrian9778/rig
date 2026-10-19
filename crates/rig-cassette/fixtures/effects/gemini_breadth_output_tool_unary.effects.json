@@ -1,6 +1,6 @@
 {
   "header": {
-    "run_spec": 1030837007388641174,
+    "run_spec": 14716740328437968975,
     "handlers": [
       {
         "key": "golden/model:default",
@@ -19,11 +19,6 @@
     "hooks": [],
     "required": {
       "golden/model:default": "completion"
-    },
-    "bus": {
-      "command_capacity": 16,
-      "stream_capacity": 64,
-      "serial_per_handler": false
     }
   },
   "records": [
@@ -91,32 +86,53 @@
             {
               "type": "toolcall",
               "id": {
-                "origin": "generated",
-                "id": "minted:tool:0"
+                "local": "00000000-0000-4000-8000-000000000000"
               },
               "function": {
                 "name": "final_result",
                 "arguments": {
                   "category": "Technology",
-                  "summary": "A local meetup for Rustaceans in Seattle to discuss Rust programming, share projects, and network.",
+                  "summary": "A local meetup for Rust enthusiasts in Seattle to connect, share knowledge, and collaborate.",
                   "title": "Seattle Rust Meetup"
                 }
               },
-              "signature": "signature_REDACTED_1",
-              "additional_params": null
+              "native": {
+                "item": {
+                  "functionCall": {
+                    "args": {
+                      "category": "Technology",
+                      "summary": "A local meetup for Rust enthusiasts in Seattle to connect, share knowledge, and collaborate.",
+                      "title": "Seattle Rust Meetup"
+                    },
+                    "name": "final_result"
+                  },
+                  "thoughtSignature": "CrcFAWkUfROJuqKlZ0qqUkMz4veWdFpD4bNAvd5u1eYb3/mBnCC9ZH6H+ziG1l8/VXZEMmzDXlJK6H08eiLyLu3LUjaGFC2Mcp8cBicbHcgewMtgSgw2rMBpkjnJ7bNO/b9h3KJupKrdbepTC7/GdhxIOyeu0fk98nqFMfXDlQzwtEO2gnGrLHHZVKJFL69Ga7jdg7uCZlGXKa8czLK30IOekEjUL8/z+CMCX8mqe+QHvmynDg26/GD8dUBuKkiUqk48i9Q6zdh8XCd8iGNwwVXzjZ12Cljt45ZYMXzKDpbgus+6t5xoXUuNDNvst/0ysd1NP54cdwTJiF5X0A2piZTgjY3PNqVIgZs34SpdSOOxcyRgcZi2YUe8WL9S6Lvlpw2LPmrVRiPPPm79ogCkFnu38Qwv1/5LSyj8AbGknP708Qv3oyPEbxn/HowERcMxW8e8vjwGp+CNEfzHb3ErnlAwaVluSZtV+NmoFIMRC1dghM/HnZ+gLf5HKn/lKH4tnzt2+r1jNNpah6BtAZ1Pk156N2vIDmq8EIKUuF0my05EA5KafJB8gvsYVBW46z/mjgEuVrg3d6hO2obuTsQlO2uSLBHQSEln5+8RajPQED5+Wc+9zYBsaaddCXpCQhrc/O9Unwrb7nSkNFrQljqw9zVybMIv5Kunp1Ijh+lf+Glh9vyYyB8NJL+9twscZBK8wDrJsmvZrElRrq/bO5fjrFJmRGz3qa1i7noO83P5uTV8Xd0RAUJmD6nzW/JX9GSQTvN+MtWrxrem2s+xHUEH0FDDsTF6WGQf37VKGVeV+KVNmdrLtD/jhKlzFVefQ9+BtVS3t3irdvTbDM78w3Jy6l3NRJHoTBMojyMmC2Hj7DvYPdyAPdsecpaIKn05gIUdnuPxd1w6x8cAn03p9OLtfopDxuOggapV3c8="
+                },
+                "fingerprint": "ed96ed10f2be3f86"
+              }
             }
           ],
           "usage": {
             "input_tokens": 153,
-            "output_tokens": 45,
-            "total_tokens": 343,
-            "reasoning_tokens": 145
+            "output_tokens": 192,
+            "total_tokens": 345,
+            "reasoning_tokens": 149,
+            "cost": {
+              "input": 0.0000459,
+              "output": 0.00048,
+              "cache_read": 0.0,
+              "cache_write": 0.0,
+              "total": 0.0005259
+            }
           },
-          "message_id": null,
-          "response_id": "id_REDACTED_1",
+          "origin": {
+            "api": "gemini.generate_content",
+            "provider": "gcp.gemini",
+            "model": "gemini-2.5-flash",
+            "response_model": "gemini-2.5-flash",
+            "response_id": "tQrBas2CLLqzmtkPif6TmAI"
+          },
           "finish_reason": "tool_calls",
-          "provider": "gcp.gemini",
-          "model": "gemini-2.5-flash",
           "raw": {
             "candidates": [
               {
@@ -126,12 +142,12 @@
                       "functionCall": {
                         "args": {
                           "category": "Technology",
-                          "summary": "A local meetup for Rustaceans in Seattle to discuss Rust programming, share projects, and network.",
+                          "summary": "A local meetup for Rust enthusiasts in Seattle to connect, share knowledge, and collaborate.",
                           "title": "Seattle Rust Meetup"
                         },
                         "name": "final_result"
                       },
-                      "thoughtSignature": "signature_REDACTED_1"
+                      "thoughtSignature": "CrcFAWkUfROJuqKlZ0qqUkMz4veWdFpD4bNAvd5u1eYb3/mBnCC9ZH6H+ziG1l8/VXZEMmzDXlJK6H08eiLyLu3LUjaGFC2Mcp8cBicbHcgewMtgSgw2rMBpkjnJ7bNO/b9h3KJupKrdbepTC7/GdhxIOyeu0fk98nqFMfXDlQzwtEO2gnGrLHHZVKJFL69Ga7jdg7uCZlGXKa8czLK30IOekEjUL8/z+CMCX8mqe+QHvmynDg26/GD8dUBuKkiUqk48i9Q6zdh8XCd8iGNwwVXzjZ12Cljt45ZYMXzKDpbgus+6t5xoXUuNDNvst/0ysd1NP54cdwTJiF5X0A2piZTgjY3PNqVIgZs34SpdSOOxcyRgcZi2YUe8WL9S6Lvlpw2LPmrVRiPPPm79ogCkFnu38Qwv1/5LSyj8AbGknP708Qv3oyPEbxn/HowERcMxW8e8vjwGp+CNEfzHb3ErnlAwaVluSZtV+NmoFIMRC1dghM/HnZ+gLf5HKn/lKH4tnzt2+r1jNNpah6BtAZ1Pk156N2vIDmq8EIKUuF0my05EA5KafJB8gvsYVBW46z/mjgEuVrg3d6hO2obuTsQlO2uSLBHQSEln5+8RajPQED5+Wc+9zYBsaaddCXpCQhrc/O9Unwrb7nSkNFrQljqw9zVybMIv5Kunp1Ijh+lf+Glh9vyYyB8NJL+9twscZBK8wDrJsmvZrElRrq/bO5fjrFJmRGz3qa1i7noO83P5uTV8Xd0RAUJmD6nzW/JX9GSQTvN+MtWrxrem2s+xHUEH0FDDsTF6WGQf37VKGVeV+KVNmdrLtD/jhKlzFVefQ9+BtVS3t3irdvTbDM78w3Jy6l3NRJHoTBMojyMmC2Hj7DvYPdyAPdsecpaIKn05gIUdnuPxd1w6x8cAn03p9OLtfopDxuOggapV3c8="
                     }
                   ],
                   "role": "model"
@@ -142,9 +158,9 @@
               }
             ],
             "modelVersion": "gemini-2.5-flash",
-            "responseId": "id_REDACTED_1",
+            "responseId": "tQrBas2CLLqzmtkPif6TmAI",
             "usageMetadata": {
-              "candidatesTokenCount": 45,
+              "candidatesTokenCount": 43,
               "promptTokenCount": 153,
               "promptTokensDetails": [
                 {
@@ -153,8 +169,8 @@
                 }
               ],
               "serviceTier": "standard",
-              "thoughtsTokenCount": 145,
-              "totalTokenCount": 343
+              "thoughtsTokenCount": 149,
+              "totalTokenCount": 345
             }
           }
         }

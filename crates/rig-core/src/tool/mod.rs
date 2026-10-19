@@ -1,33 +1,34 @@
-//! Tool contracts, the erased tool set, and canonical execution values.
+//! Tool authoring contracts, dispatch context, and canonical execution values.
+//! [`Tool`] is the tool trait; each call gets a [`ToolContext`].
 //!
-//! Two authoring surfaces share one execution path:
+//! ```
+//! use rig_core::tool::ToolOutput;
 //!
-//! * the context-free [`PortableTool`] boundary, adaptable by any runtime
-//!   without importing a registry, mutable context, lifecycle state, or
-//!   executor; and
-//! * the contextual [`Tool`] trait (every portable tool is one), whose
-//!   [`Tool::call`] also receives the dispatch's [`ToolContext`].
-//!
-//! Both erase into [`ErasedTool`], a tool-family handler a bus takes. The
-//! registry that collects tools by name, pins them per model turn and
-//! dispatches to them (`ToolSet`, `ToolCatalog`), retrieval, managed remote
-//! tool sources and the live registry handle live in `rig-agent`, layered
-//! over these types.
+//! let output = ToolOutput::json(serde_json::json!({"count": 3}));
+//! assert!(output.as_json().is_some());
+//! ```
 
 pub mod builtin;
 pub mod context;
 pub mod contextual;
+mod facts;
+pub mod feedback;
+mod footprint;
 pub mod managed;
 mod output;
-pub mod portable;
 mod result;
+pub mod schema;
+pub mod validate;
 pub use context::{
     ContextValue, PublishedContext, ToolContext, ToolContextError, ToolResultContext,
 };
-pub use contextual::{DynamicTool, ErasedTool, Tool, ToolEmbedding, tool_definition};
+pub use contextual::{DynamicTool, LivenessFn, Tool, ToolEmbedding, tool_definition, tool_name};
+pub use facts::{
+    ChangeKind, ContentHash, ExitStatus, FileChange, FileRead, FileState, FilesChanged, FilesRead,
+    Hunk, HunkLine, KeptEnd, Lines, LinesShown, OutputCut, content_hash,
+};
+pub use footprint::{Scope, Touches};
 pub use managed::{ManagedToolSink, ManagedToolToken};
 pub use output::{IntoToolOutput, ToolOutput};
-pub use portable::{
-    LivenessFn, PortableDynamicTool, PortableTool, PortableToolEmbedding, portable_tool_definition,
-};
 pub use result::{ToolErrorKind, ToolExecutionError, ToolResult};
+pub use schema::args_schema;

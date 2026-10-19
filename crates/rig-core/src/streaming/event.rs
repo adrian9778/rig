@@ -1,299 +1,338 @@
-//! The one stream vocabulary: what a provider adapter emits and what a
-//! consumer receives are the same [`StreamEvent`].
+//! The events of a completion stream. A completion decoder never builds one:
+//! it writes through the reply's part handles
+//! ([`Out`](crate::wire::Out)), and the writer emits each part's start, its
+//! fragments and its end, in that order. A [`Part`] is a part's position in
+//! the response's `choice`. A stream transform that splits or adds parts
+//! (reasoning a model wrote inside its text, tool calls written as text)
+//! numbers its own with [`Part::new`]. An item also reads back from its
+//! serialized form on its own, unchecked, so a client can decode a relayed
+//! stream as it arrives; [`StreamRecord::parse`] is the one place a sequence
+//! is checked.
 //!
-//! A stream is a sequence of **blocks** — text, reasoning, tool calls, and
-//! the assistant message itself — each identified by a [`BlockId`] for the
-//! life of the stream. Every block runs `BlockStart → BlockDelta* →
-//! BlockEnd`; a start is optional (a delta for an unseen id opens its block
-//! leniently) and an end may carry the wire's authoritative payload for the
-//! block (a restated reasoning block, a completed tool call's fields).
+//! ```
+//! use rig_core::streaming::{PartKind, StreamEvent, StreamRecord};
 //!
-//! The accumulator ([`BlockAccumulator`](super::BlockAccumulator)) folds the
-//! same events into the aggregated assistant choice, and fills
-//! [`BlockEnd::block`] on the events it yields to consumers with the block it
-//! just finalized — so a consumer that wants the completed tool call or
-//! reasoning item reads it off the end event, and one that only wants the
-//! deltas ignores it. Adapters always emit `block: None`.
-//!
-//! Everything here is data: serde, `Clone + Send + Sync + 'static`, no
-//! lifetimes, no `dyn`. The bus (phase C) sends these over a channel and the
-//! effect log records them; a host can persist an in-flight stream event.
+//! let transcript = StreamRecord::parse(serde_json::json!([
+//!     {"item": "event", "value": {"event": "start", "part": 0, "kind": "text"}},
+//!     {"item": "event", "value": {"event": "text", "part": 0, "text": "Hello"}},
+//!     {"item": "event", "value": {"event": "end", "part": 0,
+//!         "content": {"type": "text", "text": "Hello"}}},
+//! ]))?;
+//! assert!(matches!(
+//!     transcript.events().next(),
+//!     Some(StreamEvent::Start { kind: PartKind::Text, .. })
+//! ));
+//! # Ok::<(), rig_core::streaming::SequenceError>(())
+//! ```
 
 use serde::{Deserialize, Serialize};
 
-use crate::message::{AdditionalParams, AssistantContent, Reasoning};
+use crate::message::{AssistantContent, ToolName};
 
-use super::{BlockId, StreamFinal, UnknownPayload, UnparseableToolInput};
+use super::UnknownPayload;
 
-/// One event of a completion stream.
+/// A part's position in the response's `choice`. A transform that rewrites
+/// a stream numbers the parts it emits with [`Self::new`], and keeps the
+/// order [`StreamRecord::parse`] checks: each part starts, grows and ends, and
+/// parts are numbered in the order they start.
+///
+/// ```
+/// use rig_core::streaming::Part;
+///
+/// assert_eq!(Part::new(2).index(), 2);
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct Part(u32);
+
+impl Part {
+    /// The part at position `index` of the response's `choice`.
+    pub const fn new(index: u32) -> Self {
+        Self(index)
+    }
+
+    /// The part's position in the response's `choice`.
+    pub const fn index(self) -> usize {
+        self.0 as usize
+    }
+}
+
+/// What kind of part a [`StreamEvent::Start`] opened.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PartKind {
+    /// Answer text.
+    Text,
+    /// Reasoning.
+    Reasoning,
+    /// A tool call.
+    ToolCall,
+    /// An image.
+    Image,
+    /// A provider item with no canonical meaning.
+    Opaque,
+}
+
+/// One event of a completion stream: a part starts, grows, or ends with the
+/// content it finalized. Deserializing one event checks nothing about its
+/// order; read a sequence through [`StreamRecord::parse`] to check it.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "event", rename_all = "snake_case")]
 pub enum StreamEvent {
-    /// A block opened.
-    BlockStart {
-        /// The block's identity for the life of the stream.
-        id: BlockId,
-        /// What kind of block, with the metadata the wire announced at the
-        /// boundary.
-        kind: BlockKind,
+    /// A part opened. A tool call opens once its tool is named, so a call
+    /// streams its arguments under a known tool.
+    Start {
+        /// The part.
+        part: Part,
+        /// What it holds.
+        kind: PartKind,
+        /// The tool a [`PartKind::ToolCall`] names as it opens; `None` for
+        /// every other kind. The call's end states the name it settled on.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<ToolName>,
     },
-    /// A block grew.
-    BlockDelta {
-        /// The block this fragment extends.
-        id: BlockId,
+    /// A text part grew.
+    Text {
+        /// The part.
+        part: Part,
         /// The fragment.
-        delta: Delta,
-    },
-    /// A block closed.
-    BlockEnd {
-        /// The block that closed.
-        id: BlockId,
-        /// What the wire said at the boundary.
-        end: BlockClose,
-        /// The block as finalized by the accumulator, when the end
-        /// finalized one that consumers need whole (a completed tool call, a
-        /// completed reasoning item). `None` from an adapter; `None` from
-        /// the accumulator when the end finalized nothing (a dropped call, a
-        /// silent synthesized boundary) or when the block is text (its
-        /// deltas are the content).
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        block: Option<AssistantContent>,
-    },
-    /// The provider's normalized terminal record. At most one per stream,
-    /// last among the content events.
-    Final(StreamFinal),
-    /// A provider-native item rig does not model — e.g. an OpenAI Responses
-    /// hosted-tool result. Passed through verbatim; never folded into the
-    /// aggregated choice.
-    Unknown(UnknownPayload),
-}
-
-/// What kind of block a [`StreamEvent::BlockStart`] opened.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum BlockKind {
-    /// The assistant message itself: the wire announced its provider
-    /// message id (`id` is `BlockId::wire(message_id)`). Captured into
-    /// `StreamingCompletionResponse::message_id`; outranks the terminal
-    /// record's id.
-    Message,
-    /// A text block, with the provider metadata attached at its start.
-    Text {
-        /// Provider-specific metadata for the block.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        additional_params: Option<AdditionalParams>,
-    },
-    /// A reasoning block, with the provider-issued durable id when the wire
-    /// has one — the value that becomes [`Reasoning::id`] and round-trips
-    /// upstream. A minted block id never does.
-    Reasoning {
-        /// The provider-issued reasoning item id.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        provider_id: Option<String>,
-    },
-    /// A tool call under assembly.
-    ToolCall,
-}
-
-/// A fragment of a block.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "delta", rename_all = "snake_case")]
-pub enum Delta {
-    /// Text.
-    Text {
-        /// The text fragment.
         text: String,
     },
-    /// Provider metadata merged into the text block.
-    TextMeta {
-        /// The metadata.
-        additional_params: AdditionalParams,
-    },
-    /// Reasoning text.
+    /// A reasoning part grew.
     Reasoning {
-        /// The reasoning fragment.
+        /// The part.
+        part: Part,
+        /// The fragment.
         text: String,
     },
-    /// The tool name (OpenAI-compatible wires stream it as a fragment; the
-    /// last non-empty value is the established name).
-    ToolName {
-        /// The name fragment.
-        name: String,
+    /// A tool call's arguments grew. The fragments of one call, joined,
+    /// are the argument JSON the provider sent; read an incomplete prefix
+    /// with [`parse_partial_arguments`](super::parse_partial_arguments).
+    Arguments {
+        /// The part.
+        part: Part,
+        /// The fragment of raw argument JSON.
+        json: String,
     },
-    /// A raw JSON argument fragment.
-    ToolArguments {
-        /// The fragment; concatenated in arrival order.
-        arguments: String,
+    /// A part ended with the content it finalized.
+    End {
+        /// The part.
+        part: Part,
+        /// The finalized content.
+        content: AssistantContent,
     },
-}
-
-/// What the wire said when a block closed.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "close", rename_all = "snake_case")]
-pub enum BlockClose {
-    /// A text block closed; later text under a fresh id opens a new block.
-    Text,
-    /// A reasoning block closed.
-    Reasoning {
-        /// The wire's authoritative whole-block restatement, when it sent
-        /// one; it supersedes the delta accumulation.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        reasoning: Option<Reasoning>,
-        /// A provider signature closing the block; attaches to the block's
-        /// text.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        signature: Option<String>,
-        /// Whether the wire itself sent this end (anthropic's
-        /// `content_block_stop`), as opposed to the adapter synthesizing it
-        /// at a boundary the wire never announces. Wire-sent ends yield the
-        /// completed block even when bare; a synthesized bare end stays
-        /// silent (`block: None`).
-        wire_sent: bool,
-    },
-    /// A tool call's input ended: the accumulator finalizes the assembled
-    /// fragments, or the end's authoritative payload, into a completed
-    /// call.
-    ToolCall(ToolCallEnd),
-}
-
-/// The end of a streamed tool call's input.
-///
-/// Optional fields are authoritative wire values that supersede the
-/// assembled state — a wire whose completed item restates the call (OpenAI
-/// Responses `output_item.done`, a whole-call wire) carries them; delta-only
-/// wires leave them `None` and the assembled fragments are parsed instead.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct ToolCallEnd {
-    /// An already assigned local correlation handle, when re-emitting a
-    /// completed response. This does not supply provider provenance; provider
-    /// handles remain in `tool_id` and `call_id`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub durable_id: Option<crate::message::ToolCallId>,
-    /// Authoritative provider-issued tool id, when one exists (e.g. an id
-    /// that arrived after the call opened id-less). The durable handle;
-    /// absence is `None`, never an empty string (see
-    /// [`non_empty_id`](super::non_empty_id)).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tool_id: Option<String>,
-    /// Authoritative tool name from the wire's completed item.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub name: Option<String>,
-    /// Authoritative parsed arguments from the wire's completed item.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub arguments: Option<serde_json::Value>,
-    /// Provider call-correlation id (e.g. OpenAI Responses `call_id`).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub call_id: Option<String>,
-    /// Provider signature attached to the completed call.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub signature: Option<String>,
-    /// Provider-specific metadata attached to the completed call.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub additional_params: Option<serde_json::Value>,
-    /// Wire-family policy for assembled arguments that fail to parse.
-    pub on_unparseable: UnparseableToolInput,
-}
-
-impl ToolCallEnd {
-    /// End a call, finalizing from assembled fragments with the given
-    /// unparseable-input policy.
-    pub fn new(on_unparseable: UnparseableToolInput) -> Self {
-        Self {
-            durable_id: None,
-            tool_id: None,
-            name: None,
-            arguments: None,
-            call_id: None,
-            signature: None,
-            additional_params: None,
-            on_unparseable,
-        }
-    }
-
-    /// A whole call delivered at once: name and arguments are authoritative
-    /// and malformed input is a response defect.
-    pub fn whole(name: impl Into<String>, arguments: serde_json::Value) -> Self {
-        Self {
-            name: Some(name.into()),
-            arguments: Some(arguments),
-            ..Self::new(UnparseableToolInput::Error)
-        }
-    }
-
-    /// Preserve an existing local correlation handle through stream folding.
-    pub fn with_durable_id(mut self, id: crate::message::ToolCallId) -> Self {
-        self.durable_id = Some(id);
-        self
-    }
-
-    /// Attach the authoritative provider tool id (empty means absent).
-    pub fn with_tool_id(mut self, tool_id: impl Into<String>) -> Self {
-        self.tool_id = super::non_empty_id(tool_id);
-        self
-    }
-
-    /// Attach the provider call-correlation id.
-    pub fn with_call_id(mut self, call_id: impl Into<String>) -> Self {
-        self.call_id = Some(call_id.into());
-        self
-    }
-
-    /// Attach or clear a provider signature.
-    pub fn with_signature(mut self, signature: Option<String>) -> Self {
-        self.signature = signature;
-        self
-    }
-
-    /// Attach provider-specific metadata.
-    pub fn with_additional_params(mut self, additional_params: Option<serde_json::Value>) -> Self {
-        self.additional_params = additional_params;
-        self
-    }
 }
 
 impl StreamEvent {
-    /// A text fragment for block `id`.
-    pub fn text(id: BlockId, text: impl Into<String>) -> Self {
-        Self::BlockDelta {
-            id,
-            delta: Delta::Text { text: text.into() },
-        }
-    }
-
-    /// The block this event is about, if it is a block event.
-    pub fn block_id(&self) -> Option<&BlockId> {
+    /// The part this event is about.
+    pub const fn part(&self) -> Part {
         match self {
-            Self::BlockStart { id, .. }
-            | Self::BlockDelta { id, .. }
-            | Self::BlockEnd { id, .. } => Some(id),
-            Self::Final(_) | Self::Unknown(_) => None,
+            Self::Start { part, .. }
+            | Self::Text { part, .. }
+            | Self::Reasoning { part, .. }
+            | Self::Arguments { part, .. }
+            | Self::End { part, .. } => *part,
         }
     }
 
-    /// Stable variant name for logs and law-violation messages — never the
-    /// payload (events carry wire content that must not reach logs).
+    /// A stable variant name that exposes no payload to logs.
     pub const fn name(&self) -> &'static str {
         match self {
-            Self::BlockStart { .. } => "BlockStart",
-            Self::BlockDelta { .. } => "BlockDelta",
-            Self::BlockEnd { .. } => "BlockEnd",
-            Self::Final(_) => "Final",
-            Self::Unknown(_) => "Unknown",
+            Self::Start { .. } => "Start",
+            Self::Text { .. } => "Text",
+            Self::Reasoning { .. } => "Reasoning",
+            Self::Arguments { .. } => "Arguments",
+            Self::End { .. } => "End",
         }
     }
 }
 
-// The stream vocabulary crosses threads and serializes on every target: the
-// bus sends it over a channel and the effect log records it.
+/// One item of a stream: an event of the operation, or a payload the
+/// provider sent that the decoder does not model. An unmodeled payload
+/// always reaches the consumer.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "item", content = "value", rename_all = "snake_case")]
+pub enum Item<E> {
+    /// An event of the operation.
+    Event(E),
+    /// A payload the decoder does not model.
+    Unknown(UnknownPayload),
+}
+
+/// A completion stream's items read back from their serialized form, in an
+/// order the writer could have produced: each part starts once, at a
+/// position no part took before, grows only while open and with its own
+/// kind of fragment, and ends once. Positions follow the order provider
+/// items opened, so a dropped item leaves a gap. Unmodeled payloads may come
+/// anywhere.
+#[derive(Debug, Clone, Default)]
+pub struct StreamRecord {
+    items: Vec<Item<StreamEvent>>,
+    /// Each started part's kind, and whether it ended.
+    parts: std::collections::BTreeMap<usize, (PartKind, bool)>,
+}
+
+impl PartialEq for StreamRecord {
+    fn eq(&self, other: &Self) -> bool {
+        self.items == other.items
+    }
+}
+
+impl Serialize for StreamRecord {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.items.serialize(serializer)
+    }
+}
+
+/// Why a serialized event sequence is not one the writer could produce.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum SequenceError {
+    /// The value is not a list of stream items.
+    #[error("not a list of stream items: {0}")]
+    Shape(String),
+    /// An event names a part that has not started, or a start reuses a
+    /// position.
+    #[error("item {0} names a part that has not started")]
+    UnknownPart(usize),
+    /// A part ended twice, or grew after its end.
+    #[error("item {0} touches a part that already ended")]
+    EndedTwice(usize),
+    /// A fragment or end does not match the part's kind, or a start names a
+    /// tool for a part that is not a call, or none for one that is.
+    #[error("item {0} does not match its part's kind")]
+    WrongKind(usize),
+    /// A part started and never ended.
+    #[error("part {0} never ended")]
+    Unclosed(usize),
+}
+
+impl StreamRecord {
+    /// Read a serialized item sequence, refusing one the writer could not
+    /// have produced. Every part must have ended.
+    pub fn parse(value: serde_json::Value) -> Result<Self, SequenceError> {
+        let transcript = Self::parse_prefix(value)?;
+        transcript.check_closed()?;
+        Ok(transcript)
+    }
+
+    /// [`Self::parse`] for a stream that stopped early (an error or a
+    /// cancellation): parts may still be open at its end.
+    pub fn parse_prefix(value: serde_json::Value) -> Result<Self, SequenceError> {
+        let items: Vec<Item<StreamEvent>> = serde_json::from_value(value)
+            .map_err(|error| SequenceError::Shape(error.to_string()))?;
+        Self::from_items(items)
+    }
+
+    /// Append the next item a stream yielded, refusing one the writer could
+    /// not have produced after the items so far.
+    pub fn push(&mut self, item: Item<StreamEvent>) -> Result<(), SequenceError> {
+        let position = self.items.len();
+        if let Item::Event(event) = &item {
+            let index = event.part().index();
+            let kind = match event {
+                StreamEvent::Start { kind, name, .. } => {
+                    if (*kind == PartKind::ToolCall) != name.is_some() {
+                        return Err(SequenceError::WrongKind(position));
+                    }
+                    if self.parts.insert(index, (*kind, false)).is_some() {
+                        return Err(SequenceError::UnknownPart(position));
+                    }
+                    None
+                }
+                StreamEvent::Text { .. } => Some(PartKind::Text),
+                StreamEvent::Reasoning { .. } => Some(PartKind::Reasoning),
+                StreamEvent::Arguments { .. } => Some(PartKind::ToolCall),
+                StreamEvent::End { content, .. } => Some(match content {
+                    AssistantContent::Text(_) => PartKind::Text,
+                    AssistantContent::Reasoning(_) => PartKind::Reasoning,
+                    AssistantContent::ToolCall(_) => PartKind::ToolCall,
+                    AssistantContent::Image(_) => PartKind::Image,
+                    AssistantContent::Opaque(_) => PartKind::Opaque,
+                }),
+            };
+            if let Some(kind) = kind {
+                match self.parts.get_mut(&index) {
+                    None => return Err(SequenceError::UnknownPart(position)),
+                    Some((_, true)) => return Err(SequenceError::EndedTwice(position)),
+                    Some((open, false)) if *open != kind => {
+                        return Err(SequenceError::WrongKind(position));
+                    }
+                    Some((_, ended)) => *ended = matches!(event, StreamEvent::End { .. }),
+                }
+            }
+        }
+        self.items.push(item);
+        Ok(())
+    }
+
+    fn check_closed(&self) -> Result<(), SequenceError> {
+        match self.parts.iter().find(|(_, (_, ended))| !ended) {
+            Some((part, _)) => Err(SequenceError::Unclosed(*part)),
+            None => Ok(()),
+        }
+    }
+
+    /// Items a stream yielded, checked as [`Self::push`] checks them: a
+    /// stream that stopped early may leave parts open.
+    pub fn from_items(items: Vec<Item<StreamEvent>>) -> Result<Self, SequenceError> {
+        let mut transcript = Self::default();
+        for item in items {
+            transcript.push(item)?;
+        }
+        Ok(transcript)
+    }
+
+    /// The number of items.
+    pub fn len(&self) -> usize {
+        self.items.len()
+    }
+
+    /// Whether there are no items.
+    pub fn is_empty(&self) -> bool {
+        self.items.is_empty()
+    }
+
+    /// The items, in order.
+    pub fn items(&self) -> &[Item<StreamEvent>] {
+        &self.items
+    }
+
+    /// The items, in order.
+    pub fn into_items(self) -> Vec<Item<StreamEvent>> {
+        self.items
+    }
+
+    /// The events, in order, without the unmodeled payloads.
+    pub fn events(&self) -> impl Iterator<Item = &StreamEvent> {
+        self.items.iter().filter_map(|item| match item {
+            Item::Event(event) => Some(event),
+            Item::Unknown(_) => None,
+        })
+    }
+}
+
+impl From<StreamRecord> for Vec<Item<StreamEvent>> {
+    fn from(transcript: StreamRecord) -> Self {
+        transcript.items
+    }
+}
+
+/// Read as the item list it is, with no `Value` tree between.
+impl<'de> Deserialize<'de> for StreamRecord {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let items = Vec::<Item<StreamEvent>>::deserialize(deserializer)
+            .map_err(|error| serde::de::Error::custom(SequenceError::Shape(error.to_string())))?;
+        Self::from_items(items).map_err(serde::de::Error::custom)
+    }
+}
+
+// The stream vocabulary crosses threads on every target: a handler sends it
+// over a channel, the effect log records it, and a client reads it back.
 const _: fn() = || {
     fn assert_wire<T: Clone + Send + Sync + 'static + Serialize + serde::de::DeserializeOwned>() {}
     assert_wire::<StreamEvent>();
-    assert_wire::<BlockKind>();
-    assert_wire::<Delta>();
-    assert_wire::<BlockClose>();
-    assert_wire::<ToolCallEnd>();
-    assert_wire::<StreamFinal>();
-    assert_wire::<UnknownPayload>();
+    assert_wire::<StreamRecord>();
+    assert_wire::<Item<StreamEvent>>();
 };
 
 #[cfg(test)]

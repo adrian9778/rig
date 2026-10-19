@@ -1,8 +1,31 @@
 //! Rig repository paths for the reusable cassette engine.
-#![allow(dead_code, unused_imports)]
 
 pub use rig_cassette::http::*;
 use std::path::PathBuf;
+
+/// The HTTP client every cassette test sends through, one per process. A
+/// replay or a recording talks only to the local cassette server, so the
+/// client skips the system proxy lookup: on macOS that lookup reads every
+/// file beside the test binary, which costs seconds in each test process
+/// once `target/debug/deps` grows large.
+pub fn local_http() -> rig_core::http_client::DynHttpClient {
+    rig_core::http_client::DynHttpClient::new(local_reqwest())
+}
+
+/// [`local_http`] before it is erased.
+pub fn local_reqwest() -> rig_reqwest::ReqwestClient {
+    static CLIENT: std::sync::LazyLock<rig_reqwest::ReqwestClient> =
+        std::sync::LazyLock::new(|| {
+            rig_reqwest::reqwest::Client::builder()
+                .no_proxy()
+                .build()
+                .map_or_else(
+                    |_| rig_reqwest::ReqwestClient::default(),
+                    rig_reqwest::ReqwestClient::from,
+                )
+        });
+    CLIENT.clone()
+}
 
 /// Locate this workspace's provider cassette directory from the crate manifest.
 pub fn cassette_root() -> PathBuf {
@@ -80,6 +103,11 @@ pub fn recorded_json_turn(
     rig_cassette::http::recorded_json_turn(&cassette_root(), provider, scenario)
 }
 
+/// Read each recorded request's query parameters in wire order.
+pub fn recorded_request_query_pairs(provider: &str, scenario: &str) -> Vec<Vec<(String, String)>> {
+    rig_cassette::http::recorded_request_query_pairs(&cassette_root(), provider, scenario)
+}
+
 /// Read recorded request paths in wire order.
 pub fn recorded_request_paths(provider: &str, scenario: &str) -> Vec<String> {
     rig_cassette::http::recorded_request_paths(&cassette_root(), provider, scenario)
@@ -95,13 +123,19 @@ pub fn recorded_sse_json_frames(provider: &str, scenario: &str) -> Vec<serde_jso
     rig_cassette::http::recorded_sse_json_frames(&cassette_root(), provider, scenario)
 }
 
-/// Save completed checkpoint-matrix exchanges before a failing body unwinds.
+/// Save completed matrix exchanges before a failing body unwinds.
 /// This is attempt evidence, never a replacement for cassette finalization.
 pub async fn checkpoint_attempt(cassette: &ProviderCassette, provider: &str, scenario: &str) {
-    if !scenario.starts_with("checkpoint_matrix") && !scenario.starts_with("long_loop_matrix") {
+    if !scenario.starts_with("checkpoint_matrix")
+        && !scenario.starts_with("long_loop_matrix")
+        && !scenario.starts_with("long_task_matrix")
+        && !scenario.starts_with("history_survival_matrix")
+        && !scenario.starts_with("portability_matrix")
+    {
         return;
     }
-    let Some(directory) = std::env::var_os("RIG_CHECKPOINT_ATTEMPT_DIR")
+    let Some(directory) = std::env::var_os("RIG_LONG_TASK_ATTEMPT_DIR")
+        .or_else(|| std::env::var_os("RIG_CHECKPOINT_ATTEMPT_DIR"))
         .or_else(|| std::env::var_os("RIG_LONG_LOOP_ATTEMPT_DIR"))
     else {
         return;
@@ -114,4 +148,36 @@ pub async fn checkpoint_attempt(cassette: &ProviderCassette, provider: &str, sce
         "CHECKPOINT_ATTEMPT cassette={} completed_exchanges_saved={written}",
         path.display()
     );
+}
+
+/// Finish `cassette` after a test body's `result`, checking what it recorded
+/// first. `check` reads the session's exchanges under the cassette root and
+/// for the scenario it is given: the recording so far, checkpointed under the attempt root, when
+/// recording, and the committed fixture on replay. A check that fails while
+/// recording leaves the committed fixture as it was and keeps the attempt
+/// aside, as a failing body does.
+pub async fn finish_checked(
+    cassette: ProviderCassette,
+    provider: &str,
+    scenario: &str,
+    result: Result<(), Box<dyn std::any::Any + Send + 'static>>,
+    check: impl FnOnce(&std::path::Path, &str),
+) {
+    let result = match result {
+        Ok(()) => {
+            let root = if CassetteMode::current() == CassetteMode::Record {
+                let root = attempt_root()
+                    .join("checked")
+                    .join(std::process::id().to_string());
+                let path = rig_cassette::http::cassette_path(&root, provider, scenario);
+                cassette.checkpoint_recording(&path).await;
+                root
+            } else {
+                cassette_root()
+            };
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| check(&root, scenario)))
+        }
+        failed => failed,
+    };
+    cassette.finish_after_test(result).await;
 }

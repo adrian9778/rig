@@ -1,33 +1,86 @@
-//! The verification operation: a request whose only answer is its status.
+//! Status-based credential verification.
+//!
+//! ```
+//! use rig_core::operation::{Verify, VerifyDecoder};
+//! use rig_core::wire::Decoder;
+//!
+//! fn decodes<'id, D: Decoder<'id, Verify>>(_: D) {}
+//! decodes(VerifyDecoder);
+//! ```
 
-use super::{One, Take};
-use crate::client::VerifyError;
-use crate::wire::Operation;
+use super::Whole;
+use crate::driver::{Model, Transport};
+use crate::error::ProviderError;
+use crate::wire::{Call, Decoder, Flow, Free, Operation, Out, Wire, WireEvent, WireFrame};
 
-/// Checking that a provider accepts the configured credentials.
-///
-/// The reply body is not read for meaning: a success status is the answer,
-/// and the rejection classification (401/403 as invalid authentication)
-/// lives in [`VerifyError`]'s [`WireError`](crate::wire::WireError) impl, so
-/// no wire restates it.
+/// Checks credentials using response status. HTTP 401/403 indicate invalid
+/// authentication; status-only decoders do not interpret the response body.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Verify;
 
 impl Operation for Verify {
     type Request = ();
-    type Event = ();
+    type Event = std::convert::Infallible;
+    type End = ();
     type Response = ();
-    type Error = VerifyError;
-    type Capabilities = ();
-    type Output = One<Self>;
-    type Fold = Take<Self>;
-    type Telemetry = ();
+    type Fold = Whole<Self>;
+    type Emit = Free;
 
-    const NAME: &'static str = "verify";
+    fn fold(_request: &Self::Request, _call: &mut Call<'_>) -> Self::Fold {
+        Whole::new()
+    }
+}
 
-    fn is_terminal(_event: &Self::Event) -> bool {
-        true
+/// Accepts any body, including an empty one, after driver status validation.
+/// Endpoints requiring body validation must use another decoder.
+#[derive(Debug, Default)]
+pub struct VerifyDecoder;
+
+impl<'id> Decoder<'id, Verify> for VerifyDecoder {
+    type Event = ();
+
+    fn classify(&self, _frame: WireFrame) -> WireEvent<Self::Event> {
+        WireEvent::Known(())
     }
 
-    fn telemetry(_streaming: bool) -> Self::Telemetry {}
+    fn decode(&mut self, _event: (), out: Out<'id, Verify>) -> Result<Flow, ProviderError> {
+        Ok(out.end(()))
+    }
+
+    /// A 2xx with an empty body still verifies: the driver only reaches EOF
+    /// when nothing framed, and the status already said yes.
+    fn eof(&mut self, out: Out<'id, Verify>) -> Result<Flow, ProviderError> {
+        Ok(out.end(()))
+    }
 }
+
+impl<W, T> Model<W, T>
+where
+    W: Wire<Op = Verify>,
+    T: Transport<W>,
+{
+    /// Check that the provider accepts the configured credentials. A 401 or
+    /// 403 reply is [`ProviderError::InvalidAuthentication`].
+    pub async fn verify(&self) -> Result<(), ProviderError> {
+        self.call(()).await.map_err(authentication)
+    }
+}
+
+/// Reclassifies a 401 or 403 reply as [`ProviderError::InvalidAuthentication`],
+/// keeping the reply. Other failures are unchanged.
+fn authentication(error: ProviderError) -> ProviderError {
+    match error {
+        ProviderError::ProviderResponse(response)
+            if matches!(
+                response.status,
+                Some(http::StatusCode::UNAUTHORIZED | http::StatusCode::FORBIDDEN)
+            ) =>
+        {
+            ProviderError::InvalidAuthentication(response)
+        }
+        other => other,
+    }
+}
+
+#[cfg(test)]
+mod tests;

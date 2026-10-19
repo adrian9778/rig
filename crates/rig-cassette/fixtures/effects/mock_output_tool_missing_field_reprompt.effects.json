@@ -1,6 +1,6 @@
 {
   "header": {
-    "run_spec": 17063702180001451641,
+    "run_spec": 17304775086552656482,
     "handlers": [
       {
         "key": "golden/model:default",
@@ -19,11 +19,6 @@
     "hooks": [],
     "required": {
       "golden/model:default": "completion"
-    },
-    "bus": {
-      "command_capacity": 16,
-      "stream_capacity": 64,
-      "serial_per_handler": false
     }
   },
   "records": [
@@ -91,11 +86,7 @@
             {
               "type": "toolcall",
               "id": {
-                "origin": "explicit",
-                "id": "call-1"
-              },
-              "provider": {
-                "call_id": "call-1"
+                "provider": "call-1"
               },
               "function": {
                 "name": "final_result",
@@ -103,17 +94,37 @@
                   "title": "Seattle Rust Meetup",
                   "category": "Technology"
                 }
-              },
-              "signature": null,
-              "additional_params": null
+              }
             }
           ],
           "usage": {},
-          "message_id": null,
-          "response_id": null,
+          "origin": {
+            "api": "mock.script",
+            "provider": "mock",
+            "model": "mock-model"
+          },
           "finish_reason": null,
-          "provider": "mock",
-          "model": null
+          "raw": {
+            "choice": [
+              {
+                "type": "toolcall",
+                "id": {
+                  "provider": "call-1"
+                },
+                "function": {
+                  "name": "final_result",
+                  "arguments": {
+                    "title": "Seattle Rust Meetup",
+                    "category": "Technology"
+                  }
+                }
+              }
+            ],
+            "usage": {},
+            "response_id": null,
+            "provider_request_id": null,
+            "finish_reason": null
+          }
         }
       }
     },
@@ -141,16 +152,11 @@
             },
             {
               "role": "assistant",
-              "id": null,
               "content": [
                 {
                   "type": "toolcall",
                   "id": {
-                    "origin": "explicit",
-                    "id": "call-1"
-                  },
-                  "provider": {
-                    "call_id": "call-1"
+                    "provider": "call-1"
                   },
                   "function": {
                     "name": "final_result",
@@ -158,11 +164,15 @@
                       "title": "Seattle Rust Meetup",
                       "category": "Technology"
                     }
-                  },
-                  "signature": null,
-                  "additional_params": null
+                  }
                 }
-              ]
+              ],
+              "origin": {
+                "api": "mock.script",
+                "provider": "mock",
+                "model": "mock-model"
+              },
+              "stop": "tool_use"
             },
             {
               "role": "user",
@@ -170,11 +180,7 @@
                 {
                   "type": "toolresult",
                   "call": {
-                    "origin": "explicit",
-                    "id": "call-1"
-                  },
-                  "provider": {
-                    "call_id": "call-1"
+                    "provider": "call-1"
                   },
                   "name": "final_result",
                   "content": [
@@ -182,7 +188,8 @@
                       "type": "text",
                       "text": "The `final_result` arguments were missing required field(s): summary. Call `final_result` again with every required field."
                     }
-                  ]
+                  ],
+                  "is_error": true
                 }
               ]
             }
@@ -228,11 +235,7 @@
             {
               "type": "toolcall",
               "id": {
-                "origin": "explicit",
-                "id": "call-2"
-              },
-              "provider": {
-                "call_id": "call-2"
+                "provider": "call-2"
               },
               "function": {
                 "name": "final_result",
@@ -241,17 +244,38 @@
                   "category": "Technology",
                   "summary": "A meetup."
                 }
-              },
-              "signature": null,
-              "additional_params": null
+              }
             }
           ],
           "usage": {},
-          "message_id": null,
-          "response_id": null,
+          "origin": {
+            "api": "mock.script",
+            "provider": "mock",
+            "model": "mock-model"
+          },
           "finish_reason": null,
-          "provider": "mock",
-          "model": null
+          "raw": {
+            "choice": [
+              {
+                "type": "toolcall",
+                "id": {
+                  "provider": "call-2"
+                },
+                "function": {
+                  "name": "final_result",
+                  "arguments": {
+                    "title": "Seattle Rust Meetup",
+                    "category": "Technology",
+                    "summary": "A meetup."
+                  }
+                }
+              }
+            ],
+            "usage": {},
+            "response_id": null,
+            "provider_request_id": null,
+            "finish_reason": null
+          }
         }
       }
     }

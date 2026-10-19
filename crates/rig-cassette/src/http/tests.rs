@@ -7,7 +7,7 @@ use super::*;
 /// Anthropic's `content_block_start.signature`, empty on the wire).
 #[test]
 fn scrubbing_an_empty_value_invents_nothing() {
-    let mut scrubber = CassetteScrubber::new(CassettePolicy::default());
+    let mut scrubber = CassetteScrubber::default();
     assert_eq!(scrubber.placeholder("", "signature_"), "");
     // A real value still redacts, and stays stable across occurrences.
     let first = scrubber.placeholder("sig-abc", "signature_");
@@ -18,6 +18,17 @@ fn scrubbing_an_empty_value_invents_nothing() {
         first.ends_with('1'),
         "the first real value should take placeholder 1, got {first}"
     );
+}
+
+/// The marker exists so a bulk re-record sweep abandons the tests whose
+/// fixture was hand-built, instead of overwriting it. Replay, where those
+/// fixtures are the point, must be unaffected.
+#[test]
+fn the_recording_marker_stops_only_a_recording_run() {
+    assert!(skips_recording(CassetteMode::Record, "hand-derived"));
+    assert!(!skips_recording(CassetteMode::Replay, "hand-derived"));
+    // The ambient mode of the test process is replay, so a marked test runs.
+    assert!(!skip_when_recording("hand-derived"));
 }
 
 fn query_pair(name: &str, value: &str) -> NameValue {
@@ -95,40 +106,14 @@ fn query_matches_empty_expected_only_matches_empty_actual_query() {
 
 #[test]
 fn bodyless_cassette_request_only_matches_empty_actual_body() {
-    let policy = CassettePolicy::default();
     let headers = axum::http::HeaderMap::new();
 
-    assert!(body_matches(
-        policy,
-        &headers,
-        &[],
-        &[],
-        None,
-        BodyEncoding::Utf8
-    ));
+    assert!(body_matches(&headers, &[], &[], None, BodyEncoding::Utf8));
     assert!(!body_matches(
-        policy,
         &headers,
         &[],
         br#"{"unexpected":true}"#,
         None,
-        BodyEncoding::Utf8
-    ));
-}
-
-#[test]
-fn body_matching_scrubs_generated_document_names() {
-    let policy = CassettePolicy::default();
-    let headers = axum::http::HeaderMap::new();
-    let expected = r#"{"document":{"name":"document-REDACTED_1"}}"#;
-    let actual = br#"{"document":{"name":"document-d472a47d2451423eac893453a8c2fed9"}}"#;
-
-    assert!(body_matches(
-        policy,
-        &headers,
-        &[],
-        actual,
-        Some(expected),
         BodyEncoding::Utf8
     ));
 }
@@ -151,7 +136,7 @@ fn replay_matching_is_ordered_by_default() {
     ];
 
     assert_eq!(
-        matching_interaction_index(policy, &interactions, &request),
+        matching_interaction_index(policy, &interactions, &request, None, |_| 0),
         None
     );
 }
@@ -177,19 +162,66 @@ fn replay_matching_can_be_explicitly_unordered() {
     ];
 
     assert_eq!(
-        matching_interaction_index(policy, &interactions, &request),
+        matching_interaction_index(policy, &interactions, &request, None, |_| 0),
         Some(1)
+    );
+}
+
+#[test]
+fn unordered_shape_matching_serves_the_closest_interaction() {
+    let policy = CassettePolicy {
+        replay_matching: ReplayMatching::Unordered,
+        body_matching: BodyMatching::Shape,
+        ..CassettePolicy::default()
+    };
+    let recorded = |input: &str| CassetteRequest {
+        body: Some(json!({ "input": input }).to_string()),
+        ..cassette_request("/v1/answer")
+    };
+    let interactions = vec![
+        ReplayInteraction {
+            when: recorded("first"),
+            then: cassette_response(),
+            consumed: false,
+        },
+        ReplayInteraction {
+            when: recorded("second"),
+            then: cassette_response(),
+            consumed: false,
+        },
+    ];
+    let keys: Vec<Value> = interactions
+        .iter()
+        .map(|interaction| shape::shape_key(&recorded_body_view(&interaction.when)))
+        .collect();
+    let request = incoming_request("/v1/answer", json!({ "input": "second" }).to_string());
+    let sent = shape::shape_key(&incoming_body_view(&request));
+    let shapes = Some(ShapeKeys {
+        recorded: &keys,
+        sent: &sent,
+    });
+    let distance = |index: usize| {
+        let recorded = recorded_body_view(&interactions[index].when);
+        snapshot::diff(&recorded, &incoming_body_view(&request)).len()
+    };
+
+    assert_eq!(
+        matching_interaction_index(policy, &interactions, &request, shapes, distance),
+        Some(1),
+        "the interaction the request equals wins"
+    );
+    assert_eq!(
+        matching_interaction_index(policy, &interactions, &request, shapes, |_| 3),
+        Some(0),
+        "on a tie the first of the same shape serves"
     );
 }
 
 #[test]
 fn replay_matching_requires_bearer_provider_auth_without_recording_its_value() {
     for provider in ["openai", "doubleword"] {
-        let policy = CassettePolicy::for_scenario(
-            provider,
-            "agent/completion_smoke",
-            ReplayMatching::Ordered,
-        );
+        let policy =
+            CassettePolicy::for_scenario(provider, CassetteSpec::new("agent/completion_smoke"));
         let interaction = ReplayInteraction {
             when: cassette_request("/v1/responses"),
             then: cassette_response(),
@@ -204,7 +236,7 @@ fn replay_matching_requires_bearer_provider_auth_without_recording_its_value() {
         );
 
         assert_eq!(
-            matching_interaction_index(policy, &interactions, &request_without_auth),
+            matching_interaction_index(policy, &interactions, &request_without_auth, None, |_| 0),
             None,
             "{provider} replay should require bearer authentication"
         );
@@ -213,7 +245,7 @@ fn replay_matching_requires_bearer_provider_auth_without_recording_its_value() {
             vec!["authorization"]
         );
         assert_eq!(
-            matching_interaction_index(policy, &interactions, &request_with_auth),
+            matching_interaction_index(policy, &interactions, &request_with_auth, None, |_| 0),
             Some(0)
         );
     }
@@ -221,11 +253,8 @@ fn replay_matching_requires_bearer_provider_auth_without_recording_its_value() {
 
 #[test]
 fn gemini_interactions_policy_requires_api_key_header() {
-    let policy = CassettePolicy::for_scenario(
-        "gemini",
-        "interactions_api/tool_result",
-        ReplayMatching::Ordered,
-    );
+    let policy =
+        CassettePolicy::for_scenario("gemini", CassetteSpec::new("interactions_api/tool_result"));
     let mut request = incoming_request("/v1beta/models", Bytes::new());
 
     assert_eq!(
@@ -242,12 +271,16 @@ fn gemini_interactions_policy_requires_api_key_header() {
 
 #[tokio::test]
 async fn direct_recorder_omits_sigv4_headers() {
-    let policy =
-        CassettePolicy::for_scenario("bedrock", "agent/completion_smoke", ReplayMatching::Ordered);
     let interactions = Arc::new(Mutex::new(Vec::new()));
+    let ledger_dir = assert_fs::TempDir::new().expect("ledger directory");
     let recorder = DirectRecorder {
         interactions: interactions.clone(),
-        policy,
+        ledger: Arc::new(relay::LedgerTarget {
+            path: ledger_dir.path().join("ledger.jsonl"),
+            provider: "bedrock".to_owned(),
+            scenario: "agent/completion_smoke".to_owned(),
+            origin: "https://bedrock-runtime.us-east-1.amazonaws.com".to_owned(),
+        }),
     };
 
     recorder
@@ -281,9 +314,9 @@ async fn direct_recorder_omits_sigv4_headers() {
     assert_eq!(interaction.when.header.len(), 1);
     assert_eq!(interaction.when.header[0].name, "content-type");
 
-    // The response keeps `x-amzn-requestid` — the SDK reads the AWS
-    // request id off that header and nowhere else — with its value
-    // placeholdered, and still drops everything outside the allowlist.
+    // The response keeps `x-amzn-requestid` verbatim (the SDK reads the AWS
+    // request id off that header and nowhere else) and still drops
+    // everything outside the allowlist.
     let response_headers = interaction
         .then
         .header
@@ -294,7 +327,7 @@ async fn direct_recorder_omits_sigv4_headers() {
         response_headers,
         vec![
             ("content-type", "application/json"),
-            ("x-amzn-requestid", "req_REDACTED_1"),
+            ("x-amzn-requestid", "request-id"),
         ]
     );
 }
@@ -312,24 +345,21 @@ fn replay_miss_diagnostics_scrub_actual_request_details() {
         consumed: false,
     }];
 
-    let message = replay_miss_message(policy, &request, &interactions);
+    let message = replay_miss_message(policy, &request, &interactions, None, None);
 
     assert!(!message.contains("AIzaSyExampleSecretToken123456"));
     assert!(!message.contains("raw-api-key"));
     assert!(!message.contains("body-secret"));
     assert!(!message.contains("body-token"));
-    assert!(!message.contains("resp_12345678"));
     assert!(message.contains(REDACTED));
-    assert!(message.contains("resp_REDACTED_1"));
+    // A response id is not a secret; the diagnostic names it as sent.
+    assert!(message.contains("resp_12345678"));
 }
 
 #[test]
 fn replay_miss_diagnostics_report_missing_required_headers_without_values() {
-    let policy = CassettePolicy::for_scenario(
-        "anthropic",
-        "agent/completion_smoke",
-        ReplayMatching::Ordered,
-    );
+    let policy =
+        CassettePolicy::for_scenario("anthropic", CassetteSpec::new("agent/completion_smoke"));
     let request = incoming_request("/v1/messages", Bytes::new());
     let interactions = vec![ReplayInteraction {
         when: cassette_request("/v1/messages"),
@@ -337,7 +367,7 @@ fn replay_miss_diagnostics_report_missing_required_headers_without_values() {
         consumed: false,
     }];
 
-    let message = replay_miss_message(policy, &request, &interactions);
+    let message = replay_miss_message(policy, &request, &interactions, None, None);
 
     assert!(message.contains("x-api-key"));
     assert!(message.contains("missing_required_headers"));
@@ -375,6 +405,8 @@ async fn replay_request_records_unexpected_misses() {
         }],
         misses: Vec::new(),
         policy: CassettePolicy::default(),
+        snapshots: None,
+        shapes: None,
     }));
 
     let response = replay_request(
@@ -528,7 +560,6 @@ fn scrubber_reframes_binary_event_stream_payloads() {
     );
 
     let scrubbed = scrub_cassette_contents(&cassette);
-    assert!(!scrubbed.contains(generated_id));
     assert!(
         cassette_safety_failures(Path::new("fixture.yaml"), &scrubbed).is_empty(),
         "scrubbed event stream should pass cassette safety"
@@ -546,17 +577,18 @@ fn scrubber_reframes_binary_event_stream_payloads() {
     );
     let message = read_message_from(&mut reframed).expect("event stream should remain valid");
     let payload = std::str::from_utf8(message.payload()).expect("JSON payload should be UTF-8");
-    assert!(payload.contains("tooluse_REDACTED_1"));
+    assert!(
+        payload.contains(generated_id),
+        "the id is recorded verbatim"
+    );
 }
 
 #[test]
 fn body_matching_compares_base64_bytes() {
-    let policy = CassettePolicy::default();
     let headers = axum::http::HeaderMap::new();
     let expected = BASE64_STANDARD.encode([0, 159, 146, 150]);
 
     assert!(body_matches(
-        policy,
         &headers,
         &[],
         &[0, 159, 146, 150],
@@ -583,106 +615,97 @@ fn safety_detects_aws_keys_in_base64_bodies_without_echoing_value() {
     assert!(failures.iter().all(|failure| !failure.contains(leaked)));
 }
 
+/// The safety check names each key-shaped token a cassette that skipped
+/// the scrubber holds, by kind, and never echoes it.
 #[test]
-fn safety_detects_token_shaped_openai_keys_without_echoing_value() {
-    let cassette = scrub_cassette_contents(
-        r#"when:
-  path: /v1/responses
-  method: POST
-then:
-  status: 200
-  body: '{"leaked":"sk-proj-abcdefghijklmnopqrstuvwxyz1234567890"}'
-"#,
-    );
+fn safety_detects_unscrubbed_keys_without_echoing_value() {
+    for (key, kind) in [
+        (
+            "sk-proj-abcdefghijklmnopqrstuvwxyz1234567890",
+            "OpenAI API key",
+        ),
+        (
+            "sk-ant-api03-abcdefghijklmnopqrstuvwxyz1234567890",
+            "Anthropic API key",
+        ),
+        ("AIzaSyExampleSecretToken1234567890", "Google API key"),
+    ] {
+        let cassette = format!(
+            "when:\n  path: /v1/messages\n  method: POST\nthen:\n  status: 200\n  body: '{{\"leaked\":\"{key}\"}}'\n"
+        );
 
-    let failures = cassette_safety_failures(Path::new("fixture.yaml"), &cassette);
+        let failures = cassette_safety_failures(Path::new("fixture.yaml"), &cassette);
 
-    assert!(
-        failures
+        let shaped = failures
             .iter()
-            .any(|failure| failure.contains("OpenAI API key-shaped token(s)"))
-    );
-    assert!(
-        failures
-            .iter()
-            .all(|failure| !failure.contains("sk-proj-abcdefghijklmnopqrstuvwxyz1234567890"))
-    );
+            .filter(|failure| failure.contains("-shaped token(s)"))
+            .collect::<Vec<_>>();
+        assert_eq!(shaped.len(), 1, "{failures:?}");
+        assert!(
+            shaped
+                .iter()
+                .all(|failure| failure.contains(&format!("{kind}-shaped"))),
+            "{failures:?}"
+        );
+        assert!(failures.iter().all(|failure| !failure.contains(key)));
+    }
 }
 
+/// A recorded secret of every kind `rig_core::redact` knows is scrubbed,
+/// wherever it is: in a request query, header or body, or in a response
+/// header or body, plain text or JSON. The result passes the safety check.
 #[test]
-fn safety_detects_token_shaped_anthropic_keys_without_echoing_value() {
-    let cassette = scrub_cassette_contents(
-        r#"when:
-  path: /v1/messages
-  method: POST
-then:
-  status: 200
-  body: '{"leaked":"sk-ant-api03-abcdefghijklmnopqrstuvwxyz1234567890"}'
-"#,
-    );
+fn recording_scrubs_every_redact_kind() {
+    let keys = [
+        "sk-proj-abcdefghijklmnopqrstuvwxyz1234567890",
+        "sk-ant-api03-abcdefghijklmnopqrstuvwxyz",
+        "AIzaSyExampleSecretToken1234567890",
+        "AKIA1234567890ABCDEF",
+        "ghp_abcdefghijklmnopqrstuvwxyz0123456789",
+        "glpat-abcdefghijklmnopqrstuvwxyz",
+        "xoxb-1234567890-abcdefghijk",
+        concat!("sk_", "live_abcdefghijklmnopqrstuvwxyz"),
+        "hf_abcdefghijklmnopqrstuvwxyz0123456789",
+        "-----BEGIN RSA PRIVATE KEY-----\nMIIEabc\n-----END RSA PRIVATE KEY-----",
+    ];
+    let kinds = keys
+        .iter()
+        .flat_map(|key| redact::find(key).map(|secret| secret.kind))
+        .collect::<std::collections::HashSet<_>>();
+    assert_eq!(kinds.len(), keys.len(), "one sample per kind: {kinds:?}");
 
-    let failures = cassette_safety_failures(Path::new("fixture.yaml"), &cassette);
+    let mut scrubber = CassetteScrubber::default();
+    for key in keys {
+        let mut request = cassette_request("/v1/messages");
+        request.query_param.push(query_pair("q", key));
+        request.header.push(query_pair("anthropic-beta", key));
+        request.body = Some(serde_json::json!({ "input": key }).to_string());
+        let mut response = cassette_response();
+        response.header.push(query_pair("x-request-id", key));
+        response.body = Some(format!("error: {key} is invalid"));
+        let mut interaction = CassetteInteraction {
+            when: request,
+            then: response,
+        };
 
-    assert!(
-        failures
-            .iter()
-            .any(|failure| failure.contains("Anthropic API key-shaped token(s)"))
-    );
-    assert!(
-        failures
-            .iter()
-            .all(|failure| !failure.contains("sk-ant-api03-abcdefghijklmnopqrstuvwxyz1234567890"))
-    );
-    assert!(
-        failures
-            .iter()
-            .all(|failure| !failure.contains("OpenAI API key-shaped token(s)"))
-    );
+        scrubber.scrub_request(&mut interaction.when);
+        scrubber.scrub_response(&mut interaction.then);
+
+        let recorded = serialize_cassette_interactions(&[interaction]);
+        assert!(!redact::has_secret(&recorded), "{recorded}");
+        assert_eq!(recorded.matches(REDACTED).count(), 5, "{recorded}");
+        assert!(
+            cassette_safety_failures(Path::new("fixture.yaml"), &recorded).is_empty(),
+            "{recorded}"
+        );
+    }
 }
 
+/// Provider ids are recorded verbatim: a file id, a message id and the
+/// repeated file id in a later path and query all survive, and scrubbing
+/// the result again changes nothing.
 #[test]
-fn safety_detects_google_api_keys_without_echoing_value() {
-    let cassette = scrub_cassette_contents(
-        r#"when:
-  path: /v1beta/models/gemini
-  method: POST
-then:
-  status: 200
-  body: '{"leaked":"AIzaSyExampleSecretToken1234567890"}'
-"#,
-    );
-
-    let failures = cassette_safety_failures(Path::new("fixture.yaml"), &cassette);
-
-    assert!(
-        failures
-            .iter()
-            .any(|failure| failure.contains("Google API key-shaped token(s)"))
-    );
-    assert!(
-        failures
-            .iter()
-            .all(|failure| !failure.contains("AIzaSyExampleSecretToken1234567890"))
-    );
-}
-
-#[test]
-fn safety_does_not_flag_short_sk_substrings() {
-    let cassette = scrub_cassette_contents(
-        r#"when:
-  path: /v1/responses
-  method: POST
-then:
-  status: 200
-  body: '{"text":"the sk-etch marker is harmless"}'
-"#,
-    );
-
-    assert!(cassette_safety_failures(Path::new("fixture.yaml"), &cassette).is_empty());
-}
-
-#[test]
-fn scrubber_preserves_repeated_ids_across_json_bodies() {
+fn scrubber_records_provider_ids_verbatim() {
     let cassette = r#"when:
   path: /v1/files
   method: POST
@@ -711,15 +734,15 @@ then:
 
     let scrubbed = scrub_cassette_contents(cassette);
 
-    assert!(!scrubbed.contains("file_011Cb1W1wnAxQP1a6AuVcPx5"));
-    assert_eq!(scrubbed.matches("file_REDACTED_1").count(), 5);
-    assert!(scrubbed.contains("msg_REDACTED_1"));
+    assert_eq!(scrubbed.matches("file_011Cb1W1wnAxQP1a6AuVcPx5").count(), 5);
+    assert!(scrubbed.contains("msg_01D9wgWnWe16jLatSL7ce5Gm"));
+    assert!(!scrubbed.contains("REDACTED_"));
     assert!(scrubbed.contains("rig-file-id-page-two-verifier-8c27"));
     assert_eq!(scrub_cassette_contents(&scrubbed), scrubbed);
 }
 
 #[test]
-fn scrubber_preserves_repeated_bedrock_tool_use_ids_across_json_bodies() {
+fn scrubber_records_bedrock_tool_use_ids_verbatim() {
     let cassette = r#"when:
   path: /model/amazon.nova-lite-v1%3A0/converse
   method: POST
@@ -738,13 +761,18 @@ then:
 
     let scrubbed = scrub_cassette_contents(cassette);
 
-    assert!(!scrubbed.contains("tooluse_A3wBRw65LYralyPMOxFhuj"));
-    assert_eq!(scrubbed.matches("tooluse_REDACTED_1").count(), 2);
+    assert_eq!(
+        scrubbed.matches("tooluse_A3wBRw65LYralyPMOxFhuj").count(),
+        2
+    );
+    assert!(!scrubbed.contains("REDACTED_"));
     assert_eq!(scrub_cassette_contents(&scrubbed), scrubbed);
 }
 
+/// An SSE recording keeps its ids and fingerprint; only the volatile date
+/// header goes.
 #[test]
-fn scrubber_scrubs_sse_json_payloads() {
+fn scrubber_keeps_sse_json_payloads_and_drops_volatile_headers() {
     let cassette = r#"when:
   path: /v1/chat/completions
   method: POST
@@ -760,12 +788,10 @@ then:
 
     let scrubbed = scrub_cassette_contents(cassette);
 
-    assert!(!scrubbed.contains("chatcmpl-DfEFWCScgKdeItzBxcAl2DTWsWPwj"));
-    assert!(!scrubbed.contains("call_vJUubymOrhXJwTYjJvSnqzAe"));
-    assert!(!scrubbed.contains("fp_c27f75025a"));
+    assert!(scrubbed.contains("chatcmpl-DfEFWCScgKdeItzBxcAl2DTWsWPwj"));
+    assert!(scrubbed.contains("call_vJUubymOrhXJwTYjJvSnqzAe"));
+    assert!(scrubbed.contains("fp_c27f75025a"));
     assert!(!scrubbed.contains("date"));
-    assert!(scrubbed.contains("chatcmpl-REDACTED_1"));
-    assert!(scrubbed.contains("call_REDACTED_1"));
     assert!(scrubbed.contains("data: [DONE]"));
     assert!(scrubbed.contains("content-type"));
 }
@@ -787,25 +813,82 @@ then:
     assert!(!scrubbed.contains("id_REDACTED"));
 }
 
-/// The digit-less `call_` rule (Ollama's minted `call_kqpofucm` ids)
-/// keys off field identity, not value shape: a legitimate tool *named*
-/// `call_forwarding` survives recording untouched, while the same
-/// spelling in an id field is redacted.
+/// Opaque replay fields are recorded verbatim, so a fixture can seed a live
+/// call with the provider's own signature or ciphertext.
 #[test]
-fn scrubber_redacts_digitless_call_tokens_only_in_id_fields() {
+fn scrubber_records_opaque_replay_fields_verbatim() {
     let cassette = r#"when:
-  path: /api/chat
+  path: /v1/messages
   method: POST
-  body: '{"tool_calls":[{"id":"call_kqpofucm","function":{"name":"call_forwarding"}}]}'
+  body: '{"messages":[{"role":"assistant","content":[{"type":"thinking","thinking":"t","signature":"ErUBCkYIBRgCIkA7/sig+bytes=="},{"type":"redacted_thinking","data":"EqQBCgY/redacted+bytes=="}]}]}'
 then:
   status: 200
-  body: '{"message":"use call_forwarding for this"}'
+  body: '{"output":[{"type":"reasoning","id":"rs_0123456789abcdef","encrypted_content":"gAAAAAB/encrypted+bytes==","summary":[]}],"candidates":[{"content":{"parts":[{"text":"x","thoughtSignature":"CqMBCgY/thought+bytes=="}]}}],"data":[{"b64_json":"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8DwHwAFBQIAX8jx0gAAAABJRU5ErkJggg=="}],"images":["iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8DwHwAFBQIAX8jx0gAAAABJRU5ErkJggg=="],"id":"gen_1","obfuscation":"aB3d","safety_identifier":"u_9f8e7d","prompt_cache_key":"rig-key","system_fingerprint":"fp_c27f75025a","url":"https://vertexaisearch.cloud.google.com/grounding-api-redirect/AbCdEf","name":"cachedContents/n3v1qk0nqz9k","nextPageToken":"cjwKDoIBCwifnJDUBhDo0c8VCipCKHZi"}'
 "#;
 
     let scrubbed = scrub_cassette_contents(cassette);
 
-    assert!(!scrubbed.contains("call_kqpofucm"));
-    assert_eq!(scrubbed.matches("call_forwarding").count(), 2);
+    for verbatim in [
+        "ErUBCkYIBRgCIkA7/sig+bytes==",
+        "EqQBCgY/redacted+bytes==",
+        "rs_0123456789abcdef",
+        "gAAAAAB/encrypted+bytes==",
+        "CqMBCgY/thought+bytes==",
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8DwHwAFBQIAX8jx0gAAAABJRU5ErkJggg==",
+        "aB3d",
+        "u_9f8e7d",
+        "rig-key",
+        "fp_c27f75025a",
+        "grounding-api-redirect/AbCdEf",
+        "cachedContents/n3v1qk0nqz9k",
+        "cjwKDoIBCwifnJDUBhDo0c8VCipCKHZi",
+    ] {
+        assert!(
+            scrubbed.contains(verbatim),
+            "{verbatim} was scrubbed: {scrubbed}"
+        );
+    }
+    assert!(!scrubbed.contains("REDACTED_"), "{scrubbed}");
+    assert!(
+        cassette_safety_failures(Path::new("fixture.yaml"), &scrubbed).is_empty(),
+        "verbatim opaque fields pass the safety scan"
+    );
+}
+
+/// A fixture recorded under the old policy is already in recorded form:
+/// scrubbing leaves every placeholder in place, so the committed corpus
+/// passes the safety scan unchanged.
+#[test]
+fn scrubbing_is_the_identity_on_a_legacy_placeholder_fixture() {
+    let legacy = r#"when:
+  path: /v1/responses
+  method: POST
+  body: '{"input":[{"type":"reasoning","id":"rs_REDACTED_1","encrypted_content":"encrypted_content_REDACTED_2"},{"type":"function_call","call_id":"call_REDACTED_1","id":"fc_REDACTED_1"}],"prompt_cache_key":"id_REDACTED_1"}'
+then:
+  status: 200
+  header:
+  - name: content-type
+    value: application/json
+  - name: x-request-id
+    value: req_REDACTED_1
+  body: '{"id":"resp_REDACTED_1","output":[{"type":"reasoning","id":"rs_REDACTED_2","encrypted_content":"encrypted_content_REDACTED_3","summary":[]}],"safety_identifier":"id_REDACTED_2","system_fingerprint":"fp_REDACTED_1","obfuscation":"obfuscation_REDACTED_1","name":"cachedContents/cached-REDACTED_1","data":[{"b64_json":"aGVsbG8="}]}'
+"#;
+
+    fn placeholders(text: &str) -> Vec<&str> {
+        let mut found: Vec<&str> = text
+            .split(|ch: char| !(ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-')))
+            .filter(|token| token.contains("REDACTED_"))
+            .collect();
+        found.sort_unstable();
+        found
+    }
+
+    let scrubbed = scrub_cassette_contents(legacy);
+    assert_eq!(placeholders(&scrubbed), placeholders(legacy));
+    assert!(scrubbed.contains("aGVsbG8="));
+    assert!(scrubbed.contains("cachedContents/cached-REDACTED_1"));
+    assert_eq!(scrub_cassette_contents(&scrubbed), scrubbed);
+    assert!(cassette_safety_failures(Path::new("fixture.yaml"), &scrubbed).is_empty());
 }
 
 #[test]
@@ -838,18 +921,46 @@ then:
 
     assert!(scrubbed.contains("value: '[REDACTED]'"));
     assert!(!scrubbed.contains("AIzaSySecret"));
-    // `x-request-id` is allowlisted since rig#2265 (provider transport
-    // request ids are feature data), but its value is a generated id and
-    // must record scrubbed.
+    // `x-request-id` is allowlisted (provider transport request ids are
+    // feature data) and its value is recorded as sent.
     assert!(scrubbed.contains("x-request-id"));
-    assert!(!scrubbed.contains("req_abc123456789"));
-    assert!(scrubbed.contains("req_REDACTED"));
+    assert!(scrubbed.contains("req_abc123456789"));
     assert!(scrubbed.contains("name: retry-after\n    value: '2'"));
     assert!(scrubbed.contains("Sun, 06 Nov 1994 08:49:37 GMT"));
     assert!(!scrubbed.contains("opaque-private-credential"));
     assert_eq!(scrubbed, scrub_cassette_contents(&scrubbed));
     assert!(!scrubbed.contains("set-cookie"));
     assert!(scrubbed.contains("content-type"));
+}
+
+/// A request's cookie and ChatGPT account id are credentials: redacted
+/// by name, and a raw header line of either fails the safety check.
+#[test]
+fn scrubber_redacts_cookie_and_chatgpt_account_headers() {
+    let cassette = r#"when:
+  path: /backend-api/codex/responses
+  method: POST
+  header:
+  - name: Cookie
+    value: session=very-private-cookie
+  - name: ChatGPT-Account-Id
+    value: acct_private_123
+then:
+  status: 200
+  body: '{}'
+"#;
+
+    let scrubbed = scrub_cassette_contents(cassette);
+
+    assert!(!scrubbed.contains("very-private-cookie"), "{scrubbed}");
+    assert!(!scrubbed.contains("acct_private_123"), "{scrubbed}");
+    assert_eq!(scrubbed.matches(REDACTED).count(), 2);
+    assert!(cassette_safety_failures(Path::new("fixture.yaml"), &scrubbed).is_empty());
+    let raw = "cookie: session=x\nChatGPT-Account-Id: acct_1\n";
+    assert_eq!(
+        artifact_safety_failures(Path::new("dump.txt"), raw).len(),
+        2
+    );
 }
 
 #[test]
@@ -872,9 +983,9 @@ then:
     assert_eq!(scrubbed.matches(REDACTED).count(), 4);
 }
 
-/// OAuth tokens in a recorded body are placeholdered at record time, the
-/// way generated ids are: a token exchange or a refresh reply can never
-/// reach a committed cassette with its material.
+/// OAuth tokens in a recorded body are placeholdered at record time: a token
+/// exchange or a refresh reply can never reach a committed cassette with its
+/// material.
 #[test]
 fn oauth_token_fields_are_placeholdered_at_record_time() {
     let cassette = scrub_cassette_contents(

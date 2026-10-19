@@ -1,740 +1,439 @@
-use serde::{Deserialize, Serialize};
+//! The decoder of GenerateContent replies, a whole `generateContent` body or
+//! a stream of `streamGenerateContent` chunks, read as REST JSON. The REST,
+//! Vertex AI and gRPC wires share it: each part becomes a block whose
+//! provider item is the part as Gemini sent it.
+//!
+//! ```
+//! use rig_core::providers::gemini::streaming::GenerateContentDecoder;
+//!
+//! let decoder = GenerateContentDecoder::default();
+//! # let _ = decoder;
+//! ```
 
-use super::completion::gemini_api_types::{
-    ContentCandidate, FinishReason, Part, PartKind, PromptFeedback, UsageMetadata,
-    map_finish_reason,
-};
-use super::completion::{
-    PROVIDER_NAME, blocked_prompt_error, function_call_finish_reason_error, part_kind_name,
-};
-use crate::completion::CompletionError;
-use crate::operation::{AdapterOutput, Completion};
-use crate::providers::internal::wire::{self, WireEvent};
-use crate::streaming;
+use serde_json::{Map, Value};
+
+use super::completion::blocked_prompt_error;
+use super::completion::{map_google_finish_reason, usage_of};
+use crate::error::ProviderError;
+use crate::json_utils::Lenient;
+use crate::message::{CallId, DocumentSourceKind, Image, MediaType, MimeType, ToolName};
+use crate::operation::{Block, Completion, Finish};
+use crate::providers::internal::wire;
 use crate::wire::{
-    AdapterErrorEnvelope, AdapterEvent, AdapterUsage, AdapterVerdict, Decoder, Mode,
-    ObservationSink, Output, WireFrame,
+    AdapterVerdict, Decoder, Flow, ObservationSink, Out, WireCitation, WireEvent, WireFrame,
 };
-
-/// Part-kind interpretation shared by the Gemini wires whose payloads
-/// coincide: REST `streamGenerateContent` and the Interactions API both
-/// deliver whole function calls and identity-less thought fragments.
-pub(crate) mod shared_parts {
-    use serde_json::Value;
-
-    use crate::streaming::{BlockClose, BlockId, BlockKind, StreamEvent, ToolCallEnd};
-
-    /// A whole function-call part as a canonical tool call — its start and
-    /// its authoritative end (Gemini never streams arguments incrementally).
-    pub(crate) fn function_call(
-        name: String,
-        args: Value,
-        wire_id: Option<String>,
-        signature: Option<String>,
-        tool_ids: &mut crate::streaming::SyntheticIds,
-    ) -> Vec<StreamEvent> {
-        // Never fabricate the identifier that travels upstream: the wire's
-        // own id (when Gemini supplies one) is both the part identity and
-        // the correlation id; an id-less call keys the stream by a minted
-        // identity — counted up per stream, so two id-less calls never
-        // collide on one key — and replays with the id absent. The tool
-        // *name* is never an identity — two calls to the same tool in one
-        // turn must stay distinct, correlated by order and by the
-        // block id.
-        let tool_id = wire_id.and_then(crate::streaming::non_empty_id);
-        let id = tool_id
-            .as_ref()
-            .map_or_else(|| tool_ids.mint(), |id| BlockId::wire(id.as_str()));
-        let mut end = ToolCallEnd::whole(name, args).with_signature(signature);
-        // Gemini is a single-identifier wire: its one id travels as
-        // `tool_id` and `call_id` stays unset. Filling both from the same
-        // id would take the dual-wire arm downstream and fabricate an
-        // item id Gemini never issued.
-        end.tool_id = tool_id;
-        vec![
-            StreamEvent::BlockStart {
-                id: id.clone(),
-                kind: BlockKind::ToolCall,
-            },
-            StreamEvent::BlockEnd {
-                id,
-                end: BlockClose::ToolCall(end),
-                block: None,
-            },
-        ]
-    }
-}
-
-/// The usage record on a `streamGenerateContent` chunk.
-///
-/// Identical to the unary wire's [`UsageMetadata`] — Gemini sends the same
-/// `usageMetadata` object on streaming frames — so the streaming name is an
-/// alias, not a second declaration that can drift from it.
-pub type PartialUsage = UsageMetadata;
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct StreamGenerateContentResponse {
-    pub response_id: Option<String>,
-    /// Candidate responses from the model.
-    #[serde(default)]
-    pub candidates: Vec<ContentCandidate>,
-    /// The prompt's content-filter verdict. A set `blockReason` means the
-    /// prompt was refused and no candidate follows: the chunk that carries
-    /// it is the whole answer.
-    pub prompt_feedback: Option<PromptFeedback>,
-    pub model_version: Option<String>,
-    pub usage_metadata: Option<PartialUsage>,
-    /// Gemini's error envelope, sent as a frame of its own when the
-    /// service aborts a stream in-band (`{"error":{"code":500,"message":
-    /// …,"status":"INTERNAL"}}`). The provider's verdict, not an unknown
-    /// frame to skip: the stream closes after it, and without this the
-    /// turn ended as a truncation with the error lost. Kept raw so every
-    /// field (code, status, message, details) survives into the report.
-    pub error: Option<serde_json::Value>,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct StreamingCompletionResponse {
-    pub usage_metadata: PartialUsage,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub finish_reason: Option<FinishReason>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub finish_message: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub model_version: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub response_id: Option<String>,
-}
-
-impl From<&StreamingCompletionResponse> for crate::completion::Usage {
-    fn from(value: &StreamingCompletionResponse) -> crate::completion::Usage {
-        (&value.usage_metadata).into()
-    }
-}
-
-impl From<StreamingCompletionResponse> for crate::completion::Usage {
-    fn from(value: StreamingCompletionResponse) -> crate::completion::Usage {
-        (&value).into()
-    }
-}
-
-fn tool_protocol_finish_reason_error(choice: &ContentCandidate) -> Option<CompletionError> {
-    let reason = choice.finish_reason.as_ref()?;
-    function_call_finish_reason_error(reason, choice.finish_message.as_deref())
-}
 
 /// The recognizability markers of a `streamGenerateContent` chunk: every
 /// genuine frame carries `candidates`, `usageMetadata` and/or
 /// `promptFeedback` (a blocked prompt's only chunk may carry nothing but
 /// the feedback), and the service's in-band abort carries only `error`. A
-/// frame with any of them must fully decode (else `Corrupt`). A valid ID-only
-/// frame is recognized separately as metadata; other JSON is `Unknown`.
+/// frame with any of them is a chunk. A valid ID-only frame is recognized
+/// separately as metadata; other JSON is `Unknown`.
 const RECOGNIZABLE_CHUNK_KEYS: &[&str] =
     &["candidates", "usageMetadata", "promptFeedback", "error"];
 
-/// The Gemini GenerateContent wire's decoder, serving both of its modes.
-///
-/// One decoder decodes `generateContent` and `streamGenerateContent` because
-/// they are the *same document*: the streaming shape is a strict superset of
-/// the unary one (it adds `error` and relaxes `responseId`), every field of
-/// both is optional or defaulted, and a unary reply is simply that document
-/// delivered whole with complete `candidates` instead of in pieces with
-/// partial ones. The superset is the wire's, not rig's — so there is no
-/// unary event variant to select, and nothing to select it with: `classify`
-/// sees a `WireFrame` and is never told the mode. The terminal stays where
-/// the streaming wire needs it, deferred to EOF (see [`Self::finish`]),
-/// which for a one-frame unary reply fires immediately after that frame.
-///
-/// The one difference the two modes cannot share is what an EOF *means*,
-/// and the decoder is built knowing it: [`Wire::decoder`](crate::wire::Wire::decoder)
-/// is handed the [`Mode`], which is the only thing this decoder knows about
-/// how its bytes arrived.
-///
-/// Holds the per-reply state (thought lifecycle, tool-id minter, terminal
-/// metadata); frame-triage policy is the driver's.
+/// A GenerateContent reply document in REST JSON: the whole
+/// `generateContent` body or one `streamGenerateContent` chunk.
+#[derive(Debug, Default, serde::Deserialize)]
+#[serde(transparent)]
+pub struct GenerateContentChunk(pub Map<String, Value>);
+
+/// Decode GenerateContent replies. A text or thought part continues the
+/// block of the part before it while the kind stays the same, and a part
+/// that carries only a thought signature joins that block; any other part is
+/// a block of its own. The provider's end is held until EOF because
+/// hosted-tool rounds can report intermediate finish reasons. The
+/// candidate's grounding and recitation metadata cite the text blocks when
+/// the reply ends.
+#[derive(Debug, Default)]
 pub struct GenerateContentDecoder {
-    /// Owns the constant-key thought lifecycle — the ends this wire never
-    /// announces are derived by the shared lifecycle, not hand-rolled here.
-    /// All accumulation lives in the shared accumulator.
-    reasoning: crate::providers::internal::chunk_lifecycle::MintedReasoningLifecycle,
-    /// Per-stream minter for id-less tool-call keys — a fresh key per call,
-    /// so two id-less calls in one turn never collide on one identity.
-    tool_ids: crate::streaming::SyntheticIds,
-    /// Per-reply minter for the raw-content blocks a part the stream
-    /// vocabulary cannot express rides on (see `GEMINI_RAW_CONTENT_KEY`).
-    raw_ids: crate::streaming::SyntheticIds,
-    final_usage: Option<PartialUsage>,
-    final_finish_reason: Option<FinishReason>,
-    final_finish_message: Option<String>,
-    final_model_version: Option<String>,
-    final_response_id: Option<String>,
-    /// The provider sent a `finishReason` on some chunk.
-    ///
-    /// Gemini's `streamGenerateContent` sends an *intermediate* `finishReason`
-    /// when a built-in tool runs a round — a recorded code-execution stream
-    /// reads `[executableCode] [codeExecutionResult] [executableCode +
-    /// finishReason:STOP] [codeExecutionResult] [text] [text +
-    /// finishReason:STOP]` — so a `finishReason` chunk is not, on this wire, the
-    /// provider completing the turn. The terminal record is therefore deferred
-    /// to EOF (see [`Decoder::finish`], which names exactly this case);
-    /// pushing it on the first such chunk made the driver stop reading there
-    /// and silently drop the model's whole answer while still reporting a
-    /// successful `STOP`.
-    saw_finish_reason: bool,
-    /// Whether any part of the turn mapped to assistant content.
-    ///
-    /// A *whole* reply that produced none is not a blank successful answer:
-    /// the unary mapper this decoder replaced ended with
-    /// `require_non_empty_response`, and a caller reading `choice: []` as an
-    /// answer is the outcome that rule exists to prevent. Checked in
-    /// `finish` against [`Self::whole`], so a reply whose only parts were
-    /// `executableCode` / `codeExecutionResult` is rejected exactly where
-    /// the deleted mapper rejected it, while a stream that ends undelivered
-    /// keeps reporting truncation the way it always has — by carrying no
-    /// terminal record.
-    delivered: bool,
-    /// This reply arrived whole, so its EOF ends an answer rather than a
-    /// stream — the [`Mode`] this decoder was built for.
-    whole: bool,
-    /// A tool-protocol finish reason or a blocked prompt ended the turn; later frames are dead —
-    /// the provider aborted, and interpreting more output (or a terminal)
-    /// would dress the failure up as a completed turn.
-    failed: bool,
+    /// The latest `finishReason`.
+    finish: Option<String>,
+    /// The latest `usageMetadata`, as Gemini sent it.
+    usage: Option<Value>,
+    model_version: Option<String>,
+    response_id: Option<String>,
+    /// The text or thought run later parts continue, and whether it is
+    /// thought.
+    open: Option<(usize, bool)>,
+    /// Whether the open run holds a signature.
+    signed: bool,
+    /// The index of the block written last.
+    last: Option<usize>,
+    /// A signature sent alone before any block, which the next block takes.
+    signature: Option<String>,
+    /// The answer text written so far, which grounding segments cite.
+    answer: grounding::AnswerText,
+    /// The text block and byte offset in it of each part of the latest
+    /// chunk; `None` for a part that is not answer text.
+    placed: Vec<Option<(usize, usize)>>,
+    /// Where the part being written put its text.
+    placement: Option<(usize, usize)>,
+    /// The latest `groundingMetadata`'s citations, by block.
+    grounding: Vec<(usize, WireCitation)>,
+    /// How many chunks carried parts: a reply over more than one counts a
+    /// grounding segment's bytes in the whole answer, not in a part.
+    chunks: usize,
+    /// The `citationMetadata` sources of every chunk, by block.
+    recitations: Vec<(usize, WireCitation)>,
+}
+
+impl<'id> Decoder<'id, Completion> for GenerateContentDecoder {
+    type Event = GenerateContentChunk;
+
+    fn classify(&self, frame: WireFrame) -> WireEvent<GenerateContentChunk> {
+        match wire::classify_marker_keyed_frame(&frame.as_str(), RECOGNIZABLE_CHUNK_KEYS) {
+            chunk @ WireEvent::Known(_) => chunk,
+            // ID-only metadata must not create an unknown-content truncation tail.
+            _ if Self::is_analysis_only(&frame) => {
+                wire::classify_untyped_line(frame.as_str().as_bytes())
+            }
+            event => event,
+        }
+    }
+
+    fn decode(
+        &mut self,
+        GenerateContentChunk(data): GenerateContentChunk,
+        mut out: Out<'id, Completion>,
+    ) -> Result<Flow, ProviderError> {
+        let mut data = Value::Object(data);
+        // The parts move into their blocks; the rest of the chunk is read
+        // in place.
+        let parts = data
+            .pointer_mut("/candidates/0/content/parts")
+            .map(Value::take);
+        // Gemini repeats both on every chunk. Record a value when it changes:
+        // every span record counts against the exporter's attribute limit.
+        let span = tracing::Span::current();
+        if let Some(id) = data.str("responseId").filter(|id| !id.is_empty())
+            && self.response_id.as_deref() != Some(id)
+        {
+            span.record("gen_ai.response.id", id);
+            self.response_id = Some(id.to_owned());
+        }
+        if let Some(model) = data.str("modelVersion").filter(|model| !model.is_empty())
+            && self.model_version.as_deref() != Some(model)
+        {
+            span.record("gen_ai.response.model", model);
+            self.model_version = Some(model.to_owned());
+        }
+        if let Some(usage) = data.get_mut("usageMetadata") {
+            self.usage = Some(usage.take());
+        }
+        if let Some(error) = data.at("/error") {
+            // An in-band failure is a provider error, not a truncation.
+            let body = serde_json::json!({ "error": error }).to_string();
+            return Err(ProviderError::from_provider_body(body));
+        }
+        if let Some(blocked) = data.get("promptFeedback").and_then(blocked_prompt_error) {
+            return Err(blocked);
+        }
+        // The candidates, their content and its parts hold every block and
+        // the finish, so a wrongly typed one fails the reply.
+        let candidate = match data
+            .get("candidates")
+            .map(|candidates| (candidates, candidates.get(0)))
+        {
+            None | Some((Value::Null, _) | (Value::Array(_), None)) => return Ok(Flow::More),
+            Some((Value::Array(_), Some(candidate @ Value::Object(_)))) => candidate,
+            Some((Value::Array(_), Some(_))) => {
+                return Err(malformed("a candidate that is not an object"));
+            }
+            Some(_) => return Err(malformed("candidates that are not a list")),
+        };
+        // Last one wins: an intermediate `finishReason` is superseded by the
+        // reason the turn actually ended on. Proto3 JSON spells an enum
+        // value its schema does not know as its number.
+        match candidate.get("finishReason") {
+            Some(Value::String(name)) => self.finish = Some(name.clone()),
+            Some(Value::Number(number)) => self.finish = Some(format!("FINISH_REASON_{number}")),
+            _ => {}
+        }
+        let parts = match candidate.get("content") {
+            None | Some(Value::Null) => None,
+            Some(Value::Object(_)) => parts,
+            Some(_) => return Err(malformed("candidate content that is not an object")),
+        };
+        match parts {
+            None | Some(Value::Null) => {}
+            Some(Value::Array(parts)) => {
+                self.chunks += 1;
+                self.placed.clear();
+                for part in parts {
+                    self.part(part, &mut out)?;
+                    self.placed.push(self.placement.take());
+                }
+            }
+            Some(_) => return Err(malformed("candidate parts that are not a list")),
+        }
+        // Each chunk restates the grounding whole; recitation sources add up.
+        if let Some(metadata) = candidate.get("groundingMetadata") {
+            self.grounding =
+                grounding::grounding(metadata, &self.placed, &self.answer, self.chunks > 1);
+        }
+        if let Some(metadata) = candidate.get("citationMetadata") {
+            let recitations = grounding::recitations(metadata, &self.answer);
+            self.recitations.extend(recitations);
+        }
+        // A failure is final: nothing after it is read.
+        use crate::completion::FinishReason::{Length, Stop};
+        let reason = self.finish.as_deref().map(map_google_finish_reason);
+        match (reason, candidate.get("finishReason")) {
+            (None | Some(Stop | Length), _) | (_, None) => Ok(Flow::More),
+            _ => self.end(out),
+        }
+    }
+
+    /// Gemini ends a reply at EOF, not at its first finish reason: a
+    /// hosted-tool round can report one before more content arrives.
+    fn eof(&mut self, out: Out<'id, Completion>) -> Result<Flow, ProviderError> {
+        self.end(out)
+    }
+}
+
+/// A transport that delivers each reply message as its REST chunk, such as
+/// an SDK's reply transcoded once, hands the decoder the chunk itself.
+impl<'id> Decoder<'id, Completion, GenerateContentChunk> for GenerateContentDecoder {
+    type Event = GenerateContentChunk;
+
+    fn classify(&self, chunk: GenerateContentChunk) -> WireEvent<GenerateContentChunk> {
+        WireEvent::Known(chunk)
+    }
+
+    fn decode(
+        &mut self,
+        chunk: GenerateContentChunk,
+        out: Out<'id, Completion>,
+    ) -> Result<Flow, ProviderError> {
+        Decoder::<'id, Completion>::decode(self, chunk, out)
+    }
+
+    fn eof(&mut self, out: Out<'id, Completion>) -> Result<Flow, ProviderError> {
+        self.end(out)
+    }
 }
 
 impl GenerateContentDecoder {
-    /// A decoder for one reply read in `mode`.
-    pub(super) fn new(mode: Mode) -> Self {
-        Self {
-            reasoning: crate::providers::internal::chunk_lifecycle::MintedReasoningLifecycle::new(
-                crate::streaming::MintKind::Reasoning,
-            ),
-            tool_ids: crate::streaming::SyntheticIds::tool(),
-            raw_ids: crate::streaming::SyntheticIds::new(crate::streaming::MintKind::Block),
-            final_usage: None,
-            final_finish_reason: None,
-            final_finish_message: None,
-            final_model_version: None,
-            final_response_id: None,
-            saw_finish_reason: false,
-            delivered: false,
-            whole: mode == Mode::Unary,
-            failed: false,
+    /// End the reply on the finish reason the candidate holds. Without one
+    /// the reply did not end.
+    fn end(&mut self, mut out: Out<'_, Completion>) -> Result<Flow, ProviderError> {
+        let Some(reason) = self.finish.take() else {
+            return Err(ProviderError::Truncated);
+        };
+        self.close(&mut out)?;
+        let citations = std::mem::take(&mut self.grounding)
+            .into_iter()
+            .chain(std::mem::take(&mut self.recitations));
+        for (index, citation) in citations {
+            out.cite(index, citation);
         }
-    }
-}
-
-impl Decoder<Completion> for GenerateContentDecoder {
-    type Event = StreamGenerateContentResponse;
-
-    fn classify(&self, frame: WireFrame) -> WireEvent<StreamGenerateContentResponse> {
-        // ID-only frames update terminal metadata without manufacturing an
-        // Unknown content item (and therefore a semantic truncation tail).
-        // This applies equally with observation enabled or disabled.
-        if <Self as Decoder<Completion>>::is_analysis_only(self, &frame) {
-            return wire::classify_marker_keyed_frame(&frame.as_str(), &["responseId"]);
-        }
-        wire::classify_marker_keyed_frame(&frame.as_str(), RECOGNIZABLE_CHUNK_KEYS)
+        let usage = self.usage.as_ref().map(usage_of).unwrap_or_default();
+        let model = self.model_version.take();
+        let response_id = self.response_id.take();
+        Ok(out.end(Finish {
+            usage,
+            reason: Some(map_google_finish_reason(&reason)),
+            response_id,
+            model,
+            ..Finish::default()
+        }))
     }
 
-    fn is_analysis_only(&self, frame: &WireFrame) -> bool {
-        #[derive(Deserialize)]
+    /// Finish the open text or thought run: Gemini states each part whole.
+    fn close(&mut self, out: &mut Out<'_, Completion>) -> Result<(), ProviderError> {
+        self.open
+            .take()
+            .map_or(Ok(()), |(index, _)| out.finish(index))
+    }
+
+    /// Write a block at a fresh index, closing the run before it. A text or
+    /// thought block stays open as the run later parts continue; any other
+    /// is whole.
+    fn open(
+        &mut self,
+        block: Block,
+        item: Value,
+        text: &str,
+        out: &mut Out<'_, Completion>,
+    ) -> Result<(), ProviderError> {
+        self.close(out)?;
+        let index = out.fresh_index();
+        let mut item = item;
+        if let (Some(signature), Some(fields)) = (self.signature.take(), item.as_object_mut()) {
+            fields
+                .entry("thoughtSignature")
+                .or_insert(Value::String(signature));
+        }
+        self.last = Some(index);
+        self.signed = item
+            .get("thoughtSignature")
+            .and_then(Value::as_str)
+            .is_some_and(|signature| !signature.is_empty());
+        if matches!(block, Block::Text) {
+            self.answer.open(index, text);
+            self.placement = Some((index, 0));
+        }
+        let run = match &block {
+            Block::Text => Some(false),
+            Block::Reasoning { .. } => Some(true),
+            _ => None,
+        };
+        out.open(index, block, item)?;
+        out.push(index, text)?;
+        self.open = run.map(|thought| (index, thought));
+        self.open.map_or_else(|| out.finish(index), |_| Ok(()))
+    }
+
+    /// Write one part of the candidate's content. A part this decoder does
+    /// not model is an opaque item that replays; one with no data, or that
+    /// is not an object, is kept as one that does not. A signature alone
+    /// joins the block before it, as Gemini attaches it to the part before,
+    /// or the next block when it comes first.
+    fn part(&mut self, part: Value, out: &mut Out<'_, Completion>) -> Result<(), ProviderError> {
+        let Value::Object(fields) = &part else {
+            return self.open(Block::Opaque { replay: false }, part, "", out);
+        };
+        let thought = part.bool("thought") == Some(true);
+        let signature = part
+            .str("thoughtSignature")
+            .filter(|signature| !signature.is_empty());
+        if let Some(text) = part.str("text") {
+            // An empty part without a signature carries nothing.
+            if text.is_empty() && signature.is_none() {
+                return Ok(());
+            }
+            // A second signed part starts a block of its own, so each
+            // signature stays with the part that carried it.
+            return match self.open {
+                Some((index, kind)) if kind == thought && !(self.signed && signature.is_some()) => {
+                    self.signed |= signature.is_some();
+                    if !thought {
+                        self.placement = self.answer.push(index, text).map(|at| (index, at));
+                    }
+                    out.push(index, text)?;
+                    out.edit(index, |item| merge_part(item, &part))
+                }
+                _ => {
+                    let block = match thought {
+                        true => Block::Reasoning { redacted: false },
+                        false => Block::Text,
+                    };
+                    let text = text.to_owned();
+                    self.open(block, part, &text, out)
+                }
+            };
+        }
+        if let Some(call) = part.obj("functionCall") {
+            let Ok(name) =
+                ToolName::new(call.get("name").and_then(Value::as_str).unwrap_or_default())
+            else {
+                tracing::warn!("Gemini sent a function call without a name; nothing can answer it");
+                return Ok(());
+            };
+            // Proto3 JSON leaves out an empty `args` Struct.
+            let args = call
+                .get("args")
+                .map_or_else(|| "{}".to_owned(), Value::to_string);
+            let id = CallId::from_wire(call.get("id").and_then(Value::as_str).unwrap_or_default());
+            return self.open(Block::Call { id, name }, part, &args, out);
+        }
+        if !thought
+            && let (Some(mime_type), Some(data)) =
+                (part.at("/inlineData/mimeType"), part.at("/inlineData/data"))
+            && let (Some(mime_type), Some(data)) = (mime_type.as_str(), data.as_str())
+            && let Some(MediaType::Image(media_type)) = MediaType::from_mime_type(mime_type)
+        {
+            let image = Image {
+                data: DocumentSourceKind::Base64(data.to_owned()),
+                media_type: Some(media_type),
+                detail: None,
+                native: None,
+            };
+            return self.open(Block::Image(image), part, "", out);
+        }
+        let bare = ["thought", "thoughtSignature", "partMetadata"];
+        let data = fields.keys().any(|key| !bare.contains(&key.as_str()));
+        if !data && let Some(signature) = signature {
+            let Some(index) = self.open.map(|(index, _)| index).or(self.last) else {
+                self.signature = Some(signature.to_owned());
+                return Ok(());
+            };
+            return out.edit(index, |item| {
+                if let Some(item) = item.as_object_mut() {
+                    item.insert("thoughtSignature".to_owned(), Value::from(signature));
+                }
+            });
+        }
+        self.open(Block::Opaque { replay: data }, part, "", out)
+    }
+
+    /// Whether `frame` carries a response id and nothing else, a repeated
+    /// key included.
+    pub(crate) fn is_analysis_only(frame: &WireFrame) -> bool {
+        #[derive(serde::Deserialize)]
         #[serde(deny_unknown_fields)]
         struct ResponseIdOnly {
             #[serde(rename = "responseId")]
             _id: String,
         }
         matches!(
-            wire::classify_marker_keyed_frame::<ResponseIdOnly>(&frame.as_str(), &["responseId"]),
+            wire::classify_untyped_line::<ResponseIdOnly>(frame.as_str().as_bytes()),
             WireEvent::Known(_)
         )
     }
 
-    fn interpret(&mut self, data: StreamGenerateContentResponse, out: &mut Output<Completion>) {
-        if self.failed {
-            return;
-        }
-
-        let span = tracing::Span::current();
-        if let Some(response_id) = data.response_id.as_deref() {
-            span.record("gen_ai.response.id", response_id);
-            self.final_response_id = Some(response_id.to_owned());
-        }
-        if let Some(model_version) = &data.model_version {
-            span.record("gen_ai.response.model", model_version.as_str());
-            self.final_model_version = Some(model_version.clone());
-        }
-        if let Some(usage) = data.usage_metadata.as_ref() {
-            // Carried for the terminal record only: the driver records usage
-            // off the folded response, so the decoder states it once.
-            self.final_usage = Some(usage.clone());
-        }
-
-        if let Some(error) = data.error {
-            // The service aborted the turn in-band: the envelope is the
-            // whole answer and the stream closes after it. Surface it as
-            // the provider error it is, with the envelope as the body (as
-            // the unary wire and the other families' streams do), rather
-            // than skipping an unknown frame and reporting a truncation.
-            self.failed = true;
-            // GenerateContent's numeric error code is an HTTP status, unlike
-            // other providers' opaque codes or gRPC's small integer codes.
-            // Only error statuses participate in the unary retry policy.
-            let status = error
-                .get("code")
-                .and_then(serde_json::Value::as_u64)
-                .and_then(|code| u16::try_from(code).ok())
-                .and_then(|code| http::StatusCode::from_u16(code).ok())
-                .filter(|status| status.is_client_error() || status.is_server_error());
-            let body = serde_json::json!({ "error": error }).to_string();
-            let error = match status {
-                Some(status) => CompletionError::from_http_response(status, body),
-                None => crate::provider_response::completion_error_from_body(body),
-            };
-            out.push(Err(error));
-            return;
-        }
-
-        if let Some(blocked) = data.prompt_feedback.as_ref().and_then(blocked_prompt_error) {
-            // The provider refused the prompt: this chunk is its whole
-            // answer and the stream closes after it. Without this the turn
-            // would end with no terminal record and be reported as a
-            // truncated stream, the block reason lost.
-            self.failed = true;
-            out.push(Err(blocked));
-            return;
-        }
-
-        let Some(choice) = data.candidates.into_iter().next() else {
-            tracing::debug!("There is no content candidate");
+    /// Project provider verdicts, response identity, and errors
+    /// before normalization. A field of another type is left out, and a
+    /// payload that is not JSON projects nothing.
+    pub(crate) fn project(payload: &[u8], sink: &mut ObservationSink<'_>) {
+        let Ok(reply) = serde_json::from_slice::<Value>(payload) else {
             return;
         };
-
-        if let Some(finish_reason) = &choice.finish_reason {
-            // Last one wins: an intermediate `finishReason` is superseded by
-            // the reason the turn actually ended on.
-            self.saw_finish_reason = true;
-            self.final_finish_reason = Some(finish_reason.clone());
-        }
-        if let Some(message) = &choice.finish_message {
-            self.final_finish_message = Some(message.clone());
-        }
-
-        if let Some(err) = tool_protocol_finish_reason_error(&choice) {
-            self.failed = true;
-            out.push(Err(err));
-            return;
-        }
-
-        match choice.content {
-            Some(content) => {
-                if content.parts.is_empty() {
-                    tracing::trace!(reason = ?self.final_finish_reason, "There is no part in the streaming content");
-                }
-                for part in content.parts {
-                    self.interpret_part(part, out);
-                }
-            }
-            None => {
-                // Gemini's final chunk may carry finishReason with no content.
-                tracing::debug!(finish_reason = ?self.final_finish_reason, "Streaming candidate missing content");
-            }
-        }
-    }
-
-    fn finish(&mut self, out: &mut Output<Completion>) {
-        // A whole reply is the entire turn, so reaching its end having
-        // mapped no assistant content is the provider answering with
-        // nothing — the rejection `require_non_empty_response` gave the
-        // deleted unary mapper, stated here because this decoder replaced
-        // it. It runs before the `finishReason` gate below: a reply with no
-        // candidates at all names no reason to finish, and that is the
-        // shape the mapper rejected most often.
-        //
-        // Except where the reply named a terminal that cut the turn short
-        // (see `crate::message::EMPTY_RESPONSE_ERROR` for the rule and
-        // `FinishReason::truncated_output` for the set): `MAX_TOKENS`
-        // normalizes to `Length`, and Gemini's filter reasons to
-        // `ContentFilter`. A turn the cap or the filter emptied is a real
-        // answer carrying a real usage report, not a defect, so it falls
-        // through to the terminal below and yields an empty choice with
-        // that reason. The predicate is shared rather than re-derived, so
-        // this wire cannot disagree with the rest about which reasons
-        // legalize emptiness.
-        //
-        // A streamed reply reaching EOF undelivered stopped early instead,
-        // and truncation is reported by the absent terminal record (see
-        // below), never by an error — so this guard is the whole reply's
-        // alone, and widening it to the stream would turn every truncated
-        // turn into an empty-answer error.
-        let cut_short = self
-            .final_finish_reason
-            .as_ref()
-            .and_then(map_finish_reason)
-            .is_some_and(|reason| reason.truncated_output());
-        if self.whole && !self.delivered && !cut_short {
-            out.error(CompletionError::ResponseError(
-                crate::message::EMPTY_RESPONSE_ERROR.to_owned(),
-            ));
-            return;
-        }
-
-        // EOF without a `finishReason` chunk is truncation: no terminal
-        // record may be synthesized — it would report a successful completion
-        // for a turn the provider aborted.
-        if !self.saw_finish_reason {
-            return;
-        }
-
-        // Deferral, not synthesis: the provider *did* signal the finish, on a
-        // chunk that is not reliably its last (see `saw_finish_reason`).
-        // Holding the record until EOF is what lets the driver read the rest
-        // of the turn, and it means the terminal carries the last reason,
-        // usage, and metadata the stream actually reported.
-        // A terminal that never carried `usageMetadata` reports no usage; the
-        // defaulted metadata below only fills the raw record's shape.
-        let usage = self
-            .final_usage
-            .as_ref()
-            .map(crate::completion::Usage::from)
-            .unwrap_or_default();
-        let native = StreamingCompletionResponse {
-            usage_metadata: self.final_usage.take().unwrap_or_default(),
-            finish_reason: self.final_finish_reason.take(),
-            finish_message: self.final_finish_message.take(),
-            model_version: self.final_model_version.take(),
-            response_id: self.final_response_id.take(),
-        };
-        let raw = match serde_json::to_value(&native) {
-            Ok(raw) => raw,
-            Err(err) => {
-                out.error(err.into());
-                return;
-            }
-        };
-        let finish_reason = native.finish_reason.as_ref().and_then(map_finish_reason);
-        out.final_record(
-            streaming::StreamFinal::new(PROVIDER_NAME, usage)
-                .with_optional_finish_reason(finish_reason)
-                .with_optional_response_id(native.response_id)
-                .with_optional_model(native.model_version)
-                .with_raw(raw),
-        );
-    }
-
-    fn is_finished(&self) -> bool {
-        // A tool-protocol terminal failure or a blocked prompt is the wire's
-        // own in-band terminal: `interpret` already pushed the `Err` and gates itself on
-        // `failed`, so the driver must stop reading rather than drain the
-        // rest of the transport (and pass through post-error unknown frames).
-        self.failed
-    }
-
-    /// GenerateContent metadata projected before normalization discards it:
-    /// the verdict, the usage report, the response id and the error
-    /// envelope — the facts the normalized response does not keep.
-    fn project(&self, payload: &[u8], sink: &mut dyn ObservationSink) {
-        // The observation projection must not inherit native response
-        // defaults: omitted prompt/total counts in UsageMetadata otherwise
-        // become zero. Parsing failure has no effect on the provider's
-        // authoritative decoder.
-        if let Ok(ObservedUsageOnly { usage: Some(usage) }) =
-            serde_json::from_slice::<ObservedUsageOnly>(payload)
-        {
-            sink.emit(AdapterEvent::Usage {
-                usage: AdapterUsage {
-                    input_tokens: usage.prompt_token_count,
-                    output_tokens: usage.candidates_token_count,
-                    total_tokens: usage.total_token_count,
-                    cached_input_tokens: usage.cached_content_token_count,
-                    reasoning_tokens: usage.thoughts_token_count,
-                    tool_input_tokens: usage.tool_use_prompt_token_count,
-                },
-            });
-        }
-        // Project metadata independently so malformed candidate fields cannot
-        // erase an otherwise valid usage report from a rejected response.
-        let Ok(metadata) = serde_json::from_slice::<ObservedMetadata>(payload) else {
-            return;
-        };
-        let candidate = metadata.candidates.into_iter().next().unwrap_or_default();
-        let scrub = |value: String| sink.scrub(&value);
+        let candidate = reply.arr("candidates").first().unwrap_or(&Value::Null);
+        let scrub = |value: Option<&str>| value.map(|value| sink.scrub(value));
+        let block = reply
+            .at("/promptFeedback/blockReason")
+            .and_then(Value::as_str);
         let verdict = AdapterVerdict {
-            finish_reason: candidate.finish_reason.map(scrub),
-            block_reason: metadata
-                .prompt_feedback
-                .and_then(|f| f.block_reason)
-                .map(scrub),
-            detail: candidate.finish_message.map(scrub),
-            model: metadata.model_version.map(scrub),
+            finish_reason: scrub(candidate.str("finishReason")),
+            block_reason: scrub(block),
+            detail: scrub(candidate.str("finishMessage")),
+            model: scrub(reply.str("modelVersion")),
         };
-        let response_id = metadata.response_id.map(scrub);
+        let response_id = scrub(reply.str("responseId"));
         sink.provider(verdict, response_id);
-        if let Some(error) = metadata.error {
-            let code = error.code.map(|code| match code {
-                serde_json::Value::String(code) => sink.scrub(&code),
-                serde_json::Value::Number(code) => code.to_string(),
-                _ => "[invalid]".to_owned(),
-            });
-            sink.emit(AdapterEvent::ErrorEnvelope {
-                error: AdapterErrorEnvelope {
-                    code,
-                    status: error.status.map(|value| sink.scrub(&value)),
-                    message: error.message.map(|value| sink.scrub(&value)),
-                },
-            });
+        if let Some(error) = crate::observe::ObservedError::of(&reply) {
+            error.emit(sink);
         }
     }
 }
 
-/// The usage report alone, read off the payload before the verdict so a
-/// malformed candidate cannot erase it.
-#[derive(Deserialize)]
-struct ObservedUsageOnly {
-    #[serde(rename = "usageMetadata")]
-    usage: Option<ObservedUsage>,
+fn malformed(what: &str) -> ProviderError {
+    ProviderError::Response(format!("Gemini sent {what}"))
 }
 
-// Ignore all unrelated response fields rather than allocating another tree
-// containing the completion text, tools, signatures and media.
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct ObservedUsage {
-    #[serde(default, deserialize_with = "crate::observe::lenient_count")]
-    prompt_token_count: Option<u64>,
-    #[serde(default, deserialize_with = "crate::observe::lenient_count")]
-    candidates_token_count: Option<u64>,
-    #[serde(default, deserialize_with = "crate::observe::lenient_count")]
-    total_token_count: Option<u64>,
-    #[serde(default, deserialize_with = "crate::observe::lenient_count")]
-    cached_content_token_count: Option<u64>,
-    #[serde(default, deserialize_with = "crate::observe::lenient_count")]
-    thoughts_token_count: Option<u64>,
-    #[serde(default, deserialize_with = "crate::observe::lenient_count")]
-    tool_use_prompt_token_count: Option<u64>,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct ObservedMetadata {
-    #[serde(default)]
-    candidates: Vec<ObservedCandidate>,
-    prompt_feedback: Option<ObservedFeedback>,
-    model_version: Option<String>,
-    response_id: Option<String>,
-    error: Option<ObservedError>,
-}
-
-#[derive(Default, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct ObservedCandidate {
-    finish_reason: Option<String>,
-    finish_message: Option<String>,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct ObservedFeedback {
-    block_reason: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct ObservedError {
-    code: Option<serde_json::Value>,
-    status: Option<String>,
-    message: Option<String>,
-}
-
-impl GenerateContentDecoder {
-    fn interpret_part(&mut self, part: Part, out: &mut AdapterOutput) {
-        // Every arm below but the two skipping arms produces assistant
-        // content; the skips leave `delivered` alone, which is what lets
-        // `finish` tell a completed-but-contentless turn from a real answer.
-        if !matches!(
-            part.part,
-            PartKind::ExecutableCode(_) | PartKind::CodeExecutionResult(_)
-        ) {
-            self.delivered = true;
-        }
-        match part {
-            Part {
-                part: PartKind::Text(text),
-                thought: Some(true),
-                thought_signature,
-                ..
-            } => {
-                // Declare what the part carried; the shared lifecycle
-                // derives the sequence (a signature closes the block; the
-                // shared accumulator signs the accumulated deltas or records
-                // a signature-only part when nothing streamed).
-                self.reasoning.emit_chunk(
-                    crate::providers::internal::chunk_lifecycle::ChunkParts {
-                        reasoning: Some(text),
-                        reasoning_signature: thought_signature,
-                        text: None,
-                        tool_events: Vec::new(),
-                    },
-                    out,
-                );
-            }
-            Part {
-                part: PartKind::Text(text),
-                thought_signature,
-                ..
-            } => {
-                // The wire attaches `thoughtSignature` to a trailing part
-                // that carries no `thought` flag at all — recorded traffic
-                // shows `{"text":"","thoughtSignature":"..."}` — so the
-                // signature must be recognized here as well as in the
-                // `thought: true` arm above, which real streams never reach
-                // for the signature. Dropping it costs the replay-required
-                // provider state Gemini validates
-                // (`MISSING_THOUGHT_SIGNATURE`). One lifecycle end covers
-                // every case — open block (sign the deltas), already-closed
-                // block (sign the block that holds the chain-of-thought,
-                // #2258 B4), nothing streamed (signature-only part).
-                //
-                // Declared as two chunks, text first, because the signature
-                // signs what came *before* it and a chunk emits its
-                // reasoning end before its text. A streamed turn states the
-                // two in separate frames (`"289"`, then
-                // `{"text":"","thoughtSignature":…}`); a unary reply states
-                // them in ONE part, and folding that as one chunk put the
-                // signature's block ahead of the text — the same turn with
-                // its blocks in a different order depending on the
-                // transport
-                // (`completion/tests.rs::both_transports_place_a_trailing_thought_signature_the_same_way`).
-                // An empty text (the streamed shape) declares nothing, so
-                // that path is unchanged.
-                self.reasoning.emit_chunk(
-                    crate::providers::internal::chunk_lifecycle::ChunkParts {
-                        reasoning: None,
-                        reasoning_signature: None,
-                        text: Some(text),
-                        tool_events: Vec::new(),
-                    },
-                    out,
-                );
-                if let Some(signature) = thought_signature {
-                    self.reasoning.emit_chunk(
-                        crate::providers::internal::chunk_lifecycle::ChunkParts {
-                            reasoning: None,
-                            reasoning_signature: Some(signature),
-                            text: None,
-                            tool_events: Vec::new(),
-                        },
-                        out,
-                    );
-                }
-            }
-            Part {
-                part: PartKind::FunctionCall(function_call),
-                thought_signature,
-                ..
-            } => {
-                // Tool content interleaving an open thought block: the
-                // shared lifecycle synthesizes the boundary end.
-                self.reasoning.emit_chunk(
-                    crate::providers::internal::chunk_lifecycle::ChunkParts {
-                        reasoning: None,
-                        reasoning_signature: None,
-                        text: None,
-                        tool_events: shared_parts::function_call(
-                            function_call.name,
-                            function_call.args,
-                            function_call.id,
-                            thought_signature,
-                            &mut self.tool_ids,
-                        ),
-                    },
-                    out,
-                );
-            }
-            Part {
-                part: part @ PartKind::InlineData(_),
-                thought_signature,
-                ..
-            } => {
-                // `inlineData` is model output rig's *message* vocabulary
-                // models (`AssistantContent::Image`) and its *stream*
-                // vocabulary does not: `BlockKind`, `BlockClose` and
-                // `BlockAccumulator` carry text, reasoning and tool calls
-                // only. Since both modes now decode through here, dropping
-                // it would turn the streaming path's existing loss into a
-                // unary regression for the models that answer a completion
-                // with an image (`gemini-2.5-flash-image`), so the part
-                // rides a text block's metadata verbatim instead and stays
-                // recoverable. A first-class image block in the streaming
-                // vocabulary is the real fix and is a separate change.
-                let raw = Part {
-                    thought: None,
-                    thought_signature,
-                    part,
-                    additional_params: None,
-                };
-                let events = match crate::message::AdditionalParams::from_entries([(
-                    super::GEMINI_RAW_CONTENT_KEY,
-                    serde_json::json!(raw),
-                )]) {
-                    Some(params) => {
-                        let id = self.raw_ids.mint();
-                        vec![
-                            streaming::StreamEvent::BlockStart {
-                                id: id.clone(),
-                                kind: streaming::BlockKind::Text {
-                                    additional_params: Some(params),
-                                },
-                            },
-                            streaming::StreamEvent::BlockEnd {
-                                id,
-                                end: streaming::BlockClose::Text,
-                                block: None,
-                            },
-                        ]
-                    }
-                    None => Vec::new(),
-                };
-                // Declared through the lifecycle, not pushed directly, so a
-                // raw part interleaving an open thought block closes it the
-                // way every other content kind does.
-                self.reasoning.emit_chunk(
-                    crate::providers::internal::chunk_lifecycle::ChunkParts {
-                        reasoning: None,
-                        reasoning_signature: None,
-                        text: None,
-                        tool_events: events,
-                    },
-                    out,
-                );
-            }
-            Part {
-                part: part @ (PartKind::ExecutableCode(_) | PartKind::CodeExecutionResult(_)),
-                ..
-            } => {
-                // The `codeExecution` tool's own output: real Gemini output
-                // with no slot in `AssistantContent`, skipped by both
-                // transports since #2258. Structural metadata only in the
-                // log — an unmodeled part can carry model output, which must
-                // not leak into WARN logs.
-                crate::driver::warn_unmodeled("gemini_part", &part_kind_name(&part));
-            }
-            Part { part, .. } => {
-                // A part kind rig cannot account for at all. `functionResponse`
-                // and `fileData` are request-side shapes `generateContent`
-                // never answers with, so one arriving means the reply is not
-                // what this wire models — the blocking mapper this decoder
-                // replaced failed the response rather than dropping content
-                // with a WARN, and that is the contract.
-                out.error(CompletionError::ResponseError(format!(
-                    "Gemini response part kind {} carries no assistant content rig can account for",
-                    part_kind_name(&part)
-                )));
-                self.failed = true;
-            }
+/// Merge a streamed part into the part its block holds so far: the text
+/// appends, a non-empty `thoughtSignature` replaces the one held, and any
+/// other field replaces its namesake.
+fn merge_part(item: &mut Value, part: &Value) {
+    let (Value::Object(held), Value::Object(part)) = (&mut *item, part) else {
+        *item = part.clone();
+        return;
+    };
+    for (key, value) in part {
+        if key == "text"
+            && let (Some(Value::String(text)), Value::String(more)) = (held.get_mut("text"), value)
+        {
+            text.push_str(more);
+        } else if key != "thoughtSignature" || value.as_str() != Some("") {
+            held.insert(key.clone(), value.clone());
         }
     }
 }
+
+pub mod document;
+mod grounding;
 
 #[cfg(test)]
 mod tests;

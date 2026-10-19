@@ -21,6 +21,30 @@ pub fn cassette_scenarios(
     source: &str,
     wrapper_names: &[&'static str],
 ) -> Result<Vec<String>, ScenarioError> {
+    Ok(cassette_scenario_sites(source, wrapper_names)?
+        .into_iter()
+        .map(|site| site.scenario)
+        .collect())
+}
+
+/// One recorded scenario and the call that records it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ScenarioSite {
+    /// The scenario literal.
+    pub scenario: String,
+    /// The cassette wrapper the call goes through.
+    pub wrapper: String,
+    /// Account failures the spec itself declares
+    /// (`.expects_account_failure(AccountFailure::Auth)` gives `"Auth"`).
+    pub declared: Vec<String>,
+}
+
+/// Like [`cassette_scenarios`], keeping each scenario's wrapper and the
+/// account failures its spec declares.
+pub fn cassette_scenario_sites(
+    source: &str,
+    wrapper_names: &[&'static str],
+) -> Result<Vec<ScenarioSite>, ScenarioError> {
     let syntax = syn::parse_file(source)?;
     let mut visitor = CassetteScenarioVisitor {
         wrapper_names,
@@ -35,99 +59,101 @@ pub fn cassette_scenarios(
     }
 }
 
+/// The functions in `source` that declare account failures on their
+/// cassette session, with what they declare: a call to
+/// `expect_account_failure(AccountFailure::X)` declares `X`, and a call to
+/// `bogus_api_key()` declares `Auth`.
+pub fn declaring_functions(source: &str) -> Result<Vec<(String, Vec<String>)>, ScenarioError> {
+    let syntax = syn::parse_file(source)?;
+    let mut visitor = DeclaringVisitor::default();
+    visitor.visit_file(&syntax);
+    Ok(visitor.functions)
+}
+
+#[derive(Default)]
+struct DeclaringVisitor {
+    functions: Vec<(String, Vec<String>)>,
+    current: Option<(String, Vec<String>)>,
+}
+
+impl<'ast> Visit<'ast> for DeclaringVisitor {
+    fn visit_item_fn(&mut self, node: &'ast ItemFn) {
+        let outer = self
+            .current
+            .replace((node.sig.ident.to_string(), Vec::new()));
+        visit::visit_item_fn(self, node);
+        if let Some((name, declared)) = std::mem::replace(&mut self.current, outer)
+            && !declared.is_empty()
+        {
+            self.functions.push((name, declared));
+        }
+    }
+
+    fn visit_expr_method_call(&mut self, node: &'ast syn::ExprMethodCall) {
+        let declared = match node.method.to_string().as_str() {
+            "expect_account_failure" => node.args.first().and_then(last_path_segment),
+            "bogus_api_key" => Some("Auth".to_owned()),
+            _ => None,
+        };
+        if let (Some(declared), Some((_, list))) = (declared, self.current.as_mut())
+            && !list.contains(&declared)
+        {
+            list.push(declared);
+        }
+        visit::visit_expr_method_call(self, node);
+    }
+}
+
+fn last_path_segment(expr: &Expr) -> Option<String> {
+    let Expr::Path(path) = expr else {
+        return None;
+    };
+    path.path
+        .segments
+        .last()
+        .map(|segment| segment.ident.to_string())
+}
+
+/// Account failures a `CassetteSpec` builder chain declares.
+fn spec_declarations(expr: &Expr) -> Vec<String> {
+    match expr {
+        Expr::MethodCall(call) => {
+            let mut declared = spec_declarations(&call.receiver);
+            if call.method == "expects_account_failure"
+                && let Some(kind) = call.args.first().and_then(last_path_segment)
+            {
+                declared.push(kind);
+            }
+            declared
+        }
+        Expr::Paren(paren) => spec_declarations(&paren.expr),
+        _ => Vec::new(),
+    }
+}
+
 struct CassetteScenarioVisitor<'a> {
     wrapper_names: &'a [&'static str],
-    scenarios: Vec<String>,
+    scenarios: Vec<ScenarioSite>,
     failures: Vec<String>,
 }
 
 impl<'ast, 'a> Visit<'ast> for CassetteScenarioVisitor<'a> {
     fn visit_macro(&mut self, node: &'ast syn::Macro) {
-        if node
-            .path
-            .segments
-            .last()
-            .is_some_and(|s| s.ident == "golden_matrix")
-        {
-            match syn::parse2::<matrix_registry::GoldenMatrix>(node.tokens.clone()) {
-                Ok(matrix) => {
-                    let wrapper = matrix
-                        .wrapper
-                        .segments
-                        .last()
-                        .expect("wrapper path")
-                        .ident
-                        .to_string();
-                    if self.wrapper_names.contains(&wrapper.as_str()) {
-                        self.scenarios.extend(
-                            matrix
-                                .rows
-                                .into_iter()
-                                .filter(|row| !row.ignored)
-                                .map(|row| row.scenario.value()),
-                        );
-                    }
+        match matrix_registry::Matrix::of(node).transpose() {
+            Ok(matrix) => {
+                if let Some((wrapper, scenarios)) =
+                    matrix.and_then(matrix_registry::Matrix::recorded)
+                    && self.wrapper_names.contains(&wrapper.as_str())
+                {
+                    self.scenarios
+                        .extend(scenarios.into_iter().map(|scenario| ScenarioSite {
+                            scenario,
+                            wrapper: wrapper.clone(),
+                            declared: Vec::new(),
+                        }));
                 }
-                Err(error) => self.failures.push(error.to_string()),
             }
-        }
-        if node
-            .path
-            .segments
-            .last()
-            .is_some_and(|s| s.ident == "resume_matrix")
-        {
-            match syn::parse2::<matrix_registry::ResumeMatrix>(node.tokens.clone()) {
-                Ok(matrix) => {
-                    let wrapper = matrix
-                        .wrapper
-                        .segments
-                        .last()
-                        .expect("wrapper path")
-                        .ident
-                        .to_string();
-                    if self.wrapper_names.contains(&wrapper.as_str()) {
-                        self.scenarios.extend(
-                            matrix
-                                .rows
-                                .into_iter()
-                                .filter(|(_, ignored)| !ignored)
-                                .map(|(scenario, _)| scenario.value()),
-                        );
-                    }
-                }
-                Err(error) => self.failures.push(error.to_string()),
-            }
-        }
-        if node
-            .path
-            .segments
-            .last()
-            .is_some_and(|s| s.ident == "case_matrix")
-        {
-            match syn::parse2::<matrix_registry::CaseMatrix>(node.tokens.clone()) {
-                Ok(matrix) => {
-                    let Some(wrapper) = matrix.wrapper else {
-                        return;
-                    };
-                    let wrapper = wrapper
-                        .segments
-                        .last()
-                        .expect("wrapper path")
-                        .ident
-                        .to_string();
-                    if self.wrapper_names.contains(&wrapper.as_str()) {
-                        self.scenarios.extend(
-                            matrix
-                                .rows
-                                .into_iter()
-                                .filter(|(_, ignored)| !ignored)
-                                .map(|(scenario, _)| scenario.value()),
-                        );
-                    }
-                }
-                Err(error) => self.failures.push(error.to_string()),
-            }
+            Err(error) => self.failures.push(error.to_string()),
         }
         visit::visit_macro(self, node);
     }
@@ -149,7 +175,11 @@ impl<'ast, 'a> Visit<'ast> for CassetteScenarioVisitor<'a> {
         {
             match node.args.first() {
                 Some(expr) => match cassette_scenario_value(expr) {
-                    Some(scenario) => self.scenarios.push(scenario),
+                    Some(scenario) => self.scenarios.push(ScenarioSite {
+                        scenario,
+                        wrapper: wrapper_name.clone(),
+                        declared: spec_declarations(expr),
+                    }),
                     None => self.failures.push(format!(
                         "calls {wrapper_name} without a string-literal cassette scenario"
                     )),

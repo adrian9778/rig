@@ -1,44 +1,10 @@
 # rig-memory
 
-Conversation memory policies for the [Rig](https://github.com/0xPlaygrounds/rig)
-agent framework.
-
-`rig-core` ships the `ConversationMemory` trait and an in-process
-`InMemoryConversationMemory` backend. This crate provides reusable named
-policies for shaping loaded history before it is sent to the model:
-
-- [`NoopMemoryPolicy`] — identity policy, useful as a default.
-- [`SlidingWindowMemory`] — keep the most recent `N` messages, dropping any
-  leading orphan tool result.
-- [`TokenWindowMemory`] — keep the most recent messages that fit within a token
-  budget supplied by a [`TokenCounter`].
-
-## Usage
-
-```rust,no_run
-use rig_memory::{InMemoryConversationMemory, SlidingWindowMemory, IntoFilter};
-
-let memory = InMemoryConversationMemory::new()
-    .with_filter(SlidingWindowMemory::last_messages(20).into_filter());
-```
-
-For backends other than `InMemoryConversationMemory`, apply a policy directly:
-
-```rust,ignore
-use rig_memory::{MemoryPolicy, SlidingWindowMemory};
-
-let policy = SlidingWindowMemory::last_messages(20);
-let trimmed = policy.apply(loaded_messages)?;
-```
-
-To wrap any backend with a policy and propagate policy errors to the caller
-(rather than silently degrading to identity on failure), use `PolicyMemory`:
-
-```rust,no_run
-use rig_memory::{InMemoryConversationMemory, PolicyMemory, SlidingWindowMemory};
-
-let memory = PolicyMemory::new(
-    InMemoryConversationMemory::new(),
-    SlidingWindowMemory::last_messages(20),
-);
-```
+Saved conversations for [Rig](https://github.com/0xPlaygrounds/rig): recent messages,
+compaction, and sessions saved as JSON-lines logs (`rig-session/4`) that can be resumed,
+rewritten, and an agent's log forked up to a turn boundary. With default features it is pure data and builds for wasm32;
+feature `fs` adds `DirStore` and `DirFiles`. `load_async` and `save_async` keep a conversation in
+any `AsyncStore`, such as a database or IndexedDB, and every local store is one; rig-agent's
+`AgentBuilder::memory` keeps an agent's conversation there. A store appends to a log only if the
+log is still as long as the writer read it, checking and appending in one step, so of two saves
+that read one log the second is refused. See the crate docs for the API.

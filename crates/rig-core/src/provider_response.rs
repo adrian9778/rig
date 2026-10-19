@@ -1,62 +1,51 @@
-//! Shared logic for inspecting provider error response bodies across capability errors.
+//! Preserved provider error responses and their machine codes.
+//!
+//! ```
+//! use rig_core::ProviderResponseError;
+//!
+//! let reply = ProviderResponseError::new(http::StatusCode::TOO_MANY_REQUESTS, "slow down");
+//! assert!(reply.is_retryable());
+//! ```
 use http::StatusCode;
 
-/// A raw error response preserved from a provider.
-///
-/// Capability errors store this in their `ProviderResponse` variants when Rig
-/// has the provider's response body in hand. Unlike `ProviderError(String)`,
-/// which may carry Rig-generated diagnostics, this type always represents the
-/// payload the provider actually returned.
-///
-/// Prefer [`Self::new`] / [`Self::without_status`] and the `with_*` setters
-/// over a struct literal: a literal has to be revisited every time transport
-/// metadata grows, and the constructors do not.
+/// A raw provider error body with captured transport metadata.
+/// Callers must supply the provider's actual payload, not a generated diagnostic.
+/// Serialization omits headers and route; deserialization restores them as `None`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProviderResponseError {
     /// HTTP status of the provider response, when it was captured alongside the body.
     pub status: Option<StatusCode>,
     /// Raw response body as returned by the provider.
     pub body: String,
-    /// The provider's transport request id for the failed call (HTTP response
-    /// header such as Anthropic `request-id` / OpenAI `x-request-id`, or SDK
-    /// response metadata) — the id provider support asks for when
-    /// investigating a request, which matters most on exactly these failed
-    /// calls. `None` means the provider did not report one — a documented
-    /// outcome, never a secondary error (rig#2314).
+    /// Transport request ID from response headers or SDK metadata, when captured.
     pub provider_request_id: Option<String>,
-    /// The response's headers, verbatim, when the capture path had them in
-    /// hand — the rate-limit metadata (`Retry-After`, `x-ratelimit-*`) a
-    /// caller needs to back off correctly after a 429 (rig#2210). `None`
-    /// means "not captured", never "the response had no headers".
+    /// Captured response headers, including rate-limit metadata. `None` means
+    /// not captured, rather than an empty header set. Omitted during serialization.
     pub headers: Option<http::HeaderMap>,
     /// The provider's own machine-readable code for the failure, when the
     /// transport reported one apart from the body: a gRPC status code name
     /// (`UNAVAILABLE`), an AWS exception type (`ThrottlingException`).
     /// `None` when the reply carried only a status and a body.
     pub code: Option<String>,
-    /// The transport's own verdict on whether the same call may be retried,
-    /// for replies that carry no HTTP status (gRPC, SDK transports). `None`
-    /// when the transport gave none; a reply with a status is classified by
-    /// its status and ignores this.
+    /// Transport retry hint, used when neither a non-success status nor a
+    /// known provider code decides; refusals are never retryable.
     pub transient: Option<bool>,
-    /// The reply is the provider's verdict on the content, not a fault: a
-    /// blocked prompt (Gemini's `promptFeedback.blockReason`). Never retried,
-    /// and read as `ErrorReport::refusal` by every conversion. A refusal the
-    /// model *says* (OpenAI's `refusal` part) is an answer, not this.
+    /// Whether this error represents a content refusal. Refusals are never
+    /// retryable; refusal content in a successful model answer is separate.
     pub refusal: bool,
+    /// The provider and request path the reply answered, when the operation
+    /// records them for diagnostics (model listing does). Omitted during
+    /// serialization.
+    pub route: Option<String>,
 }
 
 impl ProviderResponseError {
     /// Preserve a provider error response captured with its HTTP status.
     pub fn new(status: StatusCode, body: impl Into<String>) -> Self {
+        let status = Some(status);
         Self {
-            status: Some(status),
-            body: body.into(),
-            provider_request_id: None,
-            headers: None,
-            code: None,
-            transient: None,
-            refusal: false,
+            status,
+            ..Self::without_status(body)
         }
     }
 
@@ -71,7 +60,20 @@ impl ProviderResponseError {
             code: None,
             transient: None,
             refusal: false,
+            route: None,
         }
+    }
+
+    /// Preserve a provider error body delivered with no HTTP status of its
+    /// own: an error event inside a stream, or a non-HTTP transport's reply.
+    /// An error envelope that nests an HTTP status as its numeric code
+    /// (`{"error":{"code":503}}`) records it as the status, as the same
+    /// envelope on a non-success response would carry it.
+    pub fn from_body(body: impl Into<String>) -> Self {
+        let mut reply = Self::without_status(body);
+        let status = reply.located(|envelope| envelope.http_status().filter(|_| envelope.nested));
+        reply.status = status.and_then(|status| StatusCode::from_u16(status).ok());
+        reply
     }
 
     /// Mark the reply as the provider's verdict on the content: a refusal,
@@ -97,40 +99,60 @@ impl ProviderResponseError {
         self
     }
 
-    /// Attach the transport's own retry verdict, for a reply with no HTTP
-    /// status. A reply with a status keeps it, but classifies by the status.
+    /// Replaces the transport retry hint. A refusal, a non-success HTTP
+    /// status, and a provider code the table knows each outrank it.
     pub fn with_transient(mut self, transient: Option<bool>) -> Self {
         self.transient = transient;
         self
     }
 
-    /// Whether the same call may reasonably be retried: by the status when
-    /// the reply has a non-success one ([`crate::error::retryable_status`]),
-    /// else by the transport's own verdict, else not — a reply that says
-    /// nothing about itself is not retried on a guess. A success status says
-    /// nothing either: an error envelope delivered under a 200 (a blocked
-    /// prompt, a 2xx error body) classifies by the verdict the decoder
-    /// attached, exactly as it would with no status at all. A refusal is
-    /// never retried: the provider judged the content, and the same call
-    /// gets the same verdict.
+    /// Whether the same request may reasonably be sent again, decided in
+    /// this order: a refusal never is; a non-success HTTP status decides
+    /// through [`crate::error::retryable_status`]; then a provider code the
+    /// one table knows (the explicit [`Self::code`], else the code the body's
+    /// error envelope names); then the `transient` hint; otherwise not.
+    ///
+    /// The body is read on every call, so the same envelope gets the same
+    /// verdict from every decoder and transport, streamed or unary.
     pub fn is_retryable(&self) -> bool {
         if self.refusal {
             return false;
         }
-        match self.status {
-            Some(status) if !status.is_success() => {
-                crate::error::retryable_status(Some(status.as_u16()))
-            }
-            _ => self.transient.unwrap_or(false),
+        if let Some(status) = self.status.filter(|status| !status.is_success()) {
+            return crate::error::retryable_status(Some(status.as_u16()));
         }
+        let known = match &self.code {
+            Some(code) => Envelope::default().named(code).verdict(),
+            None => self.located(|envelope| envelope.verdict()),
+        };
+        known.or(self.transient).unwrap_or(false)
     }
 
-    /// The provider's own machine code for the failure: the one the
-    /// transport reported apart from the body ([`Self::code`]), else the
-    /// one the body names (`body_code`). `None` when neither names one —
-    /// a reply that is a status and prose (Venice's `{"error":"…"}`).
+    /// Returns the explicit code, else the code the body's error envelope
+    /// names: its first nonempty string `code`, `status` or `type`, or else
+    /// its numeric code in decimal (`"429"`).
     pub fn machine_code(&self) -> Option<String> {
-        self.code.clone().or_else(|| body_code(&self.body))
+        self.code
+            .clone()
+            .or_else(|| self.located(|envelope| envelope.code()))
+    }
+
+    /// The error the body's envelope holds, as `{"error": ...}`, or the
+    /// error event itself; `None` when the body carries no envelope.
+    pub fn envelope_json(&self) -> Option<serde_json::Value> {
+        let doc: serde_json::Value = serde_json::from_str(&self.body).ok()?;
+        let envelope = envelope(&doc)?;
+        let error = envelope.error?.clone();
+        Some(match envelope.nested {
+            true => serde_json::json!({ "error": error }),
+            false => error,
+        })
+    }
+
+    /// `f` applied to the error the body carries, as [`delivered`] finds it.
+    fn located<T>(&self, f: impl FnOnce(Envelope<'_>) -> Option<T>) -> Option<T> {
+        let doc: serde_json::Value = serde_json::from_str(&self.body).ok()?;
+        delivered(&doc).and_then(f)
     }
 
     /// Attach the transport request id the failed response reported.
@@ -139,8 +161,7 @@ impl ProviderResponseError {
         self
     }
 
-    /// Attach the response's headers, so rate-limit metadata survives onto the
-    /// error (rig#2210).
+    /// Replaces captured response headers, including rate-limit metadata.
     pub fn with_headers(mut self, headers: Option<http::HeaderMap>) -> Self {
         self.headers = headers;
         self
@@ -157,20 +178,17 @@ impl std::fmt::Display for ProviderResponseError {
         if let Some(request_id) = &self.provider_request_id {
             write!(f, " (request id: {request_id})")?;
         }
+        if let Some(route) = &self.route {
+            write!(f, " [{route}]")?;
+        }
         Ok(())
     }
 }
 
 impl std::error::Error for ProviderResponseError {}
 
-/// The wire shape of [`ProviderResponseError`]: the status as its number,
-/// the body and the provider's request id — the error's identity. The
-/// headers are not on the wire: they are the transport's (`date`, the
-/// rate-limit counters), differ on every response to the same request,
-/// and a record that carried them was never the same twice — an effect
-/// log's error record replayed from one cassette diverged from itself a
-/// second later. A deserialized error has `headers: None`, "not captured",
-/// which is what a replayed error is.
+/// Serialized error metadata with numeric HTTP status and no headers.
+/// Volatile transport headers are excluded to keep replay records stable.
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ProviderResponseErrorWire {
@@ -216,557 +234,166 @@ impl<'de> serde::Deserialize<'de> for ProviderResponseError {
             code: wire.code,
             transient: wire.transient,
             refusal: wire.refusal,
+            route: None,
         })
     }
 }
 
-/// The machine code a provider's error body names, when it names one as a
-/// string under its `error` envelope: `error.code` (OpenAI and every
-/// OpenAI-shaped wire: `model_not_found`, `invalid_request_error`), else
-/// `error.status` (Google's `NOT_FOUND`, `UNAVAILABLE`), else `error.type`
-/// (Anthropic's `authentication_error`, an OpenAI reply whose `code` is
-/// `null`). A number under `code` is the HTTP status said again, not a
-/// code, and is skipped; an envelope that is prose (`{"error":"…"}`), a
-/// body that is not JSON, and an empty string name none.
-pub fn body_code(body: &str) -> Option<String> {
-    let value: serde_json::Value = serde_json::from_str(body).ok()?;
-    let error = value.get("error")?;
-    ["code", "status", "type"].iter().find_map(|field| {
-        error
-            .get(field)
-            .and_then(serde_json::Value::as_str)
-            .filter(|code| !code.is_empty())
-            .map(str::to_owned)
-    })
+/// Where a provider put its error, and the code it gave it: the first
+/// nonempty string and the first integer among its code fields.
+#[derive(Default)]
+struct Envelope<'a> {
+    /// The error value itself: an object, a message string, or the event.
+    error: Option<&'a serde_json::Value>,
+    name: Option<&'a str>,
+    number: Option<i64>,
+    /// The error nests in the document (`error`, `response.error`) rather
+    /// than being the document itself, an `error` event.
+    nested: bool,
+}
+
+/// The error `doc` carries, where [`envelope`] locates it, and whether it
+/// nests in the document rather than being the document itself.
+pub(crate) fn located_error(doc: &serde_json::Value) -> Option<(&serde_json::Value, bool)> {
+    envelope(doc).and_then(|envelope| Some((envelope.error?, envelope.nested)))
+}
+
+/// Codes naming a transient condition, in any case, from every transport:
+/// HTTP envelopes, gRPC status names, AWS exception types.
+const TRANSIENT: &[&str] = &[
+    "overloaded",
+    "overloaded_error",
+    "api_error",
+    "rate_limit_error",
+    "rate_limit_exceeded",
+    "too_many_requests",
+    "server_error",
+    "server_is_overloaded",
+    "slow_down",
+    "unavailable",
+    "resource_exhausted",
+    "deadline_exceeded",
+    "aborted",
+    "ThrottlingException",
+    "ServiceUnavailableException",
+    "InternalServerException",
+    "ModelNotReadyException",
+    "ModelTimeoutException",
+    "ModelStreamErrorException",
+];
+
+/// Codes naming a condition the same request meets again.
+const FINAL: &[&str] = &[
+    "insufficient_quota",
+    "quota_exceeded",
+    "billing_hard_limit_reached",
+    "context_length_exceeded",
+    "invalid_prompt",
+];
+
+/// The one reader of where a provider puts its error. In order: the
+/// Responses `response.failed` nesting (`response.error`); a top-level
+/// `error` object, or a nonempty `error` string (a message, no code); a
+/// document that is itself an `error` event, whose code is its `code`
+/// alone, since its `type` is the event tag. `null`, `{}` and `""` are no
+/// envelope. Whether a frame is an error at all stays its decoder's call.
+fn envelope(doc: &serde_json::Value) -> Option<Envelope<'_>> {
+    use serde_json::Value;
+    const FIELDS: &[&str] = &["code", "status", "type"];
+    let object = |value: &&Value| value.as_object().is_some_and(|fields| !fields.is_empty());
+    if let Some(error) = doc.pointer("/response/error").filter(object) {
+        return Some(Envelope::of(error, FIELDS, true));
+    }
+    match doc.get("error") {
+        Some(error) if object(&error) => Some(Envelope::of(error, FIELDS, true)),
+        Some(error @ Value::String(message)) if !message.is_empty() => {
+            Some(Envelope::of(error, &[], true))
+        }
+        _ => (doc.get("type").and_then(Value::as_str) == Some("error"))
+            .then(|| Envelope::of(doc, &["code"], false)),
+    }
+}
+
+/// The error a body already known to be one carries, for its verdict and
+/// code: where [`envelope`] locates it; in a JSON array (Gemini's non-SSE
+/// stream), the first element that carries one; else the document read as
+/// a bare error object, as a decoder that handed over the inner error
+/// (`{"type":"overloaded_error","message":".."}`) leaves it. A bare error
+/// has a nonempty string `message` and no `error` or `response` of its own,
+/// and its code is its `code`, `status` or `type`.
+fn delivered(doc: &serde_json::Value) -> Option<Envelope<'_>> {
+    if let Some(items) = doc.as_array() {
+        return items.iter().find_map(delivered);
+    }
+    let message = doc.get("message").and_then(serde_json::Value::as_str);
+    let bare = message.is_some_and(|message| !message.is_empty())
+        && doc.get("error").is_none()
+        && doc.get("response").is_none();
+    envelope(doc).or_else(|| bare.then(|| Envelope::of(doc, &["code", "status", "type"], false)))
+}
+
+impl<'a> Envelope<'a> {
+    fn named(mut self, name: &'a str) -> Self {
+        self.name = Some(name);
+        self
+    }
+
+    fn of(error: &'a serde_json::Value, fields: &[&str], nested: bool) -> Self {
+        let values = || fields.iter().filter_map(|field| error.get(field));
+        Self {
+            error: Some(error),
+            name: values().find_map(|value| value.as_str().filter(|name| !name.is_empty())),
+            number: values().find_map(serde_json::Value::as_i64),
+            nested,
+        }
+    }
+
+    /// The name when there is one, as it says more than a number.
+    fn code(&self) -> Option<String> {
+        let number = || self.number.map(|number| number.to_string());
+        self.name.map(str::to_owned).or_else(number)
+    }
+
+    /// The one provider code → retry verdict table, beside
+    /// [`crate::error::retryable_status`]: what the name says, else what
+    /// the number says read as an HTTP status, else nothing. gRPC
+    /// `INTERNAL` stays out, as its transports have always left it.
+    fn verdict(&self) -> Option<bool> {
+        let named = |codes: &[&str]| {
+            let name = self.name.unwrap_or_default();
+            codes.iter().any(|code| code.eq_ignore_ascii_case(name))
+        };
+        let status = || {
+            self.http_status()
+                .map(|s| crate::error::retryable_status(Some(s)))
+        };
+        (named(TRANSIENT).then_some(true))
+            .or_else(|| named(FINAL).then_some(false))
+            .or_else(status)
+    }
+
+    fn http_status(&self) -> Option<u16> {
+        let number = u16::try_from(self.number?).ok();
+        number.filter(|number| (400..=599).contains(number))
+    }
+}
+
+/// An id or model name as a response carries it: an empty one is none.
+pub(crate) fn reported(id: Option<String>) -> Option<String> {
+    id.filter(|id| !id.is_empty())
 }
 
 /// Parses an optional response body as JSON.
 ///
 /// Returns:
 /// - `Ok(Some(value))` when a body is present and valid JSON.
-/// - `Ok(None)` when no body is present.
+/// - `Ok(None)` when the body is absent or empty.
 /// - `Err(error)` when a body is present but isn't valid JSON.
 pub(crate) fn json(body: Option<&str>) -> Result<Option<serde_json::Value>, serde_json::Error> {
     body.filter(|body| !body.is_empty())
         .map(serde_json::from_str)
         .transpose()
 }
-
-/// Preserve the error envelope a decoder read off a **2xx** body.
-///
-/// `body` is the reply's own bytes, verbatim. Never a re-serialization of a
-/// decoded event: re-encoding through `serde_json::Value` normalizes key
-/// order and silently drops every field the decoder's type does not model —
-/// Anthropic's top-level `request_id`, the one field a user quotes to
-/// provider support, is exactly such a field. A preserved provider response
-/// is the provider's response or it is a rendering of one, and only the
-/// former is worth preserving.
-///
-/// No status is attached here, and the name is literal rather than a
-/// shortfall: the decoder was handed a frame, not a reply, so it has none.
-/// On a unary call [`crate::driver::call`] decorates the fold failure with
-/// the reply's status, which is how a consumer ends up reading `Some(200)`
-/// off a 2xx envelope. A streamed reply is deliberately left alone — a
-/// preserved in-band error's status is the *classification* a wire read
-/// off the body there (Gemini's `error.code`), and stamping the transport's
-/// 200 over it would both overwrite that and flip a refusal's retry
-/// verdict.
-///
-/// A *non-success* reply never reaches this funnel: the transport rejects
-/// it before any frame is decoded, and it arrives as `ProviderResponse`
-/// with its own status already set.
-pub(crate) fn completion_error_from_body(
-    body: impl Into<String>,
-) -> crate::completion::CompletionError {
-    crate::completion::CompletionError::ProviderResponse(ProviderResponseError::without_status(
-        body,
-    ))
-}
-
-/// Implements the `provider_response_*` inspection helpers on a capability error
-/// enum.
-///
-/// The enum must have a `ProviderResponse(`[`ProviderResponseError`]`)` variant
-/// and an `HttpError(`[`http_client::Error`](crate::http_client::Error)`)`
-/// variant; the generated helpers read from those two sources only, since they
-/// are the only ones that genuinely represent a provider's response.
-macro_rules! impl_provider_response_helpers {
-    ($error:ty) => {
-        impl $error {
-            /// Builds an error from a captured HTTP status and raw response
-            /// body: the one funnel every HTTP-error path uses.
-            ///
-            /// The body is the provider's own reply — a 2xx error envelope or
-            /// a non-success response — so it is preserved verbatim as
-            /// [`Self::ProviderResponse`] with its status, whatever the
-            /// status is. Stamp transport metadata with
-            /// [`Self::with_provider_request_id`] and
-            /// [`Self::with_response_headers`]. A transport failure that
-            /// never produced a provider reply is [`Self::HttpError`]; a
-            /// transport that reported the reply as an error goes through
-            /// [`Self::from_transport_error`]. Read the response body exactly
-            /// once and hand it here.
-            pub fn from_http_response(status: http::StatusCode, body: impl Into<String>) -> Self {
-                Self::ProviderResponse($crate::provider_response::ProviderResponseError::new(
-                    status, body,
-                ))
-            }
-
-            /// Routes a transport error. A non-success response the
-            /// transport reported as an error — status, body and headers in
-            /// hand — is the provider's reply and becomes
-            /// [`Self::ProviderResponse`]; a response-less failure stays
-            /// [`Self::HttpError`] and never carries a status. This is the
-            /// `From<http_client::Error>` conversion, so a `?` on a transport
-            /// call classifies like an explicit funnel call.
-            pub fn from_transport_error(error: $crate::http_client::Error) -> Self {
-                match error {
-                    $crate::http_client::Error::InvalidStatusCodeWithDetails {
-                        status,
-                        body,
-                        headers,
-                    } => {
-                        Self::from_http_response(status, body).with_response_headers(Some(headers))
-                    }
-                    other => Self::HttpError(other),
-                }
-            }
-
-            /// Attaches the provider's transport request id (rig#2314) to a
-            /// preserved provider response. A slot already filled keeps the
-            /// id that saw the response; no other variant has a slot, so
-            /// those pass through untouched.
-            pub fn with_provider_request_id(self, provider_request_id: Option<String>) -> Self {
-                match self {
-                    Self::ProviderResponse(response) if response.provider_request_id.is_none() => {
-                        Self::ProviderResponse(
-                            response.with_provider_request_id(provider_request_id),
-                        )
-                    }
-                    other => other,
-                }
-            }
-
-            /// Attaches the response's headers to a preserved provider
-            /// response, so rate-limit metadata (`Retry-After`,
-            /// `x-ratelimit-*`) survives onto it (rig#2210). Passing `None`
-            /// leaves the error untouched, as does calling this on a variant
-            /// with no response to annotate. An error that already captured
-            /// headers keeps the ones it has: the first capture is the one
-            /// that saw the response, so this never overwrites.
-            pub fn with_response_headers(self, headers: Option<http::HeaderMap>) -> Self {
-                let Some(headers) = headers else {
-                    return self;
-                };
-                match self {
-                    Self::ProviderResponse(response) if response.headers.is_none() => {
-                        Self::ProviderResponse(response.with_headers(Some(headers)))
-                    }
-                    other => other,
-                }
-            }
-
-            /// Attaches the HTTP status a transport reported beside a reply
-            /// preserved without one (an SDK that carries the raw response
-            /// next to its typed exception), so the reply classifies by its
-            /// status like any HTTP reply; other variants pass through, and
-            /// a status already captured is kept.
-            pub fn with_provider_status(self, status: Option<http::StatusCode>) -> Self {
-                match self {
-                    Self::ProviderResponse(response) => {
-                        Self::ProviderResponse(response.with_status(status))
-                    }
-                    other => other,
-                }
-            }
-
-            /// Attaches the provider's own machine-readable code for the
-            /// failure (a gRPC status code name, an AWS exception type) to
-            /// a preserved provider response; other variants pass through.
-            pub fn with_provider_code(self, code: Option<String>) -> Self {
-                match self {
-                    Self::ProviderResponse(response) => {
-                        Self::ProviderResponse(response.with_code(code))
-                    }
-                    other => other,
-                }
-            }
-
-            /// Attaches the transport's own retry verdict to a preserved
-            /// provider response that has no HTTP status (gRPC, SDK
-            /// transports), so [`ProviderResponseError::is_retryable`]
-            /// has an answer beyond the status table; other variants pass
-            /// through.
-            ///
-            /// [`ProviderResponseError::is_retryable`]: $crate::provider_response::ProviderResponseError::is_retryable
-            pub fn with_transient(self, transient: Option<bool>) -> Self {
-                match self {
-                    Self::ProviderResponse(response) => {
-                        Self::ProviderResponse(response.with_transient(transient))
-                    }
-                    other => other,
-                }
-            }
-
-            /// Whether the same request may reasonably be retried: a
-            /// response-less transport failure by what it is
-            /// ([`transient_transport`]), a provider's reply by its status
-            /// or, without one, by the transport's own verdict
-            /// ([`ProviderResponseError::is_retryable`]); every other
-            /// variant is a fault in the request or the response and is
-            /// not retried.
-            ///
-            /// A variant added to the enum defaults to "not retried": adding
-            /// one is the moment to decide whether it belongs here.
-            ///
-            /// [`transient_transport`]: $crate::error::transient_transport
-            /// [`ProviderResponseError::is_retryable`]: $crate::provider_response::ProviderResponseError::is_retryable
-            pub fn is_retryable(&self) -> bool {
-                match self {
-                    Self::HttpError(error) => $crate::error::transient_transport(error),
-                    Self::ProviderResponse(response) => response.is_retryable(),
-                    _ => false,
-                }
-            }
-
-            /// Preserves a raw provider error body that has **no HTTP status**.
-            ///
-            /// Use this for non-HTTP transports (gRPC / SDK clients such as AWS
-            /// Bedrock, Vertex AI, or the gRPC Gemini client) where the provider
-            /// returns an error payload but no [`http::StatusCode`] is available.
-            /// The body is preserved as [`Self::ProviderResponse`] with
-            /// `status == None`, so [`Self::provider_response_body`] still surfaces
-            /// it while [`Self::provider_response_status`] returns `None`.
-            pub fn from_provider_body(body: impl Into<String>) -> Self {
-                Self::ProviderResponse(
-                    $crate::provider_response::ProviderResponseError::without_status(body),
-                )
-            }
-
-            /// Returns the raw provider response body when available.
-            ///
-            /// This is available for `Self::ProviderResponse`, using its
-            /// preserved body.
-            ///
-            /// Returns `None` for any other variant — for example a Rig-generated
-            /// `ProviderError` diagnostic, or a response-less transport failure. An empty preserved body is
-            /// reported as `Some("")` (the provider returned no payload), which is
-            /// distinct from `None`; note that [`Self::provider_response_json`]
-            /// maps that same empty body to `Ok(None)`.
-            pub fn provider_response_body(&self) -> Option<&str> {
-                match self {
-                    Self::ProviderResponse(response) => Some(response.body.as_str()),
-                    _ => None,
-                }
-            }
-
-            /// Parses the provider response body as JSON.
-            ///
-            /// Returns:
-            /// - `Ok(Some(value))` when a body is present and valid JSON.
-            /// - `Ok(None)` when no provider response body is available.
-            /// - `Err(error)` when a body is present but isn't valid JSON.
-            pub fn provider_response_json(
-                &self,
-            ) -> Result<Option<serde_json::Value>, serde_json::Error> {
-                $crate::provider_response::json(self.provider_response_body())
-            }
-
-            /// Returns the HTTP status code when this error preserves one, either
-            /// from a non-success HTTP response, from a preserved provider
-            /// response, or from a 2xx error envelope.
-            ///
-            /// **Warning:** this can return a **2xx** status. Some providers send
-            /// an error envelope alongside a success status, which Rig preserves
-            /// via [`Self::ProviderResponse`]. Callers must not infer failure from
-            /// the status code alone — the existence of this error already means
-            /// the call failed. Returns `None` for non-HTTP transports (gRPC / SDK
-            /// clients) and for variants that carry no provider response.
-            pub fn provider_response_status(&self) -> Option<http::StatusCode> {
-                match self {
-                    Self::ProviderResponse(response) => response.status,
-                    _ => None,
-                }
-            }
-
-            /// Returns the provider's transport request id for the failed
-            /// call, when the capture path preserved one (rig#2314) — the id
-            /// provider support asks for. `None` for providers that report
-            /// none, for paths that captured no transport metadata, and for
-            /// errors with no provider response at all.
-            pub fn provider_request_id(&self) -> Option<&str> {
-                match self {
-                    Self::ProviderResponse(response) => response.provider_request_id.as_deref(),
-                    _ => None,
-                }
-            }
-
-            /// Returns the response's headers when the capture path preserved
-            /// them (rig#2210) — the rate-limit metadata (`Retry-After`,
-            /// `x-ratelimit-*`) a caller needs to back off correctly:
-            ///
-            /// ```no_run
-            /// # use rig_core::completion::CompletionError;
-            /// # use std::time::Duration;
-            /// fn backoff(error: &CompletionError) -> Option<Duration> {
-            ///     let seconds = error
-            ///         .provider_response_headers()?
-            ///         .get(http::header::RETRY_AFTER)?
-            ///         .to_str()
-            ///         .ok()?
-            ///         .parse()
-            ///         .ok()?;
-            ///     Some(Duration::from_secs(seconds))
-            /// }
-            /// ```
-            ///
-            /// Returns `None` when no headers were captured: non-HTTP
-            /// transports (gRPC / SDK clients), Rig-generated diagnostics,
-            /// and errors funnelled from only a status and body (e.g. via
-            /// [`Self::from_http_response`]). `None` therefore means "not
-            /// captured", never "the response had no headers".
-            pub fn provider_response_headers(&self) -> Option<&http::HeaderMap> {
-                match self {
-                    Self::ProviderResponse(response) => response.headers.as_ref(),
-                    _ => None,
-                }
-            }
-        }
-    };
-}
-
-pub(crate) use impl_provider_response_helpers;
-
-/// Implements the shared response-metadata setters (`with_message_id`,
-/// `with_response_id`, `with_provider_request_id`, `with_model`, `with_raw`
-/// and their `_optional` forms) on a response type with `message_id`,
-/// `response_id`, `provider_request_id`, and `model` fields of type
-/// `Option<String>` and a `raw` field of type `serde_json::Value`.
-///
-/// An empty string is treated as absent: gateways that echo `""` for fields
-/// they don't populate must not produce a `Some("")` that differs between the
-/// buffered and streaming paths. The invariant lives in these generated
-/// setters so no provider call site can diverge. `finish_reason` handling is
-/// intentionally left to each type, since reconciliation rules differ.
-///
-/// `raw` is not an identifier, but it belongs here for the same reason the
-/// identifiers do: it is per-attempt metadata that both surfaces observe —
-/// the unary response and the streaming terminal record carry the same field
-/// with the same meaning, populated at the provider seams from one setter, so
-/// neither surface can grow a variant the other lacks.
-macro_rules! response_metadata_setters {
-    ($ty:ty) => {
-        impl $ty {
-            /// Attach the provider-assigned message ID.
-            ///
-            /// An empty string is treated as absent: gateways that echo `""`
-            /// for fields they don't populate must not produce a `Some("")`
-            /// that differs between the buffered and streaming paths. All
-            /// identifier and model setters share this rule so the invariant
-            /// lives here rather than at every provider call site.
-            pub fn with_message_id(self, message_id: impl Into<String>) -> Self {
-                self.with_optional_message_id(Some(message_id.into()))
-            }
-
-            /// Attach the provider-assigned message ID when the provider
-            /// reported one.
-            pub fn with_optional_message_id(
-                mut self,
-                message_id: Option<impl Into<String>>,
-            ) -> Self {
-                self.message_id = message_id.map(Into::into).filter(|id| !id.is_empty());
-                self
-            }
-
-            /// Attach the provider-assigned response-scoped ID.
-            pub fn with_response_id(self, response_id: impl Into<String>) -> Self {
-                self.with_optional_response_id(Some(response_id.into()))
-            }
-
-            /// Attach the provider-assigned response-scoped ID when the
-            /// provider reported one.
-            pub fn with_optional_response_id(
-                mut self,
-                response_id: Option<impl Into<String>>,
-            ) -> Self {
-                self.response_id = response_id.map(Into::into).filter(|id| !id.is_empty());
-                self
-            }
-
-            /// Attach the provider's transport-level request identifier.
-            pub fn with_provider_request_id(self, request_id: impl Into<String>) -> Self {
-                self.with_optional_provider_request_id(Some(request_id.into()))
-            }
-
-            /// Attach the provider's transport-level request identifier when
-            /// the provider reported one.
-            pub fn with_optional_provider_request_id(
-                mut self,
-                request_id: Option<impl Into<String>>,
-            ) -> Self {
-                self.provider_request_id = request_id.map(Into::into).filter(|id| !id.is_empty());
-                self
-            }
-
-            /// Attach the provider-reported model identifier.
-            ///
-            /// An empty string is treated as absent, matching the identifier
-            /// setters.
-            pub fn with_model(self, model: impl Into<String>) -> Self {
-                self.with_optional_model(Some(model.into()))
-            }
-
-            /// Attach the provider-reported model identifier when the
-            /// response carried one.
-            pub fn with_optional_model(mut self, model: Option<impl Into<String>>) -> Self {
-                self.model = model.map(Into::into).filter(|model| !model.is_empty());
-                self
-            }
-
-            /// Attach the provider's own response, serialized — the value the
-            /// model's inherent raw method would have returned. Every provider
-            /// seam calls this; see the `raw` field for the exact meaning of
-            /// the payload (and of `Value::Null`).
-            pub fn with_raw(mut self, raw: impl Into<serde_json::Value>) -> Self {
-                self.raw = raw.into();
-                self
-            }
-        }
-    };
-}
-
-pub(crate) use response_metadata_setters;
-/// Metadata setters for the normalized non-completion modality responses
-/// (transcription, image generation, audio generation). Same empty-string
-/// filtering rule as [`response_metadata_setters`]; these responses carry no
-/// message-scoped ID because nothing they produce is ever replayed as an
-/// assistant message.
-macro_rules! modality_response_metadata_setters {
-    ($ty:ty) => {
-        impl $ty {
-            /// Attach the provider-assigned response-scoped ID.
-            pub fn with_response_id(self, response_id: impl Into<String>) -> Self {
-                self.with_optional_response_id(Some(response_id.into()))
-            }
-
-            /// Attach the provider-assigned response-scoped ID when the
-            /// provider reported one. An empty string is treated as absent.
-            pub fn with_optional_response_id(
-                mut self,
-                response_id: Option<impl Into<String>>,
-            ) -> Self {
-                self.response_id = response_id.map(Into::into).filter(|id| !id.is_empty());
-                self
-            }
-
-            /// Attach the provider's transport-level request identifier.
-            pub fn with_provider_request_id(self, request_id: impl Into<String>) -> Self {
-                self.with_optional_provider_request_id(Some(request_id.into()))
-            }
-
-            /// Attach the provider's transport-level request identifier when
-            /// the provider reported one. An empty string is treated as absent.
-            pub fn with_optional_provider_request_id(
-                mut self,
-                request_id: Option<impl Into<String>>,
-            ) -> Self {
-                self.provider_request_id = request_id.map(Into::into).filter(|id| !id.is_empty());
-                self
-            }
-
-            /// Attach the provider-reported model identifier.
-            pub fn with_model(self, model: impl Into<String>) -> Self {
-                self.with_optional_model(Some(model.into()))
-            }
-
-            /// Attach the provider-reported model identifier when the
-            /// response carried one. An empty string is treated as absent.
-            pub fn with_optional_model(mut self, model: Option<impl Into<String>>) -> Self {
-                self.model = model.map(Into::into).filter(|model| !model.is_empty());
-                self
-            }
-
-            /// Attach the usage the provider reported.
-            pub fn with_usage(mut self, usage: $crate::completion::Usage) -> Self {
-                self.usage = usage;
-                self
-            }
-
-            /// Attach the provider's own response, serialized — the value the
-            /// model's inherent raw method would have returned.
-            pub fn with_raw(mut self, raw: impl Into<serde_json::Value>) -> Self {
-                self.raw = raw.into();
-                self
-            }
-        }
-    };
-}
-pub(crate) use modality_response_metadata_setters;
-
-/// Declares a capability error enum with the shared core variants
-/// (`HttpError`, `JsonError`, `ResponseError`, `ProviderError`,
-/// `ProviderResponse`) and wires up [`impl_provider_response_helpers!`] for
-/// it, so the five modality errors stay structurally identical.
-///
-/// `$noun` names the capability in the generated docs (e.g. `"transcription"`
-/// → "Error returned by the transcription model provider"). The first brace
-/// block is spliced between `JsonError` and `ResponseError` (request-building
-/// and URL errors live there); the optional second block is spliced before
-/// `ProviderError` for capability-specific variants.
-macro_rules! provider_error_enum {
-    (
-        $(#[$extra_doc:meta])*
-        $name:ident, $noun:literal {
-            $($mid_variants:tt)*
-        }
-        $({ $($late_variants:tt)* })?
-    ) => {
-        #[doc = concat!("Errors returned by ", $noun, " models.")]
-        ///
-        /// Inspect provider failures with [`Self::provider_response_body`],
-        /// [`Self::provider_response_json`], and [`Self::provider_response_status`].
-        $(#[$extra_doc])*
-        #[derive(Debug, thiserror::Error)]
-        pub enum $name {
-            /// A transport failure that produced no provider reply (a
-            /// connection error, a timeout, a status reported without a
-            /// body); a reply with a body is [`Self::ProviderResponse`].
-            #[error("HttpError: {0}")]
-            HttpError($crate::http_client::Error),
-
-            /// Json error (e.g.: serialization, deserialization)
-            #[error("JsonError: {0}")]
-            JsonError(#[from] serde_json::Error),
-
-            $($mid_variants)*
-
-            #[doc = concat!("Error parsing the ", $noun, " response")]
-            #[error("ResponseError: {0}")]
-            ResponseError(String),
-
-            $($($late_variants)*)?
-
-            #[doc = concat!("Error returned by the ", $noun, " model provider")]
-            #[error("ProviderError: {0}")]
-            ProviderError(String),
-
-            #[doc = concat!("Raw error response preserved from the ", $noun, " model provider")]
-            #[error("ProviderResponseError: {0}")]
-            ProviderResponse($crate::provider_response::ProviderResponseError),
-        }
-
-        $crate::provider_response::impl_provider_response_helpers!($name);
-        $crate::wire::impl_wire_error!($name);
-
-        impl From<$crate::http_client::Error> for $name {
-            fn from(error: $crate::http_client::Error) -> Self {
-                Self::from_transport_error(error)
-            }
-        }
-    };
-}
-
-pub(crate) use provider_error_enum;
 
 #[cfg(test)]
 mod tests;

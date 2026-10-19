@@ -36,10 +36,6 @@ fn qualified_matrix_invocations_in_modules_claim_only_recorded_rows() {
                 #[tokio::test] first: ("first", CELL, "first_golden");
                 #[tokio::test] #[ignore = "unrecorded"] ignored: ("absent", CELL, "absent_golden");
             }
-            crate::matrix::resume_matrix! {
-                wrapper: with_cassette, wire: wire, run: run;
-                #[tokio::test] resume: ("first", CELL, Some(1), oracle);
-            }
             crate::matrix::case_matrix! {
                 family: wire_matrix_case;
                 #[tokio::test] scripted: truncated_after_text;
@@ -53,7 +49,7 @@ fn qualified_matrix_invocations_in_modules_claim_only_recorded_rows() {
     "#;
     assert_eq!(
         cassette_scenarios(source, WRAPPERS).expect("matrix rows"),
-        ["first", "first", "tools"]
+        ["first", "tools"]
     );
 }
 
@@ -75,7 +71,6 @@ fn comments_strings_and_macro_definitions_are_not_invocations() {
 fn malformed_matrix_rows_fail_instead_of_vanishing() {
     for source in [
         "golden_matrix! { wrapper: with_cassette, wire: wire, run: run, oracle: golden; #[tokio::test] a: (dynamic(), CELL, \"golden\"); }",
-        "resume_matrix! { wrapper: with_cassette, wire: wire, run: run; a: (\"scenario\", CELL, None, golden); }",
         "case_matrix! { family: wire_matrix_case; missing_attribute: truncation; }",
         "case_matrix! { wrapper: with_cassette, family: family; #[tokio::test] a: (\"a\", row); #[tokio::test] a: (\"b\", row); }",
     ] {
@@ -84,4 +79,63 @@ fn malformed_matrix_rows_fail_instead_of_vanishing() {
             "accepted {source}"
         );
     }
+}
+
+#[test]
+fn sites_keep_the_wrapper_and_the_specs_declarations() {
+    let source = r#"
+        async fn cells() {
+            with_x_cassette("plain/cell", |c| async {}).await;
+            with_x_bogus_key(
+                CassetteSpec::new("auth/cell")
+                    .unordered()
+                    .expects_account_failure(crate::cassettes::AccountFailure::Auth),
+                |c| async {},
+            )
+            .await;
+        }
+    "#;
+    let sites = cassette_scenario_sites(source, &["with_x_cassette", "with_x_bogus_key"])
+        .expect("sites parse");
+    assert_eq!(
+        sites,
+        [
+            ScenarioSite {
+                scenario: "plain/cell".into(),
+                wrapper: "with_x_cassette".into(),
+                declared: Vec::new(),
+            },
+            ScenarioSite {
+                scenario: "auth/cell".into(),
+                wrapper: "with_x_bogus_key".into(),
+                declared: vec!["Auth".into()],
+            },
+        ]
+    );
+}
+
+#[test]
+fn a_wrapper_declares_through_its_session() {
+    let source = r#"
+        async fn with_x_bogus_key() {
+            let cassette = ProviderCassette::start(root, "x", spec, url).await;
+            cassette.expect_account_failure(crate::cassettes::AccountFailure::Auth);
+        }
+        async fn with_x_rejected_key() {
+            let cassette = ProviderCassette::start(root, "x", spec, url).await;
+            let key = cassette.bogus_api_key();
+        }
+        async fn with_x_cassette() {
+            let cassette = ProviderCassette::start(root, "x", spec, url).await;
+            let key = cassette.api_key("X_API_KEY");
+        }
+    "#;
+    let declaring = declaring_functions(source).expect("declarations parse");
+    assert_eq!(
+        declaring,
+        [
+            ("with_x_bogus_key".to_owned(), vec!["Auth".to_owned()]),
+            ("with_x_rejected_key".to_owned(), vec!["Auth".to_owned()]),
+        ]
+    );
 }

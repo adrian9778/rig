@@ -1,63 +1,45 @@
-//! Native-only body of `rig-rmcp` (see the crate root for why).
+//! Native MCP calls, metadata preservation, and dynamic tool conversion.
+//!
+//! ```
+//! use rig_rmcp::McpMeta;
+//! use rig_rmcp::rmcp::model::RequestMetaObject;
+//!
+//! let metadata = McpMeta(RequestMetaObject::new());
+//! ```
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use rmcp::model::{
-    CallToolRequest, CallToolResult, ClientRequest, ContentBlock, ResourceContents, ServerResult,
+    CallToolRequest, CallToolResult, ClientRequest, ContentBlock, JsonObject, RequestMetaObject,
+    ResourceContents, ServerResult,
 };
-use rmcp::service::PeerRequestOptions;
+use rmcp::service::{PeerRequestOptions, ServerSink};
 
-use rig_core::message::{ImageMediaType, MimeType, ToolResultContent};
+use rig_core::message::{EmptyToolName, ImageMediaType, MimeType, ToolName, ToolResultContent};
 use rig_core::tool::{
-    ContextValue, PortableDynamicTool, ToolContext, ToolContextError, ToolExecutionError,
-    ToolOutput,
+    ContextValue, DynamicTool, ToolContext, ToolContextError, ToolExecutionError, ToolOutput,
 };
-use rig_core::wasm_compat::WasmBoxedFuture;
 
-/// Re-export of [`rmcp::model::Meta`]: wrap one in [`McpMeta`] and place it
-/// in the per-call [`ToolContext`] to have MCP tools forward it as the
-/// request's `_meta`.
-pub use rmcp::model::Meta;
+use crate::McpConnection;
 
 /// The request `_meta` a caller places in the [`ToolContext`] for an MCP
 /// tool, forwarded as the call's `_meta` (SEP-1319). A newtype because the
-/// context stores values under declared keys and `rmcp::model::Meta` is
+/// context stores values under declared keys and `RequestMetaObject` is
 /// not this crate's to implement [`ContextValue`] for.
 #[derive(
     Debug, Clone, Default, PartialEq, rig_core::serde::Serialize, rig_core::serde::Deserialize,
 )]
 #[serde(crate = "rig_core::serde", transparent)]
-pub struct McpMeta(pub Meta);
+pub struct McpMeta(pub RequestMetaObject);
 
 impl ContextValue for McpMeta {
     const KEY: &'static str = "rmcp.meta";
 }
 
-/// The `structuredContent` an MCP tool answered with, on the context's
-/// result map for result hooks.
-#[derive(Debug, Clone, PartialEq, rig_core::serde::Serialize, rig_core::serde::Deserialize)]
-#[serde(crate = "rig_core::serde", transparent)]
-pub struct McpStructuredContent(pub serde_json::Value);
-
-impl ContextValue for McpStructuredContent {
-    const KEY: &'static str = "rmcp.structured_content";
-}
-
-/// The response `_meta` an MCP tool answered with, on the context's result
-/// map for result hooks.
-#[derive(
-    Debug, Clone, Default, PartialEq, rig_core::serde::Serialize, rig_core::serde::Deserialize,
-)]
-#[serde(crate = "rig_core::serde", transparent)]
-pub struct McpResponseMeta(pub Meta);
-
-impl ContextValue for McpResponseMeta {
-    const KEY: &'static str = "rmcp.response_meta";
-}
-
 /// The untouched [`CallToolResult`], on the context's result map for
-/// result hooks.
+/// result hooks: its `structured_content` and `meta` are the response's
+/// `structuredContent` and `_meta`. Host-visible, not sent to the model.
 #[derive(Debug, Clone, PartialEq, rig_core::serde::Serialize, rig_core::serde::Deserialize)]
 #[serde(crate = "rig_core::serde", transparent)]
 pub struct McpCallToolResult(pub CallToolResult);
@@ -66,13 +48,23 @@ impl ContextValue for McpCallToolResult {
     const KEY: &'static str = "rmcp.call_tool_result";
 }
 
-/// Default per-call timeout applied to MCP tools (see issue #1914).
-///
-/// MCP tool calls await a response that can be silently lost by the transport
-/// (e.g. an rmcp StreamableHttp session re-init dropping an in-flight request),
-/// which would otherwise hang the agent forever. A generous default bounds that
-/// without disrupting normal, long-running tools. The agent and tool-server
-/// `rmcp_tool_with_timeout` builders can override or disable it.
+/// One MCP tool call the model chose, as a [`McpTool::with_call_meta`]
+/// function sees it before the request is sent.
+#[non_exhaustive]
+pub struct McpToolCall<'a> {
+    /// The tool's MCP name, the one sent to the server.
+    pub tool: &'a str,
+    /// The exact arguments sent to the server, after any hook rewrites.
+    pub arguments: Option<&'a JsonObject>,
+    /// The call's context.
+    pub context: &'a ToolContext,
+}
+
+/// Derives request `_meta` from one tool call; see [`McpTool::with_call_meta`].
+pub(crate) type CallMetaFn =
+    Arc<dyn Fn(&McpToolCall<'_>) -> Option<RequestMetaObject> + Send + Sync>;
+
+/// Default MCP tool-call deadline, overridable through [`McpTool::with_timeout`].
 pub const DEFAULT_MCP_TOOL_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// Default deadline for fetching an MCP server's complete tool list.
@@ -85,52 +77,80 @@ pub const DEFAULT_MCP_REFRESH_TIMEOUT: Duration = Duration::from_secs(30);
 /// has already exceeded its caller-visible deadline.
 const MCP_CANCELLATION_GRACE_PERIOD: Duration = Duration::from_secs(1);
 
-/// One MCP server tool, callable through an rmcp [`ServerSink`](rmcp::service::ServerSink).
+/// One MCP server tool.
 ///
-/// Construct with [`McpTool::from_mcp_server`] (or [`tools_from_server`] for a
-/// whole list). Use it as a rig-core [`PortableDynamicTool`] via `From`, or —
-/// with the `agent` feature — register it directly in rig-agent's tool server
-/// (it implements rig-core's contextual `ErasedTool`, which additionally
-/// forwards MCP `_meta` from the `ToolContext` and preserves the raw result).
+/// Build it with [`Self::new`] or [`McpConnection::tools`]. A tool keeps its
+/// [`McpConnection`] open, so registering it is enough to keep it usable.
+/// Conversion to [`DynamicTool`] forwards [`McpMeta`] from context, publishes
+/// raw results, and binds a transport liveness probe.
 #[derive(Clone)]
 pub struct McpTool {
     pub(crate) definition: rmcp::model::Tool,
-    pub(crate) client: rmcp::service::ServerSink,
-    /// Per-call timeout. When `Some`, an MCP `call_tool` that does not complete
-    /// within this duration resolves to a [`ToolExecutionError`] instead of blocking
-    /// forever (see issue #1914). When `None`, the call is unbounded.
-    ///
-    /// On elapse RMCP sends a cancellation notification so both peers can
-    /// release request-scoped resources.
+    /// The model-visible name, when it differs from the MCP name.
+    pub(crate) name: Option<ToolName>,
+    pub(crate) peer: ServerSink,
+    /// Keeps a directly built tool's connection open. Tools a
+    /// [`McpClientHandler`](crate::McpClientHandler) manages leave it to the
+    /// connection its `connect` returns, which owns them through the sink.
+    pub(crate) _connection: Option<McpConnection>,
+    /// Optional per-call deadline. Timeout triggers best-effort cancellation
+    /// for requests with an acquired handle; `None` leaves calls unbounded.
     pub(crate) timeout: Option<Duration>,
+    pub(crate) call_meta: Option<CallMetaFn>,
 }
 
 impl McpTool {
-    /// Create an adapter from an MCP tool definition and server sink.
-    ///
-    /// Applies [`DEFAULT_MCP_TOOL_TIMEOUT`] so a lost/never-answered response
-    /// cannot hang the agent forever (issue #1914).
-    pub fn from_mcp_server(
-        definition: rmcp::model::Tool,
-        client: rmcp::service::ServerSink,
-    ) -> Self {
+    /// The tool `definition` of the server behind `connection`, which the
+    /// tool keeps open. Applies [`DEFAULT_MCP_TOOL_TIMEOUT`].
+    pub fn new(definition: rmcp::model::Tool, connection: &McpConnection) -> Self {
+        Self {
+            _connection: Some(connection.clone()),
+            ..Self::managed(definition, connection.peer().clone())
+        }
+    }
+
+    /// A tool whose connection someone else keeps open.
+    pub(crate) fn managed(definition: rmcp::model::Tool, peer: ServerSink) -> Self {
         Self {
             definition,
-            client,
+            name: None,
+            peer,
+            _connection: None,
             timeout: Some(DEFAULT_MCP_TOOL_TIMEOUT),
+            call_meta: None,
         }
+    }
+
+    /// Offer the tool to the model as `name`. Calls still send the server
+    /// the tool's MCP name, so one server's tools can be namespaced or two
+    /// servers' same-named tools told apart.
+    #[must_use = "the setting applies to the returned value"]
+    pub fn with_name(mut self, name: ToolName) -> Self {
+        self.name = Some(name);
+        self
     }
 
     /// Set (or clear) the per-call timeout, consuming and returning the tool.
     ///
     /// Pass a [`Duration`] to bound calls, or `None` to make them unbounded.
-    /// On timeout the call resolves to a [`ToolExecutionError`] (which the agent loop
-    /// surfaces to the model as a tool result, so the agent can recover rather
-    /// than hang). RMCP sends a cancellation notification when the deadline
-    /// elapses.
+    /// Timeout returns [`ToolExecutionError`] and attempts cancellation when a
+    /// request handle is available. Remote cancellation is not guaranteed.
     #[must_use = "the setting applies to the returned value"]
     pub fn with_timeout(mut self, timeout: impl Into<Option<Duration>>) -> Self {
         self.timeout = timeout.into();
+        self
+    }
+
+    /// Derive request `_meta` from each call, for values bound to the chosen
+    /// arguments such as a signature or an idempotency key. The entries `meta`
+    /// returns are added over the context's [`McpMeta`], replacing keys both set.
+    /// The model sees neither.
+    #[must_use = "the setting applies to the returned value"]
+    pub fn with_call_meta<F>(mut self, meta: F) -> Self
+    where
+        F: Fn(&McpToolCall<'_>) -> Option<RequestMetaObject> + Send + Sync + 'static,
+    {
+        self.call_meta = Some(Arc::new(meta));
         self
     }
 
@@ -143,17 +163,19 @@ impl McpTool {
     pub fn definition(&self) -> &rmcp::model::Tool {
         &self.definition
     }
+
+    /// The name the model sees: the one set by [`Self::with_name`], or the MCP name.
+    pub fn name(&self) -> &str {
+        self.name
+            .as_ref()
+            .map_or(&self.definition.name, ToolName::as_str)
+    }
 }
 
-/// Parse the JSON `args` string into MCP call arguments.
-///
-/// Argument decoding failure at the MCP object boundary.
+/// Valid JSON that cannot be represented by MCP's object-valued arguments.
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum McpArgumentError {
-    /// Malformed JSON.
-    #[error("invalid JSON: {0}")]
-    Json(#[from] serde_json::Error),
-    /// Valid JSON that cannot be represented by MCP's object-valued arguments.
+    /// The JSON kind given instead of an object or null.
     #[error("expected a JSON object or null, got {0}")]
     NonObject(&'static str),
 }
@@ -169,27 +191,22 @@ pub(crate) fn json_value_kind(value: &serde_json::Value) -> &'static str {
     }
 }
 
-/// Returns no argument map for empty input or explicit JSON `null`, and an MCP
-/// argument map for a JSON object. Other valid JSON shapes are rejected: silently
-/// turning an array or scalar into a no-argument request can execute a different
-/// operation than the model requested.
-pub(crate) fn parse_mcp_arguments(
-    args: &str,
-) -> Result<Option<rmcp::model::JsonObject>, McpArgumentError> {
-    let trimmed = args.trim();
-    if trimmed.is_empty() {
-        return Ok(None);
-    }
-    let value: serde_json::Value = serde_json::from_str(trimmed)?;
+/// Returns no argument map for explicit JSON `null`, and an MCP argument map
+/// for a JSON object. Other shapes are rejected: silently turning an array or
+/// scalar into a no-argument request can execute a different operation than
+/// the model requested.
+pub(crate) fn mcp_arguments(
+    value: serde_json::Value,
+) -> Result<Option<JsonObject>, McpArgumentError> {
     match value {
         serde_json::Value::Null => Ok(None),
-        serde_json::Value::Object(_) => Ok(Some(serde_json::from_value(value)?)),
+        serde_json::Value::Object(arguments) => Ok(Some(arguments)),
         value => Err(McpArgumentError::NonObject(json_value_kind(&value))),
     }
 }
 
 pub(crate) async fn call_mcp_tool(
-    peer: &rmcp::service::ServerSink,
+    peer: &ServerSink,
     params: rmcp::model::CallToolRequestParams,
     timeout: Option<Duration>,
 ) -> Result<CallToolResult, rmcp::ServiceError> {
@@ -208,7 +225,7 @@ pub(crate) async fn call_mcp_tool(
 }
 
 pub(crate) async fn send_mcp_request(
-    peer: &rmcp::service::ServerSink,
+    peer: &ServerSink,
     request: ClientRequest,
     deadline: Option<(tokio::time::Instant, Duration)>,
 ) -> Result<ServerResult, rmcp::ServiceError> {
@@ -245,91 +262,84 @@ pub(crate) async fn send_mcp_request(
     }
 }
 
-/// Keep cancellation delivery out of the caller's deadline. RMCP's cancellation
-/// notification uses the same bounded outbound queue as requests, so awaiting it
-/// inline could exceed the timeout precisely when that queue is saturated. The
-/// detached delivery is itself bounded so a stalled transport cannot retain one
-/// task and request handle for every timed-out call indefinitely.
+/// Spawns bounded best-effort cancellation without extending the caller's deadline.
+/// Detaching avoids waiting on a saturated outbound queue; the grace period
+/// bounds retention of the task and request handle. A call made off any tokio
+/// runtime (a host executor of its own) skips the cancel instead of panicking.
 pub(crate) fn cancel_timed_out_request(
     handle: rmcp::service::RequestHandle<rmcp::service::RoleClient>,
 ) {
+    let reason = rmcp::service::RequestHandle::<rmcp::service::RoleClient>::REQUEST_TIMEOUT_REASON;
+    let cancel = handle.cancel(Some(reason.to_owned()));
     let cancellation = async move {
-        bounded_best_effort_cancellation(
-            handle.cancel(Some(
-                rmcp::service::RequestHandle::<rmcp::service::RoleClient>::REQUEST_TIMEOUT_REASON
-                    .to_owned(),
-            )),
-            MCP_CANCELLATION_GRACE_PERIOD,
-        )
-        .await;
+        let _ = rig_core::wasm_compat::timeout(MCP_CANCELLATION_GRACE_PERIOD, cancel).await;
     };
 
-    // This crate is native-only (see the `compile_error!` at the crate root), so
-    // there is no `spawn_local` branch to pick: `tokio::spawn` is always right
-    // here.
-    tokio::spawn(cancellation);
-}
-
-pub(crate) async fn bounded_best_effort_cancellation(
-    cancellation: impl std::future::Future<Output = Result<(), rmcp::ServiceError>>,
-    grace_period: Duration,
-) {
-    let _ = rig_core::wasm_compat::timeout(grace_period, cancellation).await;
+    // Native-only compilation permits a Send cancellation task.
+    if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+        runtime.spawn(cancellation);
+    }
 }
 
 impl McpTool {
-    /// Execute one MCP request.
-    ///
-    /// `meta`, when present, is attached as the MCP request's `_meta`
-    /// (SEP-1319) — the idiomatic channel for per-call metadata such as auth
-    /// tokens, session ids, or A2A `context_id`/`task_id`. It is supplied by a
-    /// caller that places an [`rmcp::model::Meta`] into the per-call
-    /// [`ToolContext`]; otherwise the call behaves exactly as before.
-    pub fn execute_mcp(
+    fn invalid(&self, error: McpArgumentError) -> ToolExecutionError {
+        ToolExecutionError::invalid_args(format!(
+            "MCP tool '{}' received invalid arguments: {error}",
+            self.definition.name
+        ))
+        .with_source(error)
+    }
+
+    /// The request `_meta` for one call: the context's [`McpMeta`] with the
+    /// [`Self::with_call_meta`] entries over it.
+    fn request_meta(
         &self,
-        args: String,
-        meta: Option<rmcp::model::Meta>,
-    ) -> WasmBoxedFuture<'_, Result<CallToolResult, ToolExecutionError>> {
-        let name = self.definition.name.clone();
+        arguments: Option<&JsonObject>,
+        context: &ToolContext,
+    ) -> Result<Option<RequestMetaObject>, ToolContextError> {
+        let mut meta = context.get::<McpMeta>()?.map(|meta| meta.0);
+        let call = McpToolCall {
+            tool: &self.definition.name,
+            arguments,
+            context,
+        };
+        if let Some(derived) = self.call_meta.as_ref().and_then(|derive| derive(&call)) {
+            meta.get_or_insert_with(RequestMetaObject::new)
+                .0
+                .extend(derived.0);
+        }
+        Ok(meta)
+    }
 
-        Box::pin(async move {
-            // Validate the JSON arguments before contacting the server: malformed
-            // JSON must surface as an InvalidArgs failure, not a silent no-arg call.
-            let arguments = parse_mcp_arguments(&args).map_err(|error| {
-                ToolExecutionError::invalid_args(format!(
-                    "MCP tool '{name}' received invalid arguments: {error}"
-                ))
-                .with_source(error)
-            })?;
-            let mut request = arguments
-                .map(|arguments| {
-                    rmcp::model::CallToolRequestParams::new(name.clone()).with_arguments(arguments)
-                })
-                .unwrap_or_else(|| rmcp::model::CallToolRequestParams::new(name));
-            request.meta = meta;
+    async fn call(
+        &self,
+        arguments: Option<JsonObject>,
+        meta: Option<RequestMetaObject>,
+    ) -> Result<CallToolResult, ToolExecutionError> {
+        let name = &self.definition.name;
+        let mut request = rmcp::model::CallToolRequestParams::new(name.clone());
+        request.arguments = arguments;
+        request.meta = meta;
 
-            match call_mcp_tool(&self.client, request, self.timeout).await {
-                Ok(result) => Ok(result),
-                Err(
-                    error @ rmcp::ServiceError::Timeout {
-                        timeout: elapsed_timeout,
-                    },
-                ) => {
-                    let timeout = self.timeout.unwrap_or(elapsed_timeout);
-                    Err(ToolExecutionError::timeout(format!(
-                        "MCP tool '{}' timed out after {timeout:?}",
-                        self.definition.name
-                    ))
-                    .with_source(error))
-                }
-                // A transport/service error before the tool produced a result.
-                Err(error) => Err(ToolExecutionError::provider(format!(
-                    "MCP tool '{}' request failed: {error}",
-                    self.definition.name
+        match call_mcp_tool(&self.peer, request, self.timeout).await {
+            Ok(result) => Ok(result),
+            Err(
+                error @ rmcp::ServiceError::Timeout {
+                    timeout: elapsed_timeout,
+                },
+            ) => {
+                let timeout = self.timeout.unwrap_or(elapsed_timeout);
+                Err(ToolExecutionError::timeout(format!(
+                    "MCP tool '{name}' timed out after {timeout:?}"
                 ))
-                .with_source(error)),
+                .with_source(error))
             }
-        })
+            // A transport/service error before the tool produced a result.
+            Err(error) => Err(ToolExecutionError::provider(format!(
+                "MCP tool '{name}' request failed: {error}"
+            ))
+            .with_source(error)),
+        }
     }
 }
 
@@ -433,13 +443,8 @@ pub fn mcp_result_output(result: &CallToolResult) -> Result<ToolOutput, ToolExec
         return ToolOutput::content(mapped);
     }
 
-    // A content-less MCP result normalizes to one empty text block. This is
-    // deliberately *not* what the native path does — a native tool returning an
-    // empty `Vec<ToolResultContent>` gets an eager `ToolExecutionError`,
-    // because that shape is the tool author's own type choice and fixable in
-    // one read. An empty MCP result is protocol-legal and outside the caller's
-    // control, so erroring here would fail tools the author cannot fix; the
-    // empty block keeps the result sendable without inventing text.
+    // Empty MCP content is legal; normalize it to sendable text, with a
+    // diagnostic when the tool explicitly reports failure.
     if result.is_error == Some(true) {
         Ok(ToolOutput::text("the MCP tool reported an error"))
     } else {
@@ -447,73 +452,40 @@ pub fn mcp_result_output(result: &CallToolResult) -> Result<ToolOutput, ToolExec
     }
 }
 
-/// Error type for MCP client operations (connection, tool-list fetch).
+/// Error type for MCP client operations: connecting, listing, and reading.
 #[derive(Debug, thiserror::Error)]
 pub enum McpClientError {
     /// Failed to establish the MCP connection or complete the handshake.
     #[error("MCP connection error: {0}")]
-    ConnectionError(String),
+    Connection(#[from] rmcp::service::ClientInitializeError),
 
-    /// Failed to fetch the tool list from the MCP server.
-    #[error("Failed to fetch MCP tool list: {0}")]
-    ToolFetchError(#[from] rmcp::ServiceError),
+    /// An MCP request failed.
+    #[error("MCP request failed: {0}")]
+    Request(#[from] rmcp::ServiceError),
 
-    /// The server did not finish returning its tool list before the deadline.
-    #[error("Timed out fetching MCP tool list after {0:?}")]
-    ToolFetchTimeout(Duration),
-}
-
-/// Wrap every tool of an MCP server's list as an [`McpTool`] sharing one
-/// [`ServerSink`](rmcp::service::ServerSink). Each tool carries the same
-/// [`DEFAULT_MCP_TOOL_TIMEOUT`] as [`McpTool::from_mcp_server`]; override it
-/// per tool with [`McpTool::with_timeout`].
-pub fn tools_from_server(
-    tools: impl IntoIterator<Item = rmcp::model::Tool>,
-    client: &rmcp::service::ServerSink,
-) -> Vec<McpTool> {
-    tools
-        .into_iter()
-        .map(|tool| McpTool::from_mcp_server(tool, client.clone()))
-        .collect()
-}
-
-/// An MCP tool as a context-free rig-core dynamic tool, with a liveness probe
-/// bound to the MCP transport so registries can retire it on disconnect.
-///
-/// The call is made with no MCP `_meta` and the raw [`CallToolResult`] is not
-/// retained (callers that need either drive [`McpTool::execute_mcp`]
-/// themselves). A tool that reports `is_error` becomes a failed call whose
-/// error carries the tool's output.
-/// Keep the MCP response's protocol data on the per-call [`ToolContext`] for
-/// result hooks: the `structuredContent` value, the response [`Meta`], and the
-/// untouched [`CallToolResult`]. Host-only; the model sees only the ordered
-/// presentation content.
-pub fn preserve_mcp_result(
-    context: &mut ToolContext,
-    result: CallToolResult,
-) -> Result<(), ToolContextError> {
-    if let Some(structured) = result.structured_content.clone() {
-        context.insert_result(McpStructuredContent(structured))?;
-    }
-    if let Some(meta) = result.meta.clone() {
-        context.insert_result(McpResponseMeta(meta))?;
-    }
-    context.insert_result(McpCallToolResult(result))?;
-    Ok(())
+    /// The server did not answer before the deadline.
+    #[error("MCP request timed out after {0:?}")]
+    Timeout(Duration),
 }
 
 /// An MCP tool as a context-aware rig-core dynamic tool, with a liveness probe
 /// bound to the MCP transport so registries can retire it on disconnect.
 ///
-/// Per call: an [`rmcp::model::Meta`] placed in the [`ToolContext`] (re-exported
-/// here as [`Meta`]) is forwarded as the request's `_meta` (SEP-1319), and the
-/// response's `structuredContent`, response `Meta`, and raw [`CallToolResult`]
-/// are published to the context's result map ([`preserve_mcp_result`]). A tool
-/// that reports `is_error` becomes a failed call whose error carries the tool's
-/// output.
-impl From<McpTool> for PortableDynamicTool {
-    fn from(tool: McpTool) -> Self {
-        let name = tool.definition.name.to_string();
+/// Per call: [`McpMeta`] in the [`ToolContext`] and [`McpTool::with_call_meta`]
+/// supply request `_meta`, and the raw [`CallToolResult`] is published to
+/// the context's result map ([`McpCallToolResult`]). A tool that declares an output schema
+/// answers the model with its structured content alone; otherwise the model
+/// gets [`mcp_result_output`]. A tool that reports `is_error` becomes a
+/// failed call whose error carries the tool's output. Fails with
+/// [`EmptyToolName`] when the tool has no name.
+impl TryFrom<McpTool> for DynamicTool {
+    type Error = EmptyToolName;
+
+    fn try_from(tool: McpTool) -> Result<Self, EmptyToolName> {
+        let name = match &tool.name {
+            Some(name) => name.clone(),
+            None => ToolName::new(tool.definition.name.to_string())?,
+        };
         let description = tool
             .definition
             .description
@@ -521,21 +493,31 @@ impl From<McpTool> for PortableDynamicTool {
             .unwrap_or("")
             .to_string();
         let parameters = tool.definition.schema_as_json_value();
-        let liveness_client = tool.client.clone();
+        let annotations = annotations(&tool.definition);
+        let liveness_peer = tool.peer.clone();
         let tool = Arc::new(tool);
-        PortableDynamicTool::new_with_context(
+        Ok(DynamicTool::new_with_context(
             name,
             description,
             parameters,
             move |context: &mut ToolContext, args: serde_json::Value| {
                 let tool = Arc::clone(&tool);
-                let meta = context.get::<McpMeta>();
                 Box::pin(async move {
-                    let meta = meta?.map(|meta| meta.0);
-                    let result = tool.execute_mcp(args.to_string(), meta).await?;
+                    let arguments = mcp_arguments(args).map_err(|error| tool.invalid(error))?;
+                    let meta = tool.request_meta(arguments.as_ref(), context)?;
+                    let result = tool.call(arguments, meta).await?;
                     let is_error = result.is_error == Some(true);
-                    let output = mcp_result_output(&result);
-                    preserve_mcp_result(context, result)?;
+                    let output = match &result.structured_content {
+                        // With a declared output schema the structured value is the
+                        // result; MCP's content blocks only repeat it for older clients.
+                        Some(structured)
+                            if tool.definition.output_schema.is_some() && !is_error =>
+                        {
+                            Ok(ToolOutput::json(structured.clone()))
+                        }
+                        _ => mcp_result_output(&result),
+                    };
+                    context.insert_result(McpCallToolResult(result))?;
                     let output = output?;
                     if is_error {
                         Err(ToolExecutionError::other(format!(
@@ -549,8 +531,26 @@ impl From<McpTool> for PortableDynamicTool {
                 })
             },
         )
-        .with_liveness(move || !liveness_client.is_transport_closed())
+        .with_annotations(annotations)
+        .with_liveness(move || !liveness_peer.is_transport_closed()))
     }
+}
+
+/// The hints an MCP server gives about what calling `tool` does, as rig's
+/// tool annotations. They are the server's word, for display and policy: a
+/// host derives what a call touches from them with
+/// [`Touches::from_hints`](rig_core::tool::Touches::from_hints), so a call
+/// is never run again after a restart because a server said it only reads.
+pub(crate) fn annotations(tool: &rmcp::model::Tool) -> rig_core::completion::ToolAnnotations {
+    let mut annotations = rig_core::completion::ToolAnnotations::default();
+    if let Some(hints) = &tool.annotations {
+        annotations.title = hints.title.clone();
+        annotations.read_only_hint = hints.read_only_hint;
+        annotations.destructive_hint = hints.destructive_hint;
+        annotations.idempotent_hint = hints.idempotent_hint;
+        annotations.open_world_hint = hints.open_world_hint;
+    }
+    annotations
 }
 
 // Compile-time thread-safety contract: an `McpTool` is handed to the agent's

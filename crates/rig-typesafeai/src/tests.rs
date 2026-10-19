@@ -1,7 +1,6 @@
 use super::*;
 use crate::decode::DecodeAnswer;
 use anyhow::ensure;
-use rig_core::driver::Bind;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
@@ -24,7 +23,7 @@ struct Batch<R, U, F> {
 impl<R: Query, U: Query, F: Query> Query for Batch<R, U, F> {
     type Response = Batch<R::Response, U::Response, F::Response>;
     type Output = Batch<R::Output, U::Output, F::Output>;
-    fn decode(&self, response: Self::Response) -> Result<Self::Output, Error> {
+    fn decode(&self, response: Self::Response) -> Result<Self::Output, ProviderError> {
         Ok(Batch {
             route: self.route.decode(response.route)?,
             urgency: self.urgency.decode(response.urgency)?,
@@ -33,7 +32,7 @@ impl<R: Query, U: Query, F: Query> Query for Batch<R, U, F> {
     }
 }
 
-fn route() -> Result<Choice<Route>, Error> {
+fn route() -> Result<Choice<Route>, ProviderError> {
     Choice::new(
         "Which team should handle the customer message?",
         [
@@ -75,9 +74,10 @@ async fn recorded_mixed_batch() -> anyhow::Result<()> {
         ["No deadline", "Within a week", "Today"],
     )?;
     let refund = Noul::new("Does the customer explicitly request a refund?")?;
-    let client = Jev::new("test-token")
+    let client = JevConfig::new("test-token")
         .with_endpoint(server.url("/v1/systemone"))
-        .bind(rig_reqwest::ReqwestClient::default());
+        .connect(rig_reqwest::ReqwestClient::default())
+        .evaluation();
     let result = client
         .evaluate(
             &fixture
@@ -109,7 +109,7 @@ fn rejects_duplicate_ids_and_choices() -> anyhow::Result<()> {
         validation::request_ids(&serde_json::value::to_raw_value(
             &(&q).named("route")?.join((&q).named("route")?)
         )?),
-        Err(Error::InvalidRequest(_))
+        Err(ProviderError::Request(_))
     ));
     ensure!(Choice::new("route", [(Route::Billing, "one"), (Route::Billing, "two")]).is_err());
     ensure!(DynamicScore::try_from_iter("rate", ["only one"]).is_err());
@@ -128,7 +128,7 @@ fn rejects_corrupt_answers() -> anyhow::Result<()> {
     ] {
         ensure!(matches!(
             q.decode(serde_json::from_value(replacement)?),
-            Err(Error::InvalidResponse(_))
+            Err(ProviderError::Response(_))
         ));
     }
     Ok(())
@@ -137,7 +137,7 @@ fn rejects_corrupt_answers() -> anyhow::Result<()> {
 /// Credentials must stay redacted even when users debug provider configuration.
 #[test]
 fn redacts_configuration() -> anyhow::Result<()> {
-    let wire = Jev::new("sensitive-test-value");
+    let wire = JevConfig::new("sensitive-test-value");
     ensure!(!format!("{wire:?}").contains("sensitive-test-value"));
     ensure!(!serde_json::to_string(&wire)?.contains("sensitive-test-value"));
     Ok(())
@@ -158,7 +158,7 @@ fn rejects_labels_that_decode_to_a_different_variant() {
             "choose",
             [(Asymmetric::First, "one"), (Asymmetric::Second, "two")]
         ),
-        Err(Error::InvalidRequest(_))
+        Err(ProviderError::Request(_))
     ));
 }
 
@@ -242,9 +242,10 @@ async fn recorded_structured_batch_into_named_answers() -> anyhow::Result<()> {
         urgency: answer.urgency,
         refund: answer.refund,
     });
-    let client = Jev::new("test-token")
+    let client = JevConfig::new("test-token")
         .with_endpoint(server.url("/v1/systemone"))
-        .bind(rig_reqwest::ReqwestClient::default());
+        .connect(rig_reqwest::ReqwestClient::default())
+        .evaluation();
     let state = fixture
         .request
         .get("state")
@@ -306,9 +307,10 @@ async fn recorded_rounded_probability_matrix() -> anyhow::Result<()> {
                 .json_body(fixture.response.clone());
         })
         .await;
-    let client = Jev::new("test-token")
+    let client = JevConfig::new("test-token")
         .with_endpoint(server.url("/v1/systemone"))
-        .bind(rig_reqwest::ReqwestClient::default());
+        .connect(rig_reqwest::ReqwestClient::default())
+        .evaluation();
     let state = fixture
         .request
         .get("state")
@@ -378,17 +380,16 @@ fn rejects_non_string_choice_serialization() {
     }
     assert!(matches!(
         Choice::new("Choose", [(Tagged::One, "One"), (Tagged::Two, "Two")]),
-        Err(Error::InvalidRequest(_))
+        Err(ProviderError::Request(_))
     ));
     assert!(matches!(
         Choice::new("Choose", [(1u8, "One"), (2u8, "Two")]),
-        Err(Error::InvalidRequest(_))
+        Err(ProviderError::Request(_))
     ));
 }
 
 #[tokio::test]
 async fn preserves_http_error_metadata() -> anyhow::Result<()> {
-    use rig_core::wire::WireError;
     for status in [429, 529] {
         let server = httpmock::MockServer::start_async().await;
         let mock = server
@@ -400,15 +401,16 @@ async fn preserves_http_error_metadata() -> anyhow::Result<()> {
                     .body(r#"{"error":"overloaded"}"#);
             })
             .await;
-        let client = Jev::new("test-token")
+        let client = JevConfig::new("test-token")
             .with_endpoint(server.url("/v1/systemone"))
-            .bind(rig_reqwest::ReqwestClient::default());
+            .connect(rig_reqwest::ReqwestClient::default())
+            .evaluation();
         let error = client
             .evaluate(&"state", Noul::new("Ready?")?.named("ready")?)
             .await
             .err()
             .ok_or_else(|| anyhow::anyhow!("expected provider error"))?;
-        let Error::ProviderResponse(response) = &error else {
+        let ProviderError::ProviderResponse(response) = &error else {
             anyhow::bail!("wrong error: {error}");
         };
         ensure!(response.status.map(|s| s.as_u16()) == Some(status));
@@ -435,12 +437,13 @@ async fn rejects_missing_and_extra_response_ids() -> anyhow::Result<()> {
                     .json_body(json!({"model":"test", "answers": answers}));
             })
             .await;
-        let client = Jev::new("test-token")
+        let client = JevConfig::new("test-token")
             .with_endpoint(server.url("/v1/systemone"))
-            .bind(rig_reqwest::ReqwestClient::default());
+            .connect(rig_reqwest::ReqwestClient::default())
+            .evaluation();
         ensure!(
             matches!(client.evaluate(&"state", Noul::new("Ready?")?.named("ready")?).await,
-            Err(Error::InvalidResponse(message)) if message == "response question IDs differ from request")
+            Err(ProviderError::Response(message)) if message == "response question IDs differ from request")
         );
         mock.assert_async().await;
     }
@@ -477,7 +480,7 @@ fn dynamic_query_rejects_invalid_runtime_definitions() -> anyhow::Result<()> {
         let definition = serde_json::from_value(definition)?;
         ensure!(matches!(
             DynamicQuery::new(BTreeMap::from([(id.into(), definition)])),
-            Err(Error::InvalidRequest(_))
+            Err(ProviderError::Request(_))
         ));
     }
     Ok(())
@@ -526,5 +529,74 @@ fn validates_score_against_distribution() -> anyhow::Result<()> {
             "typed: {weights:?}, {score}"
         );
     }
+    Ok(())
+}
+
+/// A request the endpoint URL cannot carry fails as a request that could not
+/// be built.
+#[test]
+fn an_unbuildable_request_is_a_request_failure() -> anyhow::Result<()> {
+    use rig_core::error::{ErrorKind, ProviderError};
+    use rig_core::wire::{Mode, Wire};
+
+    let request = serde_json::from_value(json!({"state": 1, "questions": {}}))?;
+    let Err(error) = JevConfig::new("token")
+        .with_endpoint("http://bad host")
+        .encode(request, Mode::Unary)
+    else {
+        anyhow::bail!("the request must not build");
+    };
+    let report = ProviderError::from(error).report();
+    ensure!(report.kind == ErrorKind::Request);
+    ensure!(!report.retryable);
+    ensure!(report.message == "RequestError: invalid uri character");
+    Ok(())
+}
+
+/// An empty credential or a blank model is refused before a request is
+/// built, as a request failure.
+#[test]
+fn an_empty_credential_or_blank_model_is_refused() -> anyhow::Result<()> {
+    use rig_core::error::{ErrorKind, ProviderError};
+    use rig_core::wire::{Mode, Wire};
+
+    for config in [JevConfig::new(""), JevConfig::new("token").model(" ")] {
+        let request = serde_json::from_value(json!({"state": 1, "questions": {}}))?;
+        let Err(error) = config.encode(request, Mode::Unary) else {
+            anyhow::bail!("the request must not build");
+        };
+        let report = ProviderError::from(error).report();
+        ensure!(report.kind == ErrorKind::Request);
+        ensure!(
+            report
+                .message
+                .contains("credential and model must be nonempty"),
+            "{}",
+            report.message
+        );
+    }
+    Ok(())
+}
+
+/// OpenRouter reports the charge as a bare number of USD beside Jev's
+/// counters (recorded from a live call); a cost of another shape is dropped
+/// without failing the reply. A serialized response reads back the same.
+#[test]
+fn reads_openrouter_usage_cost() -> anyhow::Result<()> {
+    let reply = |cost: Value| {
+        serde_json::from_value::<types::Response>(json!({
+            "model": "typesafe/jev-1.13-20260917",
+            "answers": {},
+            "usage": {"input_tokens": 283, "output_tokens": 20, "cost": cost},
+        }))
+    };
+    let usage = reply(json!(0.000011886))?.usage;
+    let tokens = types::Usage::new().input_tokens(283).output_tokens(20);
+    ensure!(usage == Some(tokens.cost(rig_core::completion::Cost::from_total(0.000011886))));
+    ensure!(reply(json!({"credits": 1}))?.usage == Some(tokens));
+    let response = reply(json!(0.000011886))?;
+    let again: types::Response = serde_json::from_value(serde_json::to_value(&response)?)?;
+    ensure!(again.model == response.model && again.answers.get() == response.answers.get());
+    ensure!(again.usage == response.usage);
     Ok(())
 }

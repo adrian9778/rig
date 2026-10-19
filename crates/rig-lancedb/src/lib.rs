@@ -8,15 +8,12 @@
         clippy::unreachable
     )
 )]
-//! LanceDB vector store integration for Rig.
+//! LanceDB vector store for Rig.
 //!
-//! This crate provides [`LanceDbVectorIndex`], a Rig vector store index backed
-//! by LanceDB tables. It supports exact and approximate vector search through
-//! [`SearchType`] and accepts LanceDB SQL filter expressions through
-//! [`LanceDBFilter`].
-//!
-//! The root `rig` facade re-exports this crate as `rig::lancedb` when the
-//! `lancedb` feature is enabled.
+//! [`LanceDbVectorIndex`] searches an existing LanceDB table, exactly or
+//! approximately according to [`SearchParams`], narrowed by [`LanceDBFilter`]
+//! SQL predicates. The `rig` facade re-exports this crate as `rig::lancedb`
+//! under the `lancedb` feature.
 
 use std::ops::Range;
 
@@ -25,57 +22,50 @@ use lancedb::{
     query::{QueryBase, VectorQuery},
 };
 use rig_core::{
-    embeddings::embedding::EmbeddingModel,
     vector_store::{
-        VectorStoreError, VectorStoreIndex,
+        VectorSearchIdResult, VectorSearchResult, VectorStoreError, VectorStoreIndex,
         request::{FilterError, SearchFilter, VectorSearchRequest},
     },
     wasm_compat::WasmCompatSend,
 };
 use serde::de::DeserializeOwned;
 use serde_json::Value;
-use utils::{FilterTableColumns, QueryToJson};
+use utils::{execute_query, filter_embeddings};
 
 mod utils;
 
-/// Type on which vector searches can be performed for a lanceDb table.
+/// Vector index over a LanceDB table.
 ///
-/// See [`LanceDbVectorIndex::top_n`] for a worked construct-then-query example.
-///
-/// The store is generic over its embedding model `M`, which is fixed for the
-/// store's lifetime: an index populated under one model is only meaningful under
-/// that same model.
-pub struct LanceDbVectorIndex<M> {
-    /// Defines which model is used to generate embeddings for the vector store.
-    model: M,
-    /// LanceDB table containing embeddings.
+/// Queries are embedded with the same model that populated the table, so
+/// results are meaningless under another model. See [`LanceDbVectorIndex::top_n`]
+/// for a worked example.
+pub struct LanceDbVectorIndex {
+    model: rig_core::DynModel<rig_core::operation::Embedding>,
     table: lancedb::Table,
-    /// Column name in `table` that contains the id of a record.
+    /// Column holding each record's id.
     id_field: String,
-    /// Vector search params that are used during vector search operations.
     search_params: SearchParams,
 }
 
-impl<M: EmbeddingModel> LanceDbVectorIndex<M> {
-    /// Create an instance of `LanceDbVectorIndex` with an existing table and model.
-    /// Define the id field name of the table.
-    /// Define search parameters that will be used to perform vector searches on the table.
+impl LanceDbVectorIndex {
+    /// Creates an index over an existing table whose ids live in `id_field`.
+    /// The table is not inspected, so a wrong column surfaces at query time.
     pub async fn new(
         table: lancedb::Table,
-        model: M,
+        model: impl Into<rig_core::DynModel<rig_core::operation::Embedding>>,
         id_field: &str,
         search_params: SearchParams,
     ) -> Result<Self, lancedb::Error> {
         Ok(Self {
             table,
-            model,
+            model: model.into(),
             id_field: id_field.to_string(),
             search_params,
         })
     }
 
-    /// Apply the search_params to the vector query.
-    /// This is a helper function used by the methods `top_n` and `top_n_ids` of the `VectorStoreIndex` trait.
+    /// Applies the configured search parameters. Probe and refinement settings
+    /// apply only when approximate search is requested explicitly.
     fn build_query(&self, mut query: VectorQuery) -> VectorQuery {
         let SearchParams {
             distance_type,
@@ -115,16 +105,21 @@ impl<M: EmbeddingModel> LanceDbVectorIndex<M> {
     }
 }
 
-/// See [LanceDB vector search](https://lancedb.github.io/lancedb/search/) for more information.
+/// Which search LanceDB performs. See
+/// [LanceDB vector search](https://lancedb.github.io/lancedb/search/).
 #[derive(Debug, Clone)]
 pub enum SearchType {
-    // Flat search, also called ENN or kNN.
+    /// Exhaustive search, bypassing any vector index.
     Flat,
-    /// Approximal Nearest Neighbor search, also called ANN.
+    /// Approximate nearest neighbor search.
     Approximate,
 }
 
-/// An eDSL for filtering expressions, is rendered as a `WHERE` clause
+/// SQL predicate applied to a search, carrying any error raised while building
+/// it until the filter is used.
+///
+/// Column names and array bounds are spliced in verbatim, so they must not carry
+/// untrusted input; string values are quote-escaped.
 #[derive(Debug, Clone)]
 pub struct LanceDBFilter(Result<String, FilterError>);
 
@@ -146,7 +141,6 @@ impl<'de> serde::Deserialize<'de> for LanceDBFilter {
         D: serde::Deserializer<'de>,
     {
         let s = String::deserialize(deserializer)?;
-        // We can't deserialize to Error, so just create an Ok variant
         Ok(LanceDBFilter(Ok(s)))
     }
 }
@@ -212,7 +206,7 @@ impl LanceDBFilter {
         Self(self.0.map(|s| format!("NOT ({s})")))
     }
 
-    /// IN operator
+    /// Matches rows whose `key` equals one of `values`.
     pub fn in_values(key: &str, values: Vec<<Self as SearchFilter>::Value>) -> Self {
         Self(
             values
@@ -224,7 +218,7 @@ impl LanceDBFilter {
         )
     }
 
-    /// LIKE operator (string pattern matching)
+    /// Matches `key` against a case-sensitive SQL `LIKE` pattern.
     pub fn like<S>(key: &str, pattern: S) -> Self
     where
         S: AsRef<str>,
@@ -235,7 +229,7 @@ impl LanceDBFilter {
         )
     }
 
-    /// ILIKE operator (case-insensitive pattern matching)
+    /// Matches `key` against a case-insensitive `LIKE` pattern.
     pub fn ilike<S>(key: &str, pattern: S) -> Self
     where
         S: AsRef<str>,
@@ -246,17 +240,17 @@ impl LanceDBFilter {
         )
     }
 
-    /// IS NULL check
+    /// Matches rows whose `key` is null.
     pub fn is_null(key: &str) -> Self {
         Self(Ok(format!("{key} IS NULL")))
     }
 
-    /// IS NOT NULL check
+    /// Matches rows whose `key` is not null.
     pub fn is_not_null(key: &str) -> Self {
         Self(Ok(format!("{key} IS NOT NULL")))
     }
 
-    /// Array has any (for LIST columns with scalar index)
+    /// Matches list columns sharing at least one element with `values`.
     pub fn array_has_any(key: &str, values: Vec<<Self as SearchFilter>::Value>) -> Self {
         Self(
             values
@@ -268,7 +262,7 @@ impl LanceDBFilter {
         )
     }
 
-    /// Array has all (for LIST columns with scalar index)
+    /// Matches list columns containing every element of `values`.
     pub fn array_has_all(key: &str, values: Vec<<Self as SearchFilter>::Value>) -> Self {
         Self(
             values
@@ -280,12 +274,13 @@ impl LanceDBFilter {
         )
     }
 
-    /// Array length comparison
+    /// Matches list columns holding exactly `length` elements.
     pub fn array_length(key: &str, length: i32) -> Self {
         Self(Ok(format!("array_length({key}) = {length}")))
     }
 
-    /// BETWEEN operator
+    /// Matches `key` within the inclusive bounds of `start` and `end`, which are
+    /// spliced into the predicate verbatim.
     pub fn between<T>(key: &str, Range { start, end }: Range<T>) -> Self
     where
         T: PartialOrd + std::fmt::Display + Into<serde_json::Number>,
@@ -294,7 +289,8 @@ impl LanceDBFilter {
     }
 }
 
-/// Parameters used to perform a vector search on a LanceDb table.
+/// Search tuning applied to every query.
+///
 /// # Example
 /// ```
 /// let search_params = rig_lancedb::SearchParams::default().distance_type(lancedb::DistanceType::Cosine);
@@ -310,69 +306,66 @@ pub struct SearchParams {
 }
 
 impl SearchParams {
-    /// Sets the distance type of the search params.
-    /// Always set the distance_type to match the value used to train the index.
-    /// The default is DistanceType::L2.
+    /// Sets the distance measure, which must match the one the index was built
+    /// with. LanceDB defaults to L2.
     pub fn distance_type(mut self, distance_type: DistanceType) -> Self {
         self.distance_type = Some(distance_type);
         self
     }
 
-    /// Sets the search type of the search params.
-    /// By default, ANN will be used if there is an index on the table and kNN will be used if there is NO index on the table.
-    /// To use the mentioned defaults, do not set the search type.
+    /// Forces exact or approximate search. When unset, LanceDB searches
+    /// approximately if the table has a vector index and exhaustively otherwise.
     pub fn search_type(mut self, search_type: SearchType) -> Self {
         self.search_type = Some(search_type);
         self
     }
 
-    /// Sets the nprobes of the search params.
-    /// Only set this value only when the search type is ANN.
-    /// See [LanceDb ANN Search](https://lancedb.github.io/lancedb/ann_indexes/#querying-an-ann-index) for more information.
+    /// Sets how many partitions approximate search probes. Ignored unless
+    /// approximate search is requested explicitly. See
+    /// [LanceDB ANN search](https://lancedb.github.io/lancedb/ann_indexes/#querying-an-ann-index).
     pub fn nprobes(mut self, nprobes: usize) -> Self {
         self.nprobes = Some(nprobes);
         self
     }
 
-    /// Sets the refine factor of the search params.
-    /// Only set this value only when search type is ANN.
-    /// See [LanceDb ANN Search](https://lancedb.github.io/lancedb/ann_indexes/#querying-an-ann-index) for more information.
+    /// Sets how many extra candidates approximate search reranks. Ignored unless
+    /// approximate search is requested explicitly.
     pub fn refine_factor(mut self, refine_factor: u32) -> Self {
         self.refine_factor = Some(refine_factor);
         self
     }
 
-    /// Sets the post filter of the search params.
-    /// If set to true, filtering will happen after the vector search instead of before.
-    /// See [LanceDb pre/post filtering](https://lancedb.github.io/lancedb/sql/#pre-and-post-filtering) for more information.
+    /// Applies filters after the vector search rather than before. See
+    /// [LanceDB pre- and post-filtering](https://lancedb.github.io/lancedb/sql/#pre-and-post-filtering).
     pub fn post_filter(mut self, post_filter: bool) -> Self {
         self.post_filter = Some(post_filter);
         self
     }
 
-    /// Sets the column of the search params.
-    /// Only set this value if there is more than one column that contains lists of floats.
-    /// If there is only one column of list of floats, this column will be chosen for the vector search automatically.
+    /// Names the embedding column to search. Needed only when the table has more
+    /// than one float-list column.
     pub fn column(mut self, column: impl Into<String>) -> Self {
         self.column = Some(column.into());
         self
     }
 }
 
-impl<M: EmbeddingModel> VectorStoreIndex for LanceDbVectorIndex<M> {
+impl VectorStoreIndex for LanceDbVectorIndex {
     type Filter = LanceDBFilter;
 
-    /// Implement the `top_n` method of the `VectorStoreIndex` trait for `LanceDbVectorIndex`.
+    /// Returns matches scored by distance, with embedding columns projected
+    /// out. A row missing its distance scores zero, and a row whose id column is
+    /// absent or non-textual gets a placeholder id.
+    ///
     /// # Example
     /// ```no_run
-    /// use rig_core::providers::openai::{self, wire::OpenAI};
+    /// use rig_core::providers::openai::{self, OpenAI};
     /// use rig_core::vector_store::VectorStoreIndex;
     /// use rig_core::vector_store::request::VectorSearchRequest;
     /// use rig_lancedb::{LanceDbVectorIndex, SearchParams};
-    /// use rig_reqwest::prelude::*;
     ///
     /// # async fn example(table: lancedb::Table) -> Result<(), anyhow::Error> {
-    /// let openai_client = OpenAI::from_env()?.bound()?;
+    /// let openai_client = OpenAI::from_env()?;
     /// let model = openai_client.embedding(openai::TEXT_EMBEDDING_ADA_002, None);
     /// let vector_store_index =
     ///     LanceDbVectorIndex::new(table, model, "id", SearchParams::default()).await?;
@@ -389,8 +382,13 @@ impl<M: EmbeddingModel> VectorStoreIndex for LanceDbVectorIndex<M> {
     async fn top_n<T: DeserializeOwned + WasmCompatSend>(
         &self,
         req: VectorSearchRequest<LanceDBFilter>,
-    ) -> Result<Vec<(f64, String, T)>, VectorStoreError> {
+    ) -> Result<Vec<VectorSearchResult<T>>, VectorStoreError> {
         let prompt_embedding = self.model.embed_text(req.query()).await?;
+        let schema = self
+            .table
+            .schema()
+            .await
+            .map_err(VectorStoreError::datastore)?;
 
         let mut query = self
             .table
@@ -398,45 +396,38 @@ impl<M: EmbeddingModel> VectorStoreIndex for LanceDbVectorIndex<M> {
             .map_err(VectorStoreError::datastore)?
             .limit(req.samples() as usize)
             .distance_range(None, req.threshold().map(|x| x as f32))
-            .select(lancedb::query::Select::Columns(
-                self.table
-                    .schema()
-                    .await
-                    .map_err(VectorStoreError::datastore)?
-                    .filter_embeddings(),
-            ));
+            .select(lancedb::query::Select::Columns(filter_embeddings(&schema)));
 
         if let Some(filter) = req.filter() {
             query = query.only_if(filter.clone().into_inner()?);
         }
 
-        self.build_query(query)
-            .execute_query()
+        execute_query(&self.build_query(query))
             .await?
             .into_iter()
             .enumerate()
             .map(|(i, value)| {
-                Ok((
-                    match value.get("_distance") {
+                Ok(VectorSearchResult {
+                    score: match value.get("_distance") {
                         Some(Value::Number(distance)) => distance.as_f64().unwrap_or_default(),
                         _ => 0.0,
                     },
-                    match value.get(self.id_field.as_str()) {
+                    id: match value.get(self.id_field.as_str()) {
                         Some(Value::String(id)) => id.clone(),
                         _ => format!("unknown{i}"),
                     },
-                    serde_json::from_value(value).map_err(VectorStoreError::JsonError)?,
-                ))
+                    document: serde_json::from_value(value).map_err(VectorStoreError::JsonError)?,
+                })
             })
             .collect()
     }
 
-    /// Like [`LanceDbVectorIndex::top_n`], but projects only the id column —
-    /// see that example for the setup, and pass the same request here.
+    /// Like [`LanceDbVectorIndex::top_n`] but projects only the id column,
+    /// returning an empty id when the column is absent or non-textual.
     async fn top_n_ids(
         &self,
         req: VectorSearchRequest<LanceDBFilter>,
-    ) -> Result<Vec<(f64, String)>, VectorStoreError> {
+    ) -> Result<Vec<VectorSearchIdResult>, VectorStoreError> {
         let prompt_embedding = self.model.embed_text(req.query()).await?;
 
         let mut query = self
@@ -452,21 +443,20 @@ impl<M: EmbeddingModel> VectorStoreIndex for LanceDbVectorIndex<M> {
             query = query.only_if(filter.clone().into_inner()?);
         }
 
-        self.build_query(query)
-            .execute_query()
+        execute_query(&self.build_query(query))
             .await?
             .into_iter()
             .map(|value| {
-                Ok((
-                    match value.get("distance") {
+                Ok(VectorSearchIdResult {
+                    score: match value.get("distance") {
                         Some(Value::Number(distance)) => distance.as_f64().unwrap_or_default(),
                         _ => 0.0,
                     },
-                    match value.get(self.id_field.as_str()) {
+                    id: match value.get(self.id_field.as_str()) {
                         Some(Value::String(id)) => id.clone(),
                         _ => "".to_string(),
                     },
-                ))
+                })
             })
             .collect()
     }

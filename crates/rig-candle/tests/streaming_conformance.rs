@@ -1,38 +1,78 @@
 //! Wire-conformance suite for candle's in-process typed-event wire.
 //!
 //! Events-first (`WireInput::Event`): fixture frames are already-typed
-//! generation events driven through [`rig_candle::stream_from_events`]
-//! — the shared driver, grammar, and terminal normalization — with no model
-//! load. This family never produces `Unknown` and has no frame-level decode,
+//! generation events replayed by a scripted transport through the
+//! [`Generation`] wire — the shared driver, grammar, and terminal
+//! normalization — with no model load. This family never produces `Unknown` and has no frame-level decode,
 //! so the malformed/unknown scenarios self-report as skipped.
 
-use rig_candle::{CandleCompletionResponse, FinishReason as CandleFinishReason, GenerationEvent};
-use rig_core::completion::{CompletionError, FinishReason};
-use rig_core::streaming::{BlockId, ToolCallEnd};
+#![allow(clippy::expect_used)]
+
+use rig_candle::{
+    CandleCompletionResponse, CandleFrame, ConversationProtocol,
+    FinishReason as CandleFinishReason, Generation, GenerationEvent,
+};
+use rig_core::completion::{CompletionRequest, FinishReason};
+use rig_core::driver::{Exchange, Model, Opened, Opening, Transport};
+use rig_core::error::ProviderError;
+use rig_core::message::{CallId, ToolCall, ToolFunction, ToolName};
 use rig_core::test_utils::streaming_conformance::{
     ProviderWireFixture, WireDriver, event_frame, fixtures::drain,
 };
 
 type CandleEvent = GenerationEvent;
 
+/// Replays scripted generation events as the local generator sends them.
+#[derive(Clone)]
+struct Scripted(std::sync::Arc<std::sync::Mutex<Vec<Result<CandleEvent, ProviderError>>>>);
+
+impl Transport<Generation> for Scripted {
+    fn send(
+        &self,
+        _request: rig_candle::CandleRequest,
+        _exchange: Exchange,
+    ) -> Opening<CandleFrame> {
+        let events = match self.0.lock() {
+            Ok(mut events) => std::mem::take(&mut *events),
+            Err(_) => {
+                return Opening::failed(ProviderError::Provider("script lock poisoned".to_owned()));
+            }
+        };
+        Opening::ready(Opened::new(futures::stream::iter(
+            events
+                .into_iter()
+                .map(|event| event.map(CandleFrame::Event)),
+        )))
+    }
+}
+
 fn driver() -> WireDriver {
     WireDriver::new("candle", |chunks| {
         Box::pin(async move {
-            let events: Vec<Result<CandleEvent, CompletionError>> = chunks
+            let events: Vec<Result<CandleEvent, ProviderError>> = chunks
                 .into_iter()
                 .map(|chunk| match chunk {
                     Ok(frame) => frame
                         .downcast_event::<CandleEvent>()
                         .cloned()
                         .ok_or_else(|| {
-                            CompletionError::ProviderError(
+                            ProviderError::Provider(
                                 "candle conformance frames must be generation events".to_string(),
                             )
                         }),
-                    Err(error) => Err(CompletionError::HttpError(error)),
+                    Err(error) => Err(ProviderError::Http(error.into())),
                 })
                 .collect();
-            let stream = rig_candle::stream_from_events(futures::stream::iter(events));
+            let generation = Generation {
+                model: "qwen3-scripted".to_owned(),
+                protocol: ConversationProtocol::Qwen3,
+                facts: Default::default(),
+            };
+            let stream = Model::new(
+                generation,
+                Scripted(std::sync::Arc::new(std::sync::Mutex::new(events))),
+            )
+            .stream(CompletionRequest::new("hello"))?;
             Ok(drain(stream).await)
         })
     })
@@ -60,11 +100,15 @@ fn fixture() -> ProviderWireFixture {
             "hi".to_string(),
         ))],
         expected_texts: vec!["hi"],
-        tool_call_frames: vec![event_frame::<CandleEvent>(GenerationEvent::ToolCall {
-            id: BlockId::wire("call_1"),
-            end: ToolCallEnd::whole("get_weather", serde_json::json!({"city": "Tokyo"}))
-                .with_tool_id("call_1"),
-        })],
+        tool_call_frames: vec![event_frame::<CandleEvent>(GenerationEvent::ToolCall(
+            ToolCall::new(
+                CallId::from_wire("call_1"),
+                ToolFunction::new(
+                    ToolName::new("get_weather").expect("a tool name"),
+                    serde_json::json!({"city": "Tokyo"}),
+                ),
+            ),
+        ))],
         expected_tool_name: "get_weather",
         // Local generation delivers tool calls whole after the buffered turn
         // is parsed; arguments never stream.

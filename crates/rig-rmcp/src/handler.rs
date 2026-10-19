@@ -1,5 +1,13 @@
-//! `McpClientHandler`: keeps a [`ManagedToolSink`] in sync with an MCP server's
-//! tool list.
+//! Synchronizes managed tool registrations with an MCP server's tool list.
+//!
+//! ```
+//! use rig_core::tool::ManagedToolSink;
+//! use rig_rmcp::{McpClientHandler, rmcp};
+//!
+//! fn handler<S: ManagedToolSink + Send + Sync + 'static>(sink: S) -> McpClientHandler<S> {
+//!     McpClientHandler::new(rmcp::model::ClientConfig::default(), sink)
+//! }
+//! ```
 
 use std::collections::HashMap;
 use std::sync::{
@@ -9,14 +17,17 @@ use std::sync::{
 use std::time::Duration;
 
 use rmcp::ServiceExt;
-use rmcp::model::{ClientRequest, ListToolsRequest, PaginatedRequestParams, ServerResult};
+use rmcp::model::RequestMetaObject;
 use tokio::sync::{Mutex, RwLock};
 
-use rig_core::tool::{ManagedToolSink, ManagedToolToken, PortableDynamicTool};
+use rig_core::message::EmptyToolName;
+use rig_core::tool::{DynamicTool, ManagedToolSink, ManagedToolToken};
 
+use crate::connection::list_tools;
+use crate::native::CallMetaFn;
 use crate::{
-    DEFAULT_MCP_REFRESH_TIMEOUT, DEFAULT_MCP_TOOL_TIMEOUT, McpClientError, McpTool,
-    send_mcp_request,
+    DEFAULT_MCP_REFRESH_TIMEOUT, DEFAULT_MCP_TOOL_TIMEOUT, McpClientError, McpConnection, McpTool,
+    McpToolCall,
 };
 
 #[derive(Default)]
@@ -33,37 +44,18 @@ pub(crate) struct RefreshActivity {
 
 pub(crate) const MAX_CONCURRENT_REFRESHES: usize = 2;
 
-/// An MCP client handler that automatically re-fetches the tool list when the
-/// server sends a `notifications/tools/list_changed` notification.
-///
-/// This handler implements [`rmcp::ClientHandler`] and bridges the MCP
-/// notification lifecycle with any [`ManagedToolSink`] — rig-agent's
-/// `ToolServerHandle` implements it, so the rig-agent usage is
-/// `McpClientHandler::new(client_info, tool_server_handle.clone())`.
-/// When the MCP server's available tools change, this handler:
-/// 1. Re-fetches the full tool list from the MCP server
-/// 2. Replaces or removes registrations still owned by this handler
-/// 3. Leaves newer local and peer-handler same-name registrations intact
-///
-/// # Usage
-///
-/// Use [`McpClientHandler::connect`] for a streamlined setup that handles
-/// connection, initial tool fetch, and registration in one call:
-///
-/// ```rust,ignore
-/// let tool_server_handle = ToolServer::new().run();
-/// let handler = McpClientHandler::new(client_info, tool_server_handle.clone());
-/// let mcp_service = handler.connect(transport).await?;
-/// ```
-///
-/// The returned `RunningService` keeps the MCP connection alive. When the
-/// server updates its tools, the handler automatically syncs with the tool server.
+/// Registers MCP tools in a [`ManagedToolSink`] and refreshes them on list changes.
+/// Refreshes replace or remove only registrations still owned by this handler,
+/// preserving newer same-name registrations. [`Self::connect`] performs the
+/// initial fetch and returns the connection. The sink owns the registered
+/// tools, so they do not keep the connection open: hold the connection for
+/// as long as they should stay usable.
 pub struct McpClientHandler<S> {
-    client_info: rmcp::model::ClientInfo,
+    client_config: rmcp::model::ClientConfig,
     sink: S,
-    /// Per-call timeout applied to every MCP tool this handler registers
-    /// (see issue #1914). Defaults to [`DEFAULT_MCP_TOOL_TIMEOUT`].
+    /// Per-call timeout for registered tools, initially [`DEFAULT_MCP_TOOL_TIMEOUT`].
     timeout: Option<Duration>,
+    call_meta: Option<CallMetaFn>,
     /// Deadline for initial and list-changed tool-list fetches.
     refresh_timeout: Duration,
     /// Tracks the exact registry generation installed for each tool. Refreshes
@@ -85,11 +77,12 @@ where
     /// With rig-agent, pass a clone of the agent's `ToolServerHandle` so tool
     /// updates are reflected in agent requests. Registered tools get
     /// [`DEFAULT_MCP_TOOL_TIMEOUT`]; change it with [`McpClientHandler::with_timeout`].
-    pub fn new(client_info: rmcp::model::ClientInfo, sink: S) -> Self {
+    pub fn new(client_config: rmcp::model::ClientConfig, sink: S) -> Self {
         Self {
-            client_info,
+            client_config,
             sink,
             timeout: Some(DEFAULT_MCP_TOOL_TIMEOUT),
+            call_meta: None,
             refresh_timeout: DEFAULT_MCP_REFRESH_TIMEOUT,
             managed_tools: Arc::new(RwLock::new(ManagedToolsState::default())),
             refresh_activity: Arc::new(Mutex::new(RefreshActivity::default())),
@@ -107,6 +100,17 @@ where
         self
     }
 
+    /// Derive request `_meta` from each call of every tool this handler
+    /// registers, as [`McpTool::with_call_meta`] does for one tool.
+    #[must_use = "the setting applies to the returned value"]
+    pub fn with_call_meta<F>(mut self, meta: F) -> Self
+    where
+        F: Fn(&McpToolCall<'_>) -> Option<RequestMetaObject> + Send + Sync + 'static,
+    {
+        self.call_meta = Some(Arc::new(meta));
+        self
+    }
+
     /// Set the deadline for initial and list-changed tool-list fetches.
     #[must_use = "the setting applies to the returned value"]
     pub fn with_refresh_timeout(mut self, timeout: Duration) -> Self {
@@ -114,15 +118,17 @@ where
         self
     }
 
-    /// Build the portable adapter with this handler's configured timeout.
+    /// Build the dynamic tool with this handler's configured timeout.
     pub(crate) fn build_tool(
         &self,
         tool: rmcp::model::Tool,
         client: rmcp::service::ServerSink,
-    ) -> PortableDynamicTool {
-        McpTool::from_mcp_server(tool, client)
-            .with_timeout(self.timeout)
-            .into()
+    ) -> Result<DynamicTool, EmptyToolName> {
+        McpTool {
+            call_meta: self.call_meta.clone(),
+            ..McpTool::managed(tool, client).with_timeout(self.timeout)
+        }
+        .try_into()
     }
 
     pub(crate) fn begin_refresh(&self) -> u64 {
@@ -132,45 +138,19 @@ where
     pub(crate) async fn fetch_tools(
         &self,
         peer: &rmcp::service::ServerSink,
-    ) -> Result<Vec<PortableDynamicTool>, McpClientError> {
-        let deadline = tokio::time::Instant::now() + self.refresh_timeout;
-        let mut tools = Vec::new();
-        let mut cursor = None;
+    ) -> Result<Vec<DynamicTool>, McpClientError> {
+        let tools = list_tools(peer, self.refresh_timeout).await?;
 
-        loop {
-            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-            if remaining.is_zero() {
-                return Err(McpClientError::ToolFetchTimeout(self.refresh_timeout));
-            }
-            let mut params = PaginatedRequestParams::default();
-            params.cursor = cursor;
-            let response = send_mcp_request(
-                peer,
-                ClientRequest::ListToolsRequest(ListToolsRequest::with_param(params)),
-                Some((deadline, self.refresh_timeout)),
-            )
-            .await
-            .map_err(|error| match error {
-                rmcp::ServiceError::Timeout { .. } => {
-                    McpClientError::ToolFetchTimeout(self.refresh_timeout)
-                }
-                error => McpClientError::ToolFetchError(error),
-            })?;
-            let ServerResult::ListToolsResult(page) = response else {
-                return Err(McpClientError::ToolFetchError(
-                    rmcp::ServiceError::UnexpectedResponse,
-                ));
-            };
-            tools.extend(page.tools);
-            cursor = page.next_cursor;
-            if cursor.is_none() {
-                break;
-            }
-        }
-
+        // One nameless tool is a server bug; it should not hide the server's other tools.
         Ok(tools
             .into_iter()
-            .map(|tool| self.build_tool(tool, peer.clone()))
+            .filter_map(|tool| match self.build_tool(tool, peer.clone()) {
+                Ok(tool) => Some(tool),
+                Err(error) => {
+                    tracing::warn!(%error, "skipping an MCP tool the server listed without a name");
+                    None
+                }
+            })
             .collect())
     }
 
@@ -196,7 +176,7 @@ where
         }
     }
 
-    pub(crate) async fn commit_initial(&self, refresh: u64, tools: Vec<PortableDynamicTool>) {
+    pub(crate) async fn commit_initial(&self, refresh: u64, tools: Vec<DynamicTool>) {
         let mut managed = self.managed_tools.write().await;
         if refresh <= managed.committed_refresh {
             tracing::debug!(refresh, "discarding stale initial MCP tool list");
@@ -206,11 +186,7 @@ where
         managed.committed_refresh = refresh;
     }
 
-    pub(crate) async fn commit_refresh(
-        &self,
-        refresh: u64,
-        tools: Vec<PortableDynamicTool>,
-    ) -> bool {
+    pub(crate) async fn commit_refresh(&self, refresh: u64, tools: Vec<DynamicTool>) -> bool {
         let mut managed = self.managed_tools.write().await;
         if refresh <= managed.committed_refresh {
             tracing::debug!(refresh, "discarding stale MCP tool-list response");
@@ -223,34 +199,30 @@ where
     }
 
     /// Connect to an MCP server, fetch the initial tool list, and register
-    /// all tools with the tool server.
+    /// all tools with the sink.
     ///
-    /// Returns the running MCP service. The connection stays alive as long as the
-    /// returned `RunningService` is held. When the server sends
-    /// `notifications/tools/list_changed`, this handler automatically re-fetches
-    /// and re-registers tools into the sink.
+    /// The connection stays open while the returned [`McpConnection`] or a
+    /// clone of it is held. When the server sends
+    /// `notifications/tools/list_changed`, this handler re-fetches and
+    /// re-registers tools into the sink.
     ///
     /// # Errors
     ///
     /// Returns [`McpClientError`] if the connection or initial tool fetch fails.
-    pub async fn connect<T, E, A>(
-        self,
-        transport: T,
-    ) -> Result<rmcp::service::RunningService<rmcp::service::RoleClient, Self>, McpClientError>
+    #[must_use = "dropping the connection closes it and retires its tools"]
+    pub async fn connect<T, E, A>(self, transport: T) -> Result<McpConnection, McpClientError>
     where
         T: rmcp::transport::IntoTransport<rmcp::service::RoleClient, E, A>,
         E: std::error::Error + Send + Sync + 'static,
     {
-        let service = ServiceExt::serve(self, transport)
-            .await
-            .map_err(|e| McpClientError::ConnectionError(e.to_string()))?;
+        let service = ServiceExt::serve(self, transport).await?;
 
         let handler = service.service();
         let refresh = handler.begin_refresh();
         let tools = handler.fetch_tools(service.peer()).await?;
         handler.commit_initial(refresh, tools).await;
 
-        Ok(service)
+        Ok(McpConnection::new(service))
     }
 }
 
@@ -258,8 +230,8 @@ impl<S> rmcp::handler::client::ClientHandler for McpClientHandler<S>
 where
     S: ManagedToolSink + Send + Sync + 'static,
 {
-    fn get_info(&self) -> rmcp::model::ClientInfo {
-        self.client_info.clone()
+    fn get_info(&self) -> rmcp::model::ClientConfig {
+        self.client_config.clone()
     }
 
     async fn on_tool_list_changed(

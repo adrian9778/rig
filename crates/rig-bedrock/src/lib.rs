@@ -15,12 +15,21 @@
 //! configured for the AWS SDK and a region with access to the selected Bedrock
 //! model.
 //!
-//! The root `rig` facade re-exports this crate as `rig::bedrock` when the
-//! `bedrock` feature is enabled.
+//! ```no_run
+//! use rig_bedrock::{client::BedrockRuntime, completion::{AMAZON_NOVA_LITE, Converse}};
+//! use rig_core::Model;
+//!
+//! let model = BedrockRuntime::from_env().completion(AMAZON_NOVA_LITE);
+//! # let _ = model;
+//! ```
 
+mod capture;
 pub mod client;
 pub mod completion;
 pub mod embedding;
+pub mod extension;
 pub mod image;
+mod options;
+mod request;
 pub mod streaming;
 pub mod types;

@@ -1,14 +1,18 @@
-//! This module primarily concerns being able to orchestrate telemetry across a given pipeline or workflow.
-//! This includes tracing, being able to send traces to an OpenTelemetry collector, setting up your
-//! agents with the correct tracing style so you can emit the right traces for platforms like Langfuse,
-//! and more.
+//! GenAI tracing spans, completion-parent adoption, and opt-in content recording.
+//!
+//! ```
+//! use rig_core::telemetry::{GenAiOperation, SpanBuilder};
+//!
+//! let span = SpanBuilder::new("provider", "model", GenAiOperation::Chat).build();
+//! ```
 use crate::completion::{AssistantContent, Message, Usage};
 use crate::message::{
-    DocumentSourceKind, Image, MimeType, Reasoning, ReasoningContent, ToolResult,
-    ToolResultContent, UserContent,
+    DocumentData, DocumentSourceKind, Image, MimeType, Opaque, ToolResult, ToolResultContent,
+    UserContent,
 };
 use base64::Engine;
 use serde::Serialize;
+use std::borrow::Borrow;
 use std::collections::HashSet;
 use std::sync::{LazyLock, Mutex};
 use tracing::callsite::Identifier;
@@ -18,27 +22,11 @@ use tracing::callsite::Identifier;
 #[doc(hidden)]
 pub use tracing as __tracing;
 
-/// Marks a span field as declared but not yet valued.
-///
-/// Re-exported so a runtime can declare a contract field through
-/// [`completion_parent_span!`](crate::completion_parent_span) without taking a
-/// direct `tracing` dependency — the crate's own `__tracing` path is hidden,
-/// and `Option::<&str>::None` is the only other portable spelling. `rig-core`
-/// already exposes `tracing` types across this module's public API
-/// ([`CompletionSpanBuilder::build`] returns a [`tracing::Span`]), so this adds
-/// no new semver surface.
+/// Declares a span field without a value, including in [`completion_parent_span!`].
 pub use tracing::field::Empty;
 
-/// Implementation detail of [`new_completion_span!`] and
-/// [`completion_parent_span!`](crate::completion_parent_span): declares a span
-/// with the caller's header fields followed by the canonical completion
-/// telemetry fields recorded over a completion's lifetime.
-///
-/// `tracing` bakes a span's field set into static metadata, so the canonical
-/// list can only be single-sourced by a macro that owns the whole
-/// `info_span!` invocation — a `const` list can never be spliced in. This is
-/// the one copy; [`COMPLETION_PARENT_REQUIRED_FIELDS`] is the checklist form
-/// of the same contract and a test asserts the two agree exactly.
+/// Declares caller-supplied header fields and canonical completion fields.
+/// The header must end with a comma; nonempty extras must begin with one.
 #[doc(hidden)]
 #[macro_export]
 macro_rules! __rig_canonical_completion_span {
@@ -58,8 +46,10 @@ macro_rules! __rig_canonical_completion_span {
             $(parent: $parent,)?
             $name,
             $($header)*
+            gen_ai.request.stream = $crate::telemetry::__tracing::field::Empty,
             gen_ai.response.id = $crate::telemetry::__tracing::field::Empty,
             gen_ai.response.model = $crate::telemetry::__tracing::field::Empty,
+            rig.provider_request_id = $crate::telemetry::__tracing::field::Empty,
             gen_ai.usage.input_tokens = $crate::telemetry::__tracing::field::Empty,
             gen_ai.usage.output_tokens = $crate::telemetry::__tracing::field::Empty,
             gen_ai.usage.cache_read.input_tokens = $crate::telemetry::__tracing::field::Empty,
@@ -89,69 +79,66 @@ macro_rules! new_completion_span {
     };
 }
 
-/// A supported GenAI completion operation and its canonical span name.
+/// A GenAI operation and its canonical span name. Completion operations carry
+/// message content and may adopt a completion-parent span; the others record
+/// only usage and identity on a fresh span.
+///
+/// Completion operations report the well-known `gen_ai.operation.name` values
+/// of the OpenTelemetry GenAI semantic conventions. Streaming is a delivery
+/// mode, not an operation: it is recorded as `gen_ai.request.stream` (see
+/// [`SpanBuilder::streaming`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CompletionOperation {
-    /// A chat completion.
+pub enum GenAiOperation {
+    /// A chat completion (`chat`), unary or streamed.
     Chat,
-    /// A streaming chat completion.
-    ChatStreaming,
-    /// A Gemini generate-content request.
+    /// A Gemini generate-content request (`generate_content`), unary or streamed.
     GenerateContent,
-    /// A Gemini Interactions API request.
-    Interactions,
-    /// A streaming Gemini Interactions API request.
-    InteractionsStreaming,
+    /// A text (or image) embedding request.
+    Embeddings,
+    /// A reranking request.
+    Rerank,
+    /// An audio transcription request.
+    Transcription,
+    /// An image generation request.
+    ImageGeneration,
+    /// An audio generation (text-to-speech) request.
+    AudioGeneration,
 }
 
-impl CompletionOperation {
+impl GenAiOperation {
     fn as_str(self) -> &'static str {
         match self {
             Self::Chat => "chat",
-            Self::ChatStreaming => "chat_streaming",
             Self::GenerateContent => "generate_content",
-            Self::Interactions => "interactions",
-            Self::InteractionsStreaming => "interactions_streaming",
+            Self::Embeddings => "embeddings",
+            Self::Rerank => "rerank",
+            Self::Transcription => "transcription",
+            Self::ImageGeneration => "image_generation",
+            Self::AudioGeneration => "audio_generation",
         }
+    }
+
+    pub(crate) fn is_completion(self) -> bool {
+        matches!(self, Self::Chat | Self::GenerateContent)
     }
 }
 
-/// Core-owned marker field for a runtime span that may absorb provider completion fields.
-///
-/// Runtimes declare this field on their completion-parent spans without having
-/// to share a tracing target. The field's presence (its value is ignored) marks
-/// the span as a *candidate* for adoption, but adoption also requires the span
-/// to statically declare every field in [`COMPLETION_PARENT_REQUIRED_FIELDS`].
-///
-/// This second requirement exists because [`tracing::Span::record`] silently
-/// no-ops for any field absent from a span's static metadata: a span carrying
-/// only the marker would be adopted and then drop every recorded completion
-/// field, losing telemetry with no error. A span missing any required field is
-/// therefore *not* adopted — [`CompletionSpanBuilder::build`] creates a fresh
-/// `rig::completions` child span instead, so telemetry is never silently lost.
-///
-/// The declarative source of the contract is the
-/// [`completion_parent_span!`](crate::completion_parent_span) macro; declaring
-/// a span through it is what guarantees the marker and the field set stay in
-/// agreement. Changing [`COMPLETION_PARENT_REQUIRED_FIELDS`] therefore needs no
-/// marker change to degrade safely: a hand-written span built against an older
-/// field list simply fails the gate above and gets a fresh child span, with a
-/// warning (once per offending callsite) naming what it is missing.
+/// Span field holding the provider's transport request id (the request-id
+/// response header), recorded on success and on provider errors. GenAI
+/// semantic conventions define no attribute for it. Rig's own completion
+/// spans declare it; it is not required of an adopted parent, which simply
+/// does not record it when undeclared.
+pub const PROVIDER_REQUEST_ID_FIELD: &str = "rig.provider_request_id";
+
+/// Marker field for completion-parent adoption, independent of tracing target.
+/// Its value is ignored. Adoption requires every field in
+/// [`COMPLETION_PARENT_REQUIRED_FIELDS`]; otherwise the builder creates a child
+/// span and warns once per incomplete callsite.
 pub const COMPLETION_PARENT_MARKER_FIELD: &str = "rig.completion_parent";
 
-/// Fields a completion-parent span must statically declare (as
-/// [`tracing::field::Empty`] or a value) to be adopted by
-/// [`CompletionSpanBuilder::build`], alongside [`COMPLETION_PARENT_MARKER_FIELD`].
-///
-/// These mirror the canonical fields the builder's own `rig::completions` span
-/// declares, so an adopted span can absorb the request, response, usage, and
-/// content telemetry recorded over a completion's lifetime without dropping any.
-///
-/// This constant is the *checklist* form of the contract used by the adoption
-/// gate; the *declarative* form is the
-/// [`completion_parent_span!`](crate::completion_parent_span) macro, which is
-/// how a runtime declares a conforming span. A test asserts the two forms
-/// agree exactly, so neither can drift from the other.
+/// Fields required alongside [`COMPLETION_PARENT_MARKER_FIELD`] for adoption.
+/// Each must be statically declared with [`Empty`] or a value.
+/// [`completion_parent_span!`] declares the complete set.
 pub const COMPLETION_PARENT_REQUIRED_FIELDS: &[&str] = &[
     "gen_ai.operation.name",
     "gen_ai.provider.name",
@@ -169,38 +156,16 @@ pub const COMPLETION_PARENT_REQUIRED_FIELDS: &[&str] = &[
     "gen_ai.output.messages",
 ];
 
-/// Declare a completion-parent span conforming to the adoption contract.
+/// Declares a completion-parent span with the marker and all required fields.
+/// Defaults to the current span as parent. An optional `parent: <expr>` between
+/// `target` and `name` accepts any parent supported by [`tracing::info_span!`],
+/// including `None`.
 ///
-/// This macro is the single declarative source of the contract: it declares
-/// [`COMPLETION_PARENT_MARKER_FIELD`] and every field in
-/// [`COMPLETION_PARENT_REQUIRED_FIELDS`], so a span it builds is always
-/// adoptable by [`CompletionSpanBuilder::build`] and can absorb every field
-/// recorded over the completion's lifetime. Runtimes should declare their
-/// completion-parent spans through it rather than hand-writing the marker and
-/// field list — [`tracing::Span::record`] silently no-ops on undeclared
-/// fields, so a hand-written span that omits one field loses that telemetry
-/// with no error (and a span that omits enough to fail the adoption gate is
-/// not adopted at all). A span declared through this macro tracks the contract
-/// automatically; a hand-written one has to be maintained by hand.
-///
-/// By default the span is explicitly parented on
-/// [`tracing::Span::current()`]; pass `parent: <expr>` between `target` and
-/// `name` to override it with any parent expression [`tracing::info_span!`]
-/// accepts (including `None`). `operation` and `system_instructions` are
-/// declared with the given values; the provider records
-/// `gen_ai.provider.name` and `gen_ai.request.model` at adoption time.
-/// Additional runtime-specific fields may be appended after the named
-/// arguments. Extra fields must not repeat the marker or a required contract
-/// field: a duplicate compiles, but the span then declares two same-named
-/// fields and [`tracing::Span::record`] targets only the first.
-///
-/// Invoking this macro does not require a direct `tracing` dependency. To
-/// declare a field with no value yet, use [`Empty`] (re-exported here for
-/// exactly this reason) or `Option::<&str>::None`; [`tracing::field::Empty`]
-/// itself is the same type but only nameable by a crate that depends on
-/// `tracing` directly.
-///
-/// # Examples
+/// Records the supplied operation and system instructions. Provider and model
+/// fields are populated on adoption. Extra fields must not duplicate the marker
+/// or required fields: recording a duplicate name updates only its first field.
+/// Use [`Empty`] or `Option::<&str>::None` for unset values without a direct
+/// `tracing` dependency.
 ///
 /// ```
 /// use rig_core::telemetry::completion_parent_span;
@@ -262,15 +227,10 @@ macro_rules! completion_parent_span {
 // constants it implements.
 pub use crate::completion_parent_span;
 
-/// What [`CompletionSpanBuilder::build`] decided about the span that is
-/// current when it runs.
-///
-/// This is the whole adoption decision table in one place, kept free of
-/// side effects so every row can be asserted directly. Emitting the
-/// diagnostics for it is [`warn_once_on_completion_parent_verdict`]'s job.
+/// Classification of the current span for completion-parent adoption.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CompletionParentVerdict {
-    /// The marker plus the complete contract — adopt and enrich.
+    /// The marker and all required fields are present.
     Adopt,
     /// The marker, but the span omits at least one field in
     /// [`COMPLETION_PARENT_REQUIRED_FIELDS`]. The missing names are computed
@@ -281,10 +241,7 @@ enum CompletionParentVerdict {
     NotAParent,
 }
 
-/// Fields in [`COMPLETION_PARENT_REQUIRED_FIELDS`] that `metadata` does not
-/// statically declare. Only called on the warning path — the adoption gate
-/// itself needs a yes/no, not the names, and allocating a `Vec` on every
-/// completion would be waste.
+/// Returns undeclared required fields for the warning diagnostic.
 fn missing_required_fields(metadata: &tracing::Metadata<'_>) -> Vec<&'static str> {
     let fields = metadata.fields();
     COMPLETION_PARENT_REQUIRED_FIELDS
@@ -294,8 +251,7 @@ fn missing_required_fields(metadata: &tracing::Metadata<'_>) -> Vec<&'static str
         .collect()
 }
 
-/// Classify the span `metadata` as a completion parent. Pure: no logging, no
-/// global state — see [`CompletionParentVerdict`] for the decision table.
+/// Classifies span metadata without logging or changing global state.
 fn classify_completion_parent(metadata: &tracing::Metadata<'_>) -> CompletionParentVerdict {
     let fields = metadata.fields();
     // Exact match, never a prefix: a runtime field that merely starts with the
@@ -314,14 +270,8 @@ fn classify_completion_parent(metadata: &tracing::Metadata<'_>) -> CompletionPar
     }
 }
 
-/// Near-miss parent callsites already reported.
-///
-/// Keyed per callsite rather than by one process-wide flag: two runtimes can
-/// each declare a near-miss parent, and a single flag would report whichever
-/// won the race and stay silent about the other — while the `missing_fields`
-/// list it printed describes only that one span. Callsites are static, so this
-/// set is bounded by the number of distinct near-miss spans in the program
-/// (normally zero).
+/// Incomplete parent callsites already reported, bounded by the program's
+/// static callsites. Each callsite receives its own missing-field diagnostic.
 static NEAR_MISS_WARNED: LazyLock<Mutex<HashSet<Identifier>>> =
     LazyLock::new(|| Mutex::new(HashSet::new()));
 
@@ -341,15 +291,8 @@ fn reset_near_miss_warnings() {
         .clear();
 }
 
-/// Surface a verdict that a human should act on, once per offending callsite.
-///
-/// A rejected near-miss degrades safely — the fresh child span loses no
-/// telemetry — but silently, so the operator's only symptom would be a
-/// duplicated span layer in dashboards.
-///
-/// Neither a `Once` nor a poison-propagating lock: a subscriber panic must not
-/// turn a diagnostic into a hard failure on every subsequent completion, and a
-/// dedup set stays perfectly valid across an unrelated panic.
+/// Warns once per incomplete parent callsite, recovering a poisoned dedup lock.
+/// A subscriber panic must not prevent subsequent completions.
 fn warn_once_on_completion_parent_verdict(
     verdict: CompletionParentVerdict,
     metadata: &tracing::Metadata<'_>,
@@ -363,10 +306,8 @@ fn warn_once_on_completion_parent_verdict(
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
                 warned.insert(metadata.callsite())
             };
-            // The guard is released above, before `warn!`, and that scoping is
-            // load-bearing: `warn!` dispatches into arbitrary subscriber code,
-            // and a subscriber that transitively reaches `build` would
-            // deadlock re-entering this non-reentrant lock.
+            // Release the lock before invoking subscribers, which may re-enter
+            // the builder and deadlock if the guard is still held.
             if !first_sighting {
                 return;
             }
@@ -382,37 +323,6 @@ fn warn_once_on_completion_parent_verdict(
     }
 }
 
-/// A supported non-completion GenAI operation and its canonical span name.
-///
-/// The completion operations stay on [`CompletionOperation`]: they carry
-/// message content and participate in span adoption. These operations carry
-/// only usage and identity metadata, and their spans are always fresh.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ModalityOperation {
-    /// A text (or image) embedding request.
-    Embeddings,
-    /// A reranking request.
-    Rerank,
-    /// An audio transcription request.
-    Transcription,
-    /// An image generation request.
-    ImageGeneration,
-    /// An audio generation (text-to-speech) request.
-    AudioGeneration,
-}
-
-impl ModalityOperation {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Embeddings => "embeddings",
-            Self::Rerank => "rerank",
-            Self::Transcription => "transcription",
-            Self::ImageGeneration => "image_generation",
-            Self::AudioGeneration => "audio_generation",
-        }
-    }
-}
-
 macro_rules! new_modality_span {
     ($name:literal, $provider:expr, $request_model:expr, $operation:expr) => {
         $crate::telemetry::__tracing::info_span!(
@@ -423,6 +333,7 @@ macro_rules! new_modality_span {
             gen_ai.request.model = $request_model,
             gen_ai.response.id = $crate::telemetry::__tracing::field::Empty,
             gen_ai.response.model = $crate::telemetry::__tracing::field::Empty,
+            rig.provider_request_id = $crate::telemetry::__tracing::field::Empty,
             gen_ai.usage.input_tokens = $crate::telemetry::__tracing::field::Empty,
             gen_ai.usage.output_tokens = $crate::telemetry::__tracing::field::Empty,
             gen_ai.usage.cache_read.input_tokens = $crate::telemetry::__tracing::field::Empty,
@@ -433,162 +344,42 @@ macro_rules! new_modality_span {
     };
 }
 
-/// Builder for a canonical GenAI span on a non-completion modality
-/// (embeddings, rerank, transcription, image generation, audio generation).
+/// Builder for a canonical GenAI span.
 ///
-/// Unlike [`CompletionSpanBuilder`], this never adopts an ambient span: the
-/// adoption contract exists so one *model turn* has exactly one completion
-/// span, and a modality call is not a model turn — an agent's RAG lookup
-/// should appear as its own child span under the turn, not overwrite the
-/// turn's fields. The span is created under whatever span is current, so
-/// nesting comes for free.
-pub struct ModalitySpanBuilder<'a> {
+/// A completion operation reuses the current span when it declares
+/// [`COMPLETION_PARENT_MARKER_FIELD`] and every field in
+/// [`COMPLETION_PARENT_REQUIRED_FIELDS`], and otherwise opens a
+/// `rig::completions` child of the current span. Every other operation opens a
+/// fresh `rig::modalities` span.
+pub struct SpanBuilder<'a> {
     provider: &'a str,
     request_model: &'a str,
-    operation: ModalityOperation,
-}
-
-impl<'a> ModalitySpanBuilder<'a> {
-    /// Create a modality-span builder for a provider request.
-    pub fn new(provider: &'a str, request_model: &'a str, operation: ModalityOperation) -> Self {
-        Self {
-            provider,
-            request_model,
-            operation,
-        }
-    }
-
-    /// Build a canonical modality span.
-    pub fn build(self) -> tracing::Span {
-        let operation = self.operation.as_str();
-        match self.operation {
-            ModalityOperation::Embeddings => {
-                new_modality_span!("embeddings", self.provider, self.request_model, operation)
-            }
-            ModalityOperation::Rerank => {
-                new_modality_span!("rerank", self.provider, self.request_model, operation)
-            }
-            ModalityOperation::Transcription => {
-                new_modality_span!(
-                    "transcription",
-                    self.provider,
-                    self.request_model,
-                    operation
-                )
-            }
-            ModalityOperation::ImageGeneration => new_modality_span!(
-                "image_generation",
-                self.provider,
-                self.request_model,
-                operation
-            ),
-            ModalityOperation::AudioGeneration => new_modality_span!(
-                "audio_generation",
-                self.provider,
-                self.request_model,
-                operation
-            ),
-        }
-    }
-}
-
-/// The telemetry a normalized modality response can put on its span: the
-/// usage and identity fields every normalized response carries since the
-/// type-erasure sweep. Implemented for all six normalized response types.
-pub trait ModalityResponseTelemetry {
-    /// Rig-normalized token usage for the call.
-    fn telemetry_usage(&self) -> &Usage;
-    /// Provider-reported model identifier, when the wire named one.
-    fn telemetry_model(&self) -> Option<&str>;
-    /// Provider-assigned response-scoped identifier, when reported.
-    fn telemetry_response_id(&self) -> Option<&str>;
-}
-
-macro_rules! impl_modality_response_telemetry {
-    ($($ty:ty),+ $(,)?) => {
-        $(impl ModalityResponseTelemetry for $ty {
-            fn telemetry_usage(&self) -> &Usage {
-                &self.usage
-            }
-            fn telemetry_model(&self) -> Option<&str> {
-                self.model.as_deref()
-            }
-            fn telemetry_response_id(&self) -> Option<&str> {
-                self.response_id.as_deref()
-            }
-        })+
-    };
-}
-
-impl_modality_response_telemetry!(
-    crate::embeddings::EmbeddingResponse,
-    crate::embeddings::ImageEmbeddingResponse,
-    crate::rerank::RerankResponse,
-    crate::transcription::TranscriptionResponse,
-);
-#[cfg(feature = "image")]
-impl_modality_response_telemetry!(crate::image_generation::ImageGenerationResponse);
-#[cfg(feature = "audio")]
-impl_modality_response_telemetry!(crate::audio_generation::AudioGenerationResponse);
-
-/// Run a modality call inside its canonical span and record the normalized
-/// response's usage and identity onto it on success.
-///
-/// This is the one seam every provider implementation calls, so the span
-/// contract lives here rather than at thirty call sites. Errors close the
-/// span with its request fields only; the provider error itself already
-/// carries the preserved body and status.
-pub async fn instrument_modality<F, T, E>(
-    provider: &str,
-    request_model: &str,
-    operation: ModalityOperation,
-    call: F,
-) -> Result<T, E>
-where
-    F: Future<Output = Result<T, E>>,
-    T: ModalityResponseTelemetry,
-{
-    let span = ModalitySpanBuilder::new(provider, request_model, operation).build();
-    let result = tracing::Instrument::instrument(call, span.clone()).await;
-    if let Ok(response) = &result {
-        span.record_token_usage(response.telemetry_usage());
-        if let Some(id) = response.telemetry_response_id() {
-            span.record("gen_ai.response.id", id);
-        }
-        if let Some(model) = response.telemetry_model() {
-            span.record("gen_ai.response.model", model);
-        }
-    }
-    result
-}
-
-/// Builder for a canonical GenAI completion span.
-///
-/// Runtime spans declaring [`COMPLETION_PARENT_MARKER_FIELD`] and the
-/// [`COMPLETION_PARENT_REQUIRED_FIELDS`] are enriched and reused so one model
-/// turn has exactly one model span. Other ambient spans — and marker spans that
-/// omit a required field — remain parents of a newly created `rig::completions`
-/// span.
-pub struct CompletionSpanBuilder<'a> {
-    provider: &'a str,
-    request_model: &'a str,
-    operation: CompletionOperation,
+    operation: GenAiOperation,
     system_instructions: Option<String>,
+    streaming: Option<bool>,
 }
 
-impl<'a> CompletionSpanBuilder<'a> {
-    /// Create a completion-span builder for a provider request.
-    pub fn new(provider: &'a str, request_model: &'a str, operation: CompletionOperation) -> Self {
+impl<'a> SpanBuilder<'a> {
+    /// Create a span builder for a provider request.
+    pub fn new(provider: &'a str, request_model: &'a str, operation: GenAiOperation) -> Self {
         Self {
             provider,
             request_model,
             operation,
             system_instructions: None,
+            streaming: None,
         }
     }
 
+    /// Record whether the request streams its response, as
+    /// `gen_ai.request.stream`. Only completion spans record it.
+    pub fn streaming(mut self, streaming: bool) -> Self {
+        self.streaming = Some(streaming);
+        self
+    }
+
     /// Set the system instructions sent with the request when sensitive content
-    /// telemetry has been explicitly enabled.
+    /// telemetry has been explicitly enabled. Only completion spans record them.
     pub fn system_instructions(
         mut self,
         system_instructions: Option<&'a str>,
@@ -598,62 +389,65 @@ impl<'a> CompletionSpanBuilder<'a> {
         self
     }
 
-    /// Build a canonical completion span or enrich Rig's current completion-parent span.
+    /// Build the operation's canonical span, or enrich Rig's current
+    /// completion-parent span for a completion operation.
     pub fn build(self) -> tracing::Span {
-        let current = tracing::Span::current();
-        if let Some(metadata) = current.metadata() {
-            let verdict = classify_completion_parent(metadata);
-            warn_once_on_completion_parent_verdict(verdict, metadata);
-            if verdict == CompletionParentVerdict::Adopt {
-                current.record("gen_ai.operation.name", self.operation.as_str());
-                current.record("gen_ai.provider.name", self.provider);
-                current.record("gen_ai.request.model", self.request_model);
-                if let Some(system_instructions) = self.system_instructions.as_deref() {
-                    current.record("gen_ai.system_instructions", system_instructions);
-                }
-                return current;
-            }
+        if self.operation.is_completion()
+            && let Some(parent) = self.adopt_completion_parent()
+        {
+            return parent;
         }
 
-        let operation = self.operation.as_str();
-        let system_instructions = self.system_instructions.as_deref();
-        match self.operation {
-            CompletionOperation::Chat => new_completion_span!(
-                "chat",
-                self.provider,
-                self.request_model,
-                operation,
-                system_instructions
-            ),
-            CompletionOperation::ChatStreaming => new_completion_span!(
-                "chat_streaming",
-                self.provider,
-                self.request_model,
-                operation,
-                system_instructions
-            ),
-            CompletionOperation::GenerateContent => new_completion_span!(
-                "generate_content",
-                self.provider,
-                self.request_model,
-                operation,
-                system_instructions
-            ),
-            CompletionOperation::Interactions => new_completion_span!(
-                "interactions",
-                self.provider,
-                self.request_model,
-                operation,
-                system_instructions
-            ),
-            CompletionOperation::InteractionsStreaming => new_completion_span!(
-                "interactions_streaming",
-                self.provider,
-                self.request_model,
-                operation,
-                system_instructions
-            ),
+        let (provider, model) = (self.provider, self.request_model);
+        let op = self.operation.as_str();
+        let sys = self.system_instructions.as_deref();
+        let span = match self.operation {
+            GenAiOperation::Chat => new_completion_span!("chat", provider, model, op, sys),
+            GenAiOperation::GenerateContent => {
+                new_completion_span!("generate_content", provider, model, op, sys)
+            }
+            GenAiOperation::Embeddings => new_modality_span!("embeddings", provider, model, op),
+            GenAiOperation::Rerank => new_modality_span!("rerank", provider, model, op),
+            GenAiOperation::Transcription => {
+                new_modality_span!("transcription", provider, model, op)
+            }
+            GenAiOperation::ImageGeneration => {
+                new_modality_span!("image_generation", provider, model, op)
+            }
+            GenAiOperation::AudioGeneration => {
+                new_modality_span!("audio_generation", provider, model, op)
+            }
+        };
+        if self.operation.is_completion() {
+            self.record_streaming(&span);
         }
+        span
+    }
+
+    fn record_streaming(&self, span: &tracing::Span) {
+        if let Some(streaming) = self.streaming {
+            span.record("gen_ai.request.stream", streaming);
+        }
+    }
+
+    /// The current span, enriched with this request, when it is a conforming
+    /// completion parent. Warns once per near-miss callsite.
+    fn adopt_completion_parent(&self) -> Option<tracing::Span> {
+        let current = tracing::Span::current();
+        let metadata = current.metadata()?;
+        let verdict = classify_completion_parent(metadata);
+        warn_once_on_completion_parent_verdict(verdict, metadata);
+        if verdict != CompletionParentVerdict::Adopt {
+            return None;
+        }
+        current.record("gen_ai.operation.name", self.operation.as_str());
+        current.record("gen_ai.provider.name", self.provider);
+        current.record("gen_ai.request.model", self.request_model);
+        self.record_streaming(&current);
+        if let Some(system_instructions) = self.system_instructions.as_deref() {
+            current.record("gen_ai.system_instructions", system_instructions);
+        }
+        Some(current)
     }
 }
 
@@ -689,6 +483,9 @@ enum TelemetryPart {
     },
     Reasoning {
         content: String,
+    },
+    Opaque {
+        kind: String,
     },
     Uri {
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -740,9 +537,6 @@ where
             modality,
             content: base64::engine::general_purpose::STANDARD.encode(content),
         }),
-        DocumentSourceKind::String(content) => Some(TelemetryPart::Text {
-            content: content.clone(),
-        }),
         DocumentSourceKind::Unknown => None,
     }
 }
@@ -751,21 +545,12 @@ fn image_part(image: &Image) -> Option<TelemetryPart> {
     media_part(&image.data, image.media_type.as_ref(), "image")
 }
 
-fn reasoning_parts(reasoning: &Reasoning) -> Vec<TelemetryPart> {
-    reasoning
-        .content
-        .iter()
-        .map(|content| {
-            let content = match content {
-                ReasoningContent::Text { text, .. } | ReasoningContent::Summary(text) => text,
-                ReasoningContent::Encrypted(content) => content,
-                ReasoningContent::Redacted { data } => data,
-            };
-            TelemetryPart::Reasoning {
-                content: content.clone(),
-            }
-        })
-        .collect()
+/// A provider-only item, named by its `type` and nothing else: its payload
+/// is the provider's, not content.
+fn opaque_part(opaque: &Opaque) -> TelemetryPart {
+    TelemetryPart::Opaque {
+        kind: opaque.kind().unwrap_or("unknown").to_owned(),
+    }
 }
 
 fn tool_result_response(result: &ToolResult) -> serde_json::Value {
@@ -806,9 +591,14 @@ fn user_parts(content: &[UserContent]) -> Vec<TelemetryPart> {
             UserContent::Video(video) => {
                 media_part(&video.data, video.media_type.as_ref(), "video")
             }
-            UserContent::Document(document) => {
-                media_part(&document.data, document.media_type.as_ref(), "document")
-            }
+            UserContent::Document(document) => match &document.data {
+                DocumentData::Text(content) => Some(TelemetryPart::Text {
+                    content: content.clone(),
+                }),
+                DocumentData::File(data) => {
+                    media_part(data, document.media_type.as_ref(), "document")
+                }
+            },
         })
         .collect()
 }
@@ -822,19 +612,22 @@ fn assistant_parts(content: &[AssistantContent]) -> Vec<TelemetryPart> {
             }],
             AssistantContent::ToolCall(tool_call) => vec![TelemetryPart::ToolCall {
                 id: Some(tool_call.id.to_string()),
-                name: tool_call.function.name.clone(),
-                arguments: tool_call.function.arguments.clone(),
+                name: tool_call.function.name.clone().into(),
+                arguments: tool_call.function.arguments_value(),
             }],
-            AssistantContent::Reasoning(reasoning) => reasoning_parts(reasoning),
+            AssistantContent::Reasoning(reasoning) => vec![TelemetryPart::Reasoning {
+                content: reasoning.text.clone(),
+            }],
             AssistantContent::Image(image) => image_part(image).into_iter().collect(),
+            AssistantContent::Opaque(opaque) => vec![opaque_part(opaque)],
         })
         .collect()
 }
 
-fn input_messages(messages: &[Message]) -> Vec<TelemetryChatMessage> {
+fn input_messages(messages: &[impl Borrow<Message>]) -> Vec<TelemetryChatMessage> {
     messages
         .iter()
-        .map(|message| match message {
+        .map(|message| match message.borrow() {
             Message::System { content } => TelemetryChatMessage {
                 role: "system",
                 parts: vec![TelemetryPart::Text {
@@ -845,9 +638,9 @@ fn input_messages(messages: &[Message]) -> Vec<TelemetryChatMessage> {
                 role: "user",
                 parts: user_parts(content),
             },
-            Message::Assistant { content, .. } => TelemetryChatMessage {
+            Message::Assistant(turn) => TelemetryChatMessage {
                 role: "assistant",
-                parts: assistant_parts(content),
+                parts: assistant_parts(&turn.content),
             },
         })
         .collect()
@@ -892,7 +685,7 @@ pub fn system_instructions_json(instructions: Option<&str>, enabled: bool) -> Op
 /// Message content can contain prompts, retrieved context, tool results, and
 /// other sensitive or high-cardinality data. Keep this disabled unless the
 /// caller has explicitly opted in for debugging/observability.
-pub fn record_model_input(span: &tracing::Span, messages: &[Message], enabled: bool) {
+pub fn record_model_input(span: &tracing::Span, messages: &[impl Borrow<Message>], enabled: bool) {
     if !enabled || span.is_disabled() {
         return;
     }
@@ -919,34 +712,13 @@ pub fn record_model_output(span: &tracing::Span, content: &[AssistantContent], e
     }
 }
 
-/// Provider response metadata used to populate GenAI telemetry spans.
-pub trait ProviderResponseExt {
-    /// Provider-native usage type.
-    type Usage: Serialize;
-
-    /// Returns the provider response ID, if supplied.
-    fn response_id(&self) -> Option<&str>;
-
-    /// Returns the provider response model name, if supplied.
-    fn response_model_name(&self) -> Option<&str>;
-
-    /// Returns the primary text response, when available.
-    fn text_response(&self) -> Option<String>;
-
-    /// Returns provider-native usage metrics, if supplied.
-    fn usage(&self) -> Option<Self::Usage>;
-}
-
-/// A trait designed specifically to be used with Spans for the purpose of recording telemetry.
-/// Implemented for [`tracing::Span`] to record GenAI semantic convention fields.
+/// Records GenAI usage and response metadata on tracing spans.
 pub trait SpanCombinator {
     /// Record Rig-normalized token usage fields on the span.
     fn record_token_usage(&self, usage: &Usage);
 
-    /// Record provider response metadata such as response ID and model name.
-    fn record_response_metadata<R>(&self, response: &R)
-    where
-        R: ProviderResponseExt;
+    /// Record a response's ID, model, and token usage on the span.
+    fn record_response(&self, response_id: Option<&str>, model: Option<&str>, usage: &Usage);
 }
 
 impl SpanCombinator for tracing::Span {
@@ -981,21 +753,17 @@ impl SpanCombinator for tracing::Span {
         }
     }
 
-    fn record_response_metadata<R>(&self, response: &R)
-    where
-        R: ProviderResponseExt,
-    {
+    fn record_response(&self, response_id: Option<&str>, model: Option<&str>, usage: &Usage) {
         if self.is_disabled() {
             return;
         }
-
-        if let Some(id) = response.response_id() {
+        if let Some(id) = response_id {
             self.record("gen_ai.response.id", id);
         }
-
-        if let Some(model_name) = response.response_model_name() {
-            self.record("gen_ai.response.model", model_name);
+        if let Some(model) = model {
+            self.record("gen_ai.response.model", model);
         }
+        self.record_token_usage(usage);
     }
 }
 

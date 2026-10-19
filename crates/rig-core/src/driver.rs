@@ -1,320 +1,1059 @@
-//! The one driver: the only `async` in the provider layer.
+//! Calls a model. A [`Model`] pairs a [`Wire`] (what to send and how to read
+//! the reply) with a [`Transport`] (how the payload travels). Its `stream`
+//! yields any operation's events as a [`Streamed`], and its `call` is that
+//! stream, finished: one decoder, one fold and one response constructor for
+//! both. The `_observed` twins take the observation context a recorder
+//! records under.
 //!
-//! [`call`] and [`stream`] are the whole HTTP half of every provider in this
-//! crate. Everything that used to be duplicated per provider or per
-//! `_observed` sibling lives here once: the status split and the non-success
-//! funnel (rig#2210/#2314), transport request-id capture, the `Accept`
-//! header, observation facts, the telemetry span and usage recording, and
-//! the frame-triage policy table.
+//! ```no_run
+//! use rig_core::completion::CompletionRequest;
+//! use rig_core::driver::Model;
+//! use rig_core::providers::openai::{self, OpenAIConfig};
 //!
-//! **Unary is a stream of one frame.** [`call`] frames the whole reply body
-//! with the same framer and drives it through the same [`Decoder`] a stream
-//! would, then folds the events into the operation's response. There is no
-//! `decode`, so a provider's unary and streaming replies cannot drift.
-//!
-//! [`Bound`] is a wire plus its socket, and the one implementation of each
-//! consumer-facing trait that rig-core ships.
+//! # async fn example(http: rig_core::http_client::DynHttpClient) -> Result<(), Box<dyn std::error::Error>> {
+//! let model = OpenAIConfig::from_env()?.connect(http).responses(openai::GPT_5_2);
+//! let response = model.call(CompletionRequest::new("Hello")).await?;
+//! # let _ = response;
+//! # Ok(())
+//! # }
+//! ```
 
-use bytes::Bytes;
-use futures::{Stream, StreamExt};
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll};
 
-use crate::http_client::framing::{Framing, NdjsonFramer, SseFramer};
-use crate::http_client::{self, HttpClientExt};
-use crate::observe::{AdapterContext, AdapterEnding, AdapterErrorBoundary, AdapterSlot};
-use crate::providers::internal::wire::WireEvent;
-use crate::wasm_compat::WasmCompatSend;
+use futures::StreamExt;
+use tracing::Instrument;
+
+use crate::error::ProviderError;
+use crate::observe::{AdapterContext, AdapterSlot};
+use crate::streaming::{Item, Streamed};
+use crate::wasm_compat::{WasmBoxedFuture, WasmBoxedStream, WasmCompatSend, WasmCompatSync};
+use crate::wire::document::Reassemble;
 use crate::wire::{
-    Body, Decoder, Encoded, Error, Event, Fold, Mode, Operation, Reply, Request, Response, Sink,
-    Wire, WireError, WireFrame,
+    Call, Capabilities, Decoder, Descriptor, Flow, Mode, Operation, Out, Request, Response, Shared,
+    Wire, WireEvent,
 };
 
-mod bound;
-mod consumers;
+mod dyn_model;
+pub(crate) mod http_transport;
+mod local;
 
-pub use bound::{Bind, Bound};
-#[cfg(feature = "audio")]
-pub use consumers::HasAudioGeneration;
-#[cfg(feature = "image")]
-pub use consumers::HasImageGeneration;
-pub use consumers::{
-    CompletionProvider, HasCompletion, HasEmbedding, HasImageEmbedding, HasModelListing, HasRerank,
-    HasTranscription, HasVerify, Socket,
-};
+pub use dyn_model::DynModel;
+pub use local::{Local, Step};
 
-/// The frame-triage policy table, in one place for every operation:
+/// An endpoint of one provider: a wire bound to a transport.
 ///
-/// | classify             | driver action                                     |
-/// |----------------------|---------------------------------------------------|
-/// | [`WireEvent::Known`] | `interpret`, then yield what it pushed            |
-/// | `WireEvent::Unknown` | warn (metadata only), skip semantically, and hand |
-/// |                      | the raw value to the operation's passthrough      |
-/// | `WireEvent::Corrupt` | an in-band `Err` item; keep consuming             |
-/// | transport `Err`      | flush delivered content, one `Err`, then end      |
-///
-/// The same table serves a streamed reply and a buffered one: `call` stops
-/// at the first `Err` item because its fold is fallible, so a corrupt frame
-/// fails a unary call and surfaces in-band on a stream without the driver
-/// naming the difference.
-pub struct WireDriver<Op: Operation, D, F = WireFrame> {
-    decoder: D,
-    out: Op::Output,
-    ready: Vec<Result<Op::Event, Op::Error>>,
-    /// Frames counted for observation's EOF/corruption positions.
-    frames: usize,
-    observation: Option<AdapterSlot>,
-    done: bool,
-    laws: <Op::Output as Sink<Op>>::Laws,
-    frame: std::marker::PhantomData<fn(F)>,
+/// The pair holds no invariant, so both halves are public. To share one
+/// transport across models, clone it; to send a model's requests another
+/// way, replace its transport. The transport defaults to the erased HTTP
+/// client, so a model on the default transport is `Model<W>`.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Model<W, T = crate::http_client::DynHttpClient> {
+    /// What to send and how to read the reply.
+    pub wire: W,
+    /// How the payload travels.
+    pub transport: T,
+    /// What preparing the last request leaves for the next.
+    prepared: crate::wire::Prepared,
 }
 
-impl<Op, D, F> WireDriver<Op, D, F>
-where
-    Op: Operation,
-    D: Decoder<Op, F>,
-{
-    /// A driver over one reply, without observation.
-    pub fn new(decoder: D) -> Self {
-        Self::observed(decoder, None)
-    }
-
-    pub(crate) fn observed(decoder: D, observation: Option<AdapterSlot>) -> Self {
+impl<W, T> Model<W, T> {
+    /// Pair `wire` with the `transport` that sends it.
+    pub fn new(wire: W, transport: T) -> Self {
         Self {
-            decoder,
-            out: Op::Output::default(),
-            ready: Vec::new(),
-            frames: 0,
-            observation,
-            done: false,
-            laws: Default::default(),
-            frame: std::marker::PhantomData,
-        }
-    }
-
-    /// Whether the provider's genuine terminal already arrived: the driver
-    /// stops consuming, and never runs the EOF flush.
-    pub fn done(&self) -> bool {
-        self.done
-    }
-
-    /// Feed one frame.
-    pub fn push(&mut self, frame: F) {
-        if self.done {
-            return;
-        }
-        let analysis_only = self.observation.is_some() && self.decoder.is_analysis_only(&frame);
-        let classified = self.decoder.classify(frame);
-        // Never exempt a corrupt frame, even when the provider's metadata
-        // predicate accepts its shape.
-        let corrupt = matches!(classified, WireEvent::Corrupt(_));
-        if (corrupt || !analysis_only) && self.observation.is_some() {
-            self.frames += 1;
-        }
-        match classified {
-            WireEvent::Known(event) => self.decoder.interpret(event, &mut self.out),
-            // Skipped semantically, but surfaced verbatim where the
-            // operation has a raw passthrough channel; aggregation never
-            // folds it into the answer.
-            WireEvent::Unknown { event_type, value } => {
-                warn_unmodeled(&event_type, &value);
-                if let Some(event) = Op::unknown(value) {
-                    self.out.push(Ok(event));
-                }
-            }
-            WireEvent::Corrupt(error) => {
-                if let Some(observation) = &self.observation {
-                    observation.corrupt(self.frames);
-                }
-                self.ready.push(Err(Op::Error::json(error)));
-            }
-        }
-        self.out.check_laws(&mut self.laws);
-        self.collect();
-        if self.decoder.is_finished() {
-            self.done = true;
-        }
-    }
-
-    /// Report a transport failure: truncation semantics — content the
-    /// provider fully delivered flushes first, then the error is the last
-    /// item and nothing follows it.
-    pub fn fail(&mut self, error: Op::Error) {
-        if self.done {
-            return;
-        }
-        if let Some(observation) = &self.observation {
-            observation.fail(&error);
-        }
-        self.decoder.flush_before_terminal_error(&mut self.out);
-        self.collect();
-        self.ready.push(Err(error));
-        self.done = true;
-    }
-
-    /// End of reply: flush what the decoder still holds. Never runs after a
-    /// transport error or after a terminal.
-    pub fn finish(&mut self) {
-        if self.done {
-            return;
-        }
-        if let Some(observation) = &self.observation {
-            observation.transport_eof(self.frames);
-        }
-        self.decoder.finish(&mut self.out);
-        self.out.check_laws(&mut self.laws);
-        self.collect();
-        if let Some(observation) = &self.observation {
-            observation.eof(self.frames);
-        }
-        self.done = true;
-    }
-
-    /// Take the items the pushed frames produced.
-    pub fn drain(&mut self) -> std::vec::Drain<'_, Result<Op::Event, Op::Error>> {
-        self.ready.drain(..)
-    }
-
-    /// The next page's request, if the reply named one.
-    pub fn continuation(&self) -> Option<http::Request<Body>> {
-        self.decoder.continuation()
-    }
-
-    /// The reply as one document, when the decoder reassembled it.
-    pub fn document(&self) -> Option<serde_json::Value> {
-        self.decoder.document()
-    }
-
-    /// Project a payload's observation facts through the decoder.
-    fn project(&self, payload: &[u8]) {
-        if let Some(observation) = &self.observation {
-            observation.project(|sink| self.decoder.project(payload, sink));
-        }
-    }
-
-    /// Move one step's output into the ready queue, reporting a terminal to
-    /// observation as it passes.
-    fn collect(&mut self) {
-        let mut terminal = false;
-        for item in self.out.drain() {
-            if let Some(observation) = &self.observation {
-                match &item {
-                    Ok(event) if Op::is_terminal(event) => {
-                        observation.finish(AdapterEnding::Terminal);
-                    }
-                    Err(error) => observation.fail(error),
-                    _ => {}
-                }
-            }
-            terminal |= matches!(&item, Ok(event) if Op::is_terminal(event));
-            self.ready.push(item);
-        }
-        if terminal {
-            self.done = true;
+            wire,
+            transport,
+            prepared: crate::wire::Prepared::default(),
         }
     }
 }
 
-impl<Op, D> WireDriver<Op, D>
+impl<W, T> Model<W, T>
 where
-    Op: Operation,
-    D: Decoder<Op>,
+    W: Wire<Op = crate::operation::Completion>,
+    T: Transport<W>,
 {
-    /// Project and decode one framed payload: the step every byte reply
-    /// takes, whatever produced its bytes. The payload is projected whether
-    /// or not it is a frame (a heartbeat still carries facts), and
-    /// [`Self::push`] already no-ops once the reply is done.
+    /// Every option of `request` this model would refuse, found by preparing
+    /// and encoding it as [`Self::call`] does, with nothing sent. It lists
+    /// the refusals of the model's catalog entry
+    /// ([`ModelSpec::refusals`](crate::catalog::ModelSpec::refusals)) and
+    /// those of the wire and its route, all of them rather than the first.
+    /// The request's [`OnUnsupported`](crate::completion::OnUnsupported)
+    /// policy does not change what is listed, but a request whose
+    /// [`GenerationOptions`](crate::completion::GenerationOptions) are
+    /// default is not checked against the catalog, as when it is sent.
     ///
-    /// One payload at a time, because a streamed reply yields between them:
-    /// a consumer that stops reading must not have facts recorded for the
-    /// frames it never saw.
-    fn absorb(&mut self, payload: Framed) {
-        self.project(payload.payload());
-        if let Some(frame) = payload.into_frame() {
-            self.push(frame);
+    /// The request's messages are not read: its system prompt and a
+    /// stand-in prompt take their place, so a check costs the same for any
+    /// history. A refusal that depends on what the messages hold, such as
+    /// Bedrock's of a cache checkpoint after a reasoning turn, is reported
+    /// when the request is sent.
+    ///
+    /// # Errors
+    ///
+    /// [`CheckError::Unsupported`](crate::completion::CheckError::Unsupported)
+    /// with every refusal, or
+    /// [`CheckError::Invalid`](crate::completion::CheckError::Invalid) when the request cannot be built for another
+    /// reason.
+    pub fn check(
+        &self,
+        request: &crate::completion::CompletionRequest,
+    ) -> Result<(), crate::completion::CheckError> {
+        check_with(request, |request| self.dry_run(request))
+    }
+}
+
+/// The answer of `run`, a dry run of `request` without its messages, for
+/// [`Model::check`]. The run goes on past each refusal as under
+/// [`OnUnsupported::Ignore`](crate::completion::OnUnsupported::Ignore), so
+/// it meets every one; a request whose options are default stays default,
+/// so it is not checked against the catalog, as when it is sent.
+pub(crate) fn check_with(
+    request: &crate::completion::CompletionRequest,
+    run: impl FnOnce(crate::completion::CompletionRequest) -> Result<(), ProviderError>,
+) -> Result<(), crate::completion::CheckError> {
+    use crate::completion::{CheckError, OnUnsupported};
+    let mut request = without_messages(request);
+    if !request.options.is_default() {
+        request.options.on_unsupported = Some(OnUnsupported::Ignore);
+    }
+    match crate::completion::options::collect_refusals(|| run(request)) {
+        (Err(error), _) => Err(CheckError::Invalid(error)),
+        (Ok(()), refusals) if refusals.is_empty() => Ok(()),
+        (Ok(()), refusals) => Err(CheckError::Unsupported(refusals)),
+    }
+}
+
+/// `request` with its leading system prompt and a stand-in prompt as its
+/// messages, everything else as it is: what [`check_with`] dry-runs.
+pub(crate) fn without_messages(
+    request: &crate::completion::CompletionRequest,
+) -> crate::completion::CompletionRequest {
+    use crate::completion::{CompletionRequest, Message};
+    let CompletionRequest {
+        model,
+        chat_history,
+        documents,
+        tools,
+        temperature,
+        max_tokens,
+        tool_choice,
+        additional_params,
+        output_schema,
+        record_telemetry_content,
+        accept_unknown_finish_reasons,
+        foreign_reasoning,
+        options,
+        provider_options,
+        cache_points,
+    } = request;
+    let system = chat_history
+        .first()
+        .filter(|message| matches!(&***message, Message::System { .. }));
+    CompletionRequest {
+        model: model.clone(),
+        chat_history: system
+            .cloned()
+            .into_iter()
+            .chain([std::sync::Arc::new(Message::user("check"))])
+            .collect(),
+        documents: documents.clone(),
+        tools: tools.clone(),
+        temperature: *temperature,
+        max_tokens: *max_tokens,
+        tool_choice: tool_choice.clone(),
+        additional_params: additional_params.clone(),
+        output_schema: output_schema.clone(),
+        record_telemetry_content: *record_telemetry_content,
+        accept_unknown_finish_reasons: *accept_unknown_finish_reasons,
+        foreign_reasoning: *foreign_reasoning,
+        options: options.clone(),
+        provider_options: provider_options.clone(),
+        cache_points: cache_points.clone(),
+    }
+}
+
+/// Sends a wire's payloads and delivers its replies' frames.
+///
+/// HTTP clients ([`HttpClientExt`](crate::http_client::HttpClientExt)) are
+/// transports for every wire that encodes [`Encoded`](crate::wire::Encoded)
+/// requests and reads [`WireFrame`](crate::wire::WireFrame)s. A local
+/// runtime, a proxy or a mock is a transport for the wires it serves.
+pub trait Transport<W: Wire>: Clone + WasmCompatSend + WasmCompatSync + 'static {
+    /// Open the reply to one payload. Nothing is sent until the opening is
+    /// first polled. A payload the transport cannot send in the exchange's
+    /// mode fails the opening; a failure after the reply opened is its last
+    /// frame.
+    fn send(&self, payload: W::Payload, exchange: Exchange) -> Opening<W::Frame>;
+}
+
+/// What the driver tells a transport about one send.
+#[derive(Clone)]
+pub struct Exchange {
+    /// How the reply is read.
+    pub mode: Mode,
+    /// The observation an observing transport records the send under.
+    pub(crate) observation: Option<AdapterContext>,
+    /// What the HTTP transport puts in the request's extensions, such as
+    /// the [`Serving`](crate::serve::Serving) of a dispatched effect.
+    pub(crate) extensions: http::Extensions,
+}
+
+/// What a caller adds to one send besides the request: the observation to
+/// record it under, and the HTTP request's extensions.
+#[derive(Default)]
+pub(crate) struct Sending {
+    pub(crate) observation: Option<AdapterContext>,
+    pub(crate) extensions: http::Extensions,
+}
+
+impl Sending {
+    /// A send observed under `observation`.
+    pub(crate) fn observed(observation: AdapterContext) -> Self {
+        Self {
+            observation: Some(observation),
+            extensions: http::Extensions::new(),
         }
     }
 }
 
-/// Drive an already-framed transport stream through a decoder.
-///
-/// The async wrapper over [`WireDriver`], and nothing else: it exists so a
-/// typed transport — an AWS event stream, a gRPC stream, an in-process
-/// generator — can reuse the fold without an HTTP request behind it. Every
-/// byte wire in this crate goes through [`stream`] instead, which frames the
-/// bytes, captures the request id and records the span on top of the same
-/// fold.
-pub fn run_wire_stream<D, F, S>(transport: S, decoder: D) -> crate::streaming::StreamingResult
+/// One reply, opened when first polled.
+pub struct Opening<F>(WasmBoxedFuture<'static, Result<Opened<F>, ProviderError>>);
+
+impl<F: WasmCompatSend + 'static> Opening<F> {
+    /// The reply `open` opens.
+    pub fn new(
+        open: impl Future<Output = Result<Opened<F>, ProviderError>> + WasmCompatSend + 'static,
+    ) -> Self {
+        Self(Box::pin(open))
+    }
+
+    /// A reply that is already open.
+    pub fn ready(opened: Opened<F>) -> Self {
+        Self::new(std::future::ready(Ok(opened)))
+    }
+
+    /// A reply that failed to open with `error`.
+    pub fn failed(error: ProviderError) -> Self {
+        Self::new(std::future::ready(Err(error)))
+    }
+}
+
+impl<F> Future for Opening<F> {
+    type Output = Result<Opened<F>, ProviderError>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        self.0.as_mut().poll(cx)
+    }
+}
+
+/// One reply a transport opened: its frames, and the facts the transport
+/// owns.
+pub struct Opened<F> {
+    pub(crate) frames: WasmBoxedStream<'static, Result<F, ProviderError>>,
+    pub(crate) request_id: Option<String>,
+    pub(crate) status: Option<http::StatusCode>,
+    pub(crate) headers: Option<http::HeaderMap>,
+    pub(crate) route: Option<String>,
+    pub(crate) document: Option<serde_json::Value>,
+    pub(crate) slot: Option<AdapterSlot>,
+    pub(crate) analysis_only: Option<fn(&F) -> bool>,
+}
+
+impl<F: WasmCompatSend + 'static> Opened<F> {
+    /// A reply of `frames`, in order. A transport failure is the last item.
+    pub fn new(
+        frames: impl futures::Stream<Item = Result<F, ProviderError>> + WasmCompatSend + 'static,
+    ) -> Self {
+        Self {
+            frames: Box::pin(frames),
+            request_id: None,
+            status: None,
+            headers: None,
+            route: None,
+            document: None,
+            slot: None,
+            analysis_only: None,
+        }
+    }
+
+    /// A reply that failed with `error` before any frame.
+    pub fn failed(error: ProviderError) -> Self {
+        Self::new(futures::stream::once(async move { Err(error) }))
+    }
+
+    /// The provider's transport request id, when the reply carried one. An
+    /// empty id is no id.
+    pub fn with_request_id(mut self, request_id: Option<String>) -> Self {
+        self.request_id = crate::provider_response::reported(request_id);
+        self
+    }
+
+    /// The reply's HTTP status and headers, which enrich its unary failure.
+    pub fn with_http(mut self, status: http::StatusCode, headers: http::HeaderMap) -> Self {
+        self.status = Some(status);
+        self.headers = Some(headers);
+        self
+    }
+
+    /// The concrete request path, which a listing's failure names.
+    pub fn with_route(mut self, route: impl Into<String>) -> Self {
+        self.route = Some(route.into());
+        self
+    }
+
+    /// The whole reply as one document: the response's `raw`. A reply
+    /// with one is not fed to the wire's reassembler.
+    pub fn with_document(mut self, document: serde_json::Value) -> Self {
+        self.document = Some(document);
+        self
+    }
+
+    /// The same reply, its frames passed through `frames`: what a transport
+    /// that wraps another uses to watch or rewrite a reply in flight.
+    pub fn map_frames<S>(
+        mut self,
+        frames: impl FnOnce(WasmBoxedStream<'static, Result<F, ProviderError>>) -> S,
+    ) -> Self
+    where
+        S: futures::Stream<Item = Result<F, ProviderError>> + WasmCompatSend + 'static,
+    {
+        self.frames = Box::pin(frames(self.frames));
+        self
+    }
+}
+
+impl<W, T> Model<W, T>
 where
-    D: Decoder<crate::operation::Completion, F> + WasmCompatSend + 'static,
-    F: WasmCompatSend + 'static,
-    S: Stream<Item = Result<F, crate::completion::CompletionError>> + WasmCompatSend + 'static,
+    W: Wire,
+    T: Transport<W>,
 {
-    let mut driver = WireDriver::<crate::operation::Completion, _, F>::new(decoder);
-    Box::pin(async_stream::stream! {
-        let mut transport = Box::pin(transport);
-        while let Some(frame) = transport.next().await {
-            match frame {
-                Ok(frame) => driver.push(frame),
-                Err(error) => driver.fail(error),
-            }
-            for item in driver.drain() {
-                yield item;
-            }
-            if driver.done() {
+    /// The wire's provider descriptor name (`"anthropic"`).
+    pub fn name(&self) -> &str {
+        self.wire.describe().name
+    }
+
+    /// The model id the wire addresses, when the operation addresses one.
+    pub fn id(&self) -> Option<&str> {
+        self.wire.describe().model
+    }
+
+    /// What a runtime accounts for about this model, such as an embedding
+    /// model's width.
+    pub fn capabilities(&self) -> Capabilities {
+        self.wire.describe().capabilities
+    }
+
+    /// Send `request` and fold the whole reply into the operation's
+    /// response: [`Self::stream`] of a unary reply, finished. A completion
+    /// takes a prompt, a conversation or a
+    /// [`CompletionRequest`](crate::completion::CompletionRequest).
+    pub fn call(
+        &self,
+        request: impl Into<Request<W>>,
+    ) -> impl Future<Output = Result<Response<W>, ProviderError>> + WasmCompatSend + 'static {
+        self.finished(request.into(), Sending::default())
+    }
+
+    /// [`Self::call`], with the attempt observed under `observation`.
+    pub fn call_observed(
+        &self,
+        request: impl Into<Request<W>>,
+        observation: AdapterContext,
+    ) -> impl Future<Output = Result<Response<W>, ProviderError>> + WasmCompatSend + 'static {
+        self.finished(request.into(), Sending::observed(observation))
+    }
+
+    /// The call opens when first polled, so its span is created under the
+    /// caller's instrumented context.
+    fn finished(
+        &self,
+        request: Request<W>,
+        sending: Sending,
+    ) -> impl Future<Output = Result<Response<W>, ProviderError>> + WasmCompatSend + 'static {
+        let model = self.clone();
+        async move { model.open(request, Mode::Unary, sending)?.finish().await }
+    }
+
+    /// Open a streamed reply. Encoding errors return here; every later
+    /// failure arrives in-band, as the stream's last item. Nothing is sent
+    /// until the stream is first polled.
+    pub fn stream(&self, request: impl Into<Request<W>>) -> Result<Streamed<W::Op>, ProviderError> {
+        self.open(request.into(), Mode::Streaming, Sending::default())
+    }
+
+    /// [`Self::stream`], with the attempt observed under `observation`.
+    pub fn stream_observed(
+        &self,
+        request: impl Into<Request<W>>,
+        observation: AdapterContext,
+    ) -> Result<Streamed<W::Op>, ProviderError> {
+        self.open(
+            request.into(),
+            Mode::Streaming,
+            Sending::observed(observation),
+        )
+    }
+
+    /// [`Self::call`], with a failure paired with the request path of the
+    /// reply that failed, for an operation whose errors name their route.
+    pub(crate) async fn call_routed(
+        &self,
+        request: Request<W>,
+    ) -> Result<Response<W>, (ProviderError, String)> {
+        self.open(request, Mode::Unary, Sending::default())
+            .map_err(|error| (error, String::new()))?
+            .finish_routed()
+            .await
+    }
+
+    /// `request` prepared and encoded as [`Self::call`] would, with nothing
+    /// sent.
+    pub(crate) fn dry_run(&self, request: Request<W>) -> Result<(), ProviderError> {
+        let describe = Descriptor {
+            prepared: Some(&self.prepared),
+            ..self.wire.describe()
+        };
+        let request = <W::Op as Operation>::prepare(request, &describe)?;
+        self.wire.encode(request, Mode::Unary)?;
+        Ok(())
+    }
+
+    /// The one entry to the driver: the operation's fold for the reply,
+    /// the encoded payload, and the transport's reply, in `mode`. A request
+    /// the operation rejects fails here, before it is encoded.
+    pub(crate) fn open(
+        &self,
+        request: Request<W>,
+        mode: Mode,
+        sending: Sending,
+    ) -> Result<Streamed<W::Op>, ProviderError> {
+        let describe = Descriptor {
+            prepared: Some(&self.prepared),
+            ..self.wire.describe()
+        };
+        let request = <W::Op as Operation>::prepare(request, &describe)?;
+        let provider = describe.name.to_owned();
+        let mut call = Call::new(&describe, mode);
+        let fold = <W::Op as Operation>::fold(&request, &mut call);
+        let span = call.span;
+        let payload = self.wire.encode(request, mode)?;
+        let Sending {
+            observation,
+            extensions,
+        } = sending;
+        let exchange = Exchange {
+            mode,
+            observation,
+            extensions,
+        };
+        let opening = self.transport.send(payload, exchange);
+        let shared = Arc::new(Mutex::new(Shared::new(fold)));
+        let reading = read(
+            self.wire.clone(),
+            opening,
+            Arc::clone(&shared),
+            span.clone(),
+            mode,
+        );
+        Ok(Streamed::new(reading, shared, span, provider))
+    }
+}
+
+/// Read one reply: open it, classify each frame, decode it into the reply's
+/// writer, and stop at the provider's end. The stream yields once per frame
+/// read, so its items reach the consumer frame by frame. When the transport
+/// reported no whole document, the wire's reassembler sees every known
+/// event before the decoder decodes it, and what it rebuilds is the reply's
+/// `raw` however the reply ends.
+///
+/// The reply's `'id` brand is the borrow of its shared state inside this
+/// stream: the decoder and every part handle it holds are tied to it, and
+/// none can leave.
+fn read<W: Wire>(
+    wire: W,
+    opening: Opening<W::Frame>,
+    shared: Arc<Mutex<Shared<W::Op>>>,
+    span: tracing::Span,
+    mode: Mode,
+) -> WasmBoxedStream<'static, ()> {
+    let decoding = span.clone();
+    let reading = async_stream::stream! {
+        let reply: &Mutex<Shared<W::Op>> = &shared;
+        // A unary call sends under the call's span; a stream reads under it.
+        let opened = match mode {
+            Mode::Unary => opening.instrument(span.clone()).await,
+            Mode::Streaming => opening.await,
+        };
+        let Opened {
+            mut frames,
+            request_id,
+            status,
+            headers,
+            route,
+            document,
+            slot,
+            analysis_only,
+        } = match opened {
+            Ok(opened) => opened,
+            Err(error) => {
+                fail(reply, None, error);
                 return;
             }
+        };
+        record_request_id(&span, request_id.as_deref());
+        let mut reassembler = document.is_none().then(|| wire.reassembler());
+        {
+            let mut state = lock(reply);
+            state.request_id.clone_from(&request_id);
+            state.document = document;
+            state.route = route.unwrap_or_default();
         }
-        driver.finish();
-        for item in driver.drain() {
-            yield item;
+        let enrich = |error: ProviderError| match mode {
+            // A unary reply's failure carries what the transport reported.
+            Mode::Unary => error
+                .with_provider_status(status)
+                .with_provider_request_id(request_id.clone())
+                .with_response_headers(headers.clone()),
+            Mode::Streaming => error,
+        };
+        let mut decoder = wire.decoder();
+        let mut tally = slot.as_ref().map(|slot| Tally {
+            slot,
+            analysis_only,
+            counted: 0,
+        });
+        loop {
+            let flow = match frames.next().await {
+                Some(Ok(frame)) => step(
+                    &mut decoder,
+                    reassembler.as_mut(),
+                    reply,
+                    frame,
+                    tally.as_mut(),
+                ),
+                Some(Err(error)) => {
+                    record(reply, reassembler.map(|document| document.finish()));
+                    fail(reply, slot.as_ref(), error);
+                    return;
+                }
+                None => eof(&mut decoder, reply, tally.as_ref()),
+            };
+            match flow {
+                Ok(Flow::More) => yield (),
+                Ok(Flow::Ended(_)) => break,
+                Err(error) => {
+                    record(reply, reassembler.map(|document| document.finish()));
+                    fail(reply, slot.as_ref(), enrich(error));
+                    return;
+                }
+            }
         }
-    })
-}
-
-/// One frame after [`triage_frame`]: a modeled event for `interpret`, or an
-/// unknown frame's raw payload for the passthrough channel.
-#[derive(Debug)]
-pub enum TriagedFrame<T> {
-    /// A modeled event, ready for [`Decoder::interpret`].
-    Event(T),
-    /// An unknown frame's raw payload. Already warned; the caller forwards it
-    /// as `StreamEvent::Unknown` where the surface has a raw channel
-    /// (openai-agents' raw-event precedent), and never interprets it — the
-    /// semantic path skips it.
-    Unknown(crate::streaming::UnknownPayload),
-}
-
-/// Triage one classified frame under the policy table on [`WireDriver`]:
-/// `Known` passes through, `Unknown` is warned (structural metadata only)
-/// and handed back raw for the passthrough channel, `Corrupt` is the
-/// operation's JSON error.
-///
-/// [`WireDriver::push`]'s per-frame policy factored out for the non-stream
-/// surfaces that classify frames one at a time (the websocket pre-dispatch),
-/// so they share the table instead of restating it.
-pub fn triage_frame<T>(
-    event: WireEvent<T>,
-) -> Result<TriagedFrame<T>, crate::completion::CompletionError> {
-    match event {
-        WireEvent::Known(event) => Ok(TriagedFrame::Event(event)),
-        WireEvent::Unknown { event_type, value } => {
-            // Structural metadata only — see `warn_unmodeled`. The full
-            // payload survives on the `Unknown` raw passthrough channel;
-            // that channel IS the opt-in for consumers who want the content.
-            warn_unmodeled(&event_type, &value);
-            Ok(TriagedFrame::Unknown(value))
+        record(reply, reassembler.map(|document| document.finish()));
+        if let Some(slot) = &slot {
+            let usage = lock(reply)
+                .end
+                .as_ref()
+                .and_then(W::Op::observed_usage)
+                .cloned();
+            slot.terminal(usage.as_ref());
         }
-        WireEvent::Corrupt(error) => Err(crate::completion::CompletionError::JsonError(error)),
+        {
+            let state = lock(reply);
+            if let Some(document) = state.raw.as_ref().or(state.document.as_ref()) {
+                crate::providers::internal::trace_json(
+                    crate::providers::internal::LogTarget::Completions,
+                    "reply",
+                    document,
+                );
+            }
+        }
+        yield ();
+    };
+    let mut reading: WasmBoxedStream<'static, ()> = Box::pin(reading);
+    match mode {
+        // A stream decodes under the call's span.
+        Mode::Streaming => Box::pin(futures::stream::poll_fn(move |cx| {
+            let _decoding = decoding.enter();
+            reading.as_mut().poll_next(cx)
+        })),
+        Mode::Unary => reading,
     }
 }
 
-/// Warn about an unmodeled wire payload with **structural metadata only** —
-/// its kind and serialized byte size, never the payload itself. Unmodeled
-/// frames and parts can carry model output or other sensitive provider
-/// data, which must not leak into production WARN logs; the one redaction
-/// policy lives here, used by the driver's Unknown arm and by adapters that
-/// skip an unmodeled part kind. `driver_adoption.rs` scans streaming
-/// modules for direct `warn!(?...)` payload captures, so bypassing this
-/// helper fails CI.
+/// A reply decoded from frames already in hand: its items, then its
+/// response or the error that ended it.
+pub(crate) struct Decoded<Op: Operation> {
+    /// Read only by relays and tests; a websocket session needs the outcome.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub(crate) items: Vec<Result<crate::streaming::Item<Op::Event>, ProviderError>>,
+    pub(crate) outcome: Result<Op::Response, ProviderError>,
+}
+
+/// Observation's count of one observed reply's frames, for its EOF and
+/// corruption positions.
+pub(crate) struct Tally<'a, F> {
+    slot: &'a AdapterSlot,
+    /// Frames observation does not count, unless they are corrupt.
+    analysis_only: Option<fn(&F) -> bool>,
+    counted: usize,
+}
+
+/// What the driver does with a classified frame: a known event is decoded,
+/// an unmodeled payload is warned about and delivered (aggregation never
+/// folds it into the answer), and a corrupt frame is the error that ends
+/// the reply.
+pub(crate) fn triage<E>(event: WireEvent<E>) -> Result<Item<E>, ProviderError> {
+    match event {
+        WireEvent::Known(event) => Ok(Item::Event(event)),
+        WireEvent::Unknown { event_type, value } => {
+            warn_unmodeled(&event_type, &value);
+            Ok(Item::Unknown(value))
+        }
+        WireEvent::Corrupt(error) => Err(ProviderError::from(error)),
+    }
+}
+
+/// Classify one frame and decode it into `reply`, handing a known event to
+/// `reassembler` first, and count the frame in `tally` when the reply is
+/// observed.
+pub(crate) fn step<'id, Op, F, D, R>(
+    decoder: &mut D,
+    reassembler: Option<&mut R>,
+    reply: &'id Mutex<Shared<Op>>,
+    frame: F,
+    tally: Option<&mut Tally<'_, F>>,
+) -> Result<Flow, ProviderError>
+where
+    Op: Operation,
+    D: Decoder<'id, Op, F>,
+    R: Reassemble<D::Event>,
+{
+    let exempt = tally
+        .as_ref()
+        .and_then(|tally| tally.analysis_only)
+        .is_some_and(|analysis_only| analysis_only(&frame));
+    let classified = decoder.classify(frame);
+    if let Some(tally) = tally {
+        // A corrupt frame is never exempt, whatever its shape.
+        let corrupt = matches!(classified, WireEvent::Corrupt(_));
+        if corrupt || !exempt {
+            tally.counted += 1;
+        }
+        if corrupt {
+            tally.slot.corrupt(tally.counted);
+        }
+    }
+    match triage(classified)? {
+        Item::Event(event) => {
+            if let Some(reassembler) = reassembler {
+                reassembler.absorb(&event);
+            }
+            decoder.decode(event, Out::new(reply))
+        }
+        Item::Unknown(value) => {
+            Out::new(reply).unknown(value);
+            Ok(Flow::More)
+        }
+    }
+}
+
+/// The frames ran out: a decoder that saw the provider's end ends the reply
+/// here; otherwise it is [`ProviderError::Truncated`].
+fn eof<'id, Op, F, D>(
+    decoder: &mut D,
+    reply: &'id Mutex<Shared<Op>>,
+    tally: Option<&Tally<'_, F>>,
+) -> Result<Flow, ProviderError>
+where
+    Op: Operation,
+    D: Decoder<'id, Op, F>,
+{
+    if let Some(tally) = tally {
+        tally.slot.transport_eof(tally.counted);
+    }
+    let step = decoder.eof(Out::new(reply));
+    if !matches!(step, Ok(Flow::Ended(_)))
+        && let Some(tally) = tally
+    {
+        tally.slot.eof(tally.counted);
+    }
+    match step {
+        Ok(Flow::More) => Err(ProviderError::Truncated),
+        step => step,
+    }
+}
+
+/// Feed frames already in hand through `reassembler` and `decoder` into
+/// `reply`, as [`read`] does: the reply ends at the provider's end, or the
+/// decoder decides at EOF, and what the reassembler rebuilt is recorded.
+pub(crate) fn feed<'id, Op, F, D, R>(
+    decoder: &mut D,
+    mut reassembler: Option<R>,
+    reply: &'id Mutex<Shared<Op>>,
+    frames: impl IntoIterator<Item = F>,
+) -> Result<(), ProviderError>
+where
+    Op: Operation,
+    D: Decoder<'id, Op, F>,
+    R: Reassemble<D::Event>,
+{
+    let fed = feed_until_end(decoder, reassembler.as_mut(), reply, frames);
+    record(reply, reassembler.map(|document| document.finish()));
+    fed
+}
+
+fn feed_until_end<'id, Op, F, D, R>(
+    decoder: &mut D,
+    mut reassembler: Option<&mut R>,
+    reply: &'id Mutex<Shared<Op>>,
+    frames: impl IntoIterator<Item = F>,
+) -> Result<(), ProviderError>
+where
+    Op: Operation,
+    D: Decoder<'id, Op, F>,
+    R: Reassemble<D::Event>,
+{
+    for frame in frames {
+        if let Flow::Ended(_) = step(decoder, reassembler.as_deref_mut(), reply, frame, None)? {
+            return Ok(());
+        }
+    }
+    eof(decoder, reply, None).map(drop)
+}
+
+/// Record `document`, what a reassembler rebuilt, as the reply's `raw`. A
+/// `Null` document records nothing.
+pub(crate) fn record<Op: Operation>(
+    reply: &Mutex<Shared<Op>>,
+    document: Option<serde_json::Value>,
+) {
+    if let Some(document) = document.filter(|document| !document.is_null()) {
+        lock(reply).raw = Some(document);
+    }
+}
+
+/// Fold a fed reply as a stream does: its items, then its response, or the
+/// error that ended it. `reply.raw` stands unless it is null, when the
+/// decoder's record does.
+pub(crate) fn settle<Op: Operation>(
+    shared: Mutex<Shared<Op>>,
+    fed: Result<(), ProviderError>,
+    reply: crate::wire::Reply,
+) -> Decoded<Op> {
+    let mut shared = shared
+        .into_inner()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Err(error) = fed {
+        shared.items.push_back(Err(error));
+    }
+    shared.document = Some(reply.raw).filter(|raw| !raw.is_null());
+    shared.request_id = reply.provider_request_id;
+    let mut items = Vec::new();
+    while let Some(item) = shared.take() {
+        let failed = item.is_err();
+        items.push(item);
+        if failed {
+            break;
+        }
+    }
+    let outcome = match items.last() {
+        Some(Err(error)) => Err(error.clone()),
+        _ => shared.conclude(&reply.provider),
+    };
+    #[cfg(any(test, feature = "test-utils"))]
+    if let Err(error) = &outcome
+        && !matches!(items.last(), Some(Err(_)))
+    {
+        items.push(Err(error.clone()));
+    }
+    Decoded {
+        #[cfg(any(test, feature = "test-utils"))]
+        items,
+        outcome,
+    }
+}
+
+/// [`decode_reply`](crate::wire::decode_reply), with `raw` the reply's
+/// whole document as a transport reports it (`Null` for none, so the
+/// reassembler's stands), for tests that state what the transport read.
+pub(crate) fn decode_reply<W: Wire>(
+    wire: &W,
+    request: &Request<W>,
+    mode: Mode,
+    frames: impl IntoIterator<Item = W::Frame>,
+    raw: serde_json::Value,
+) -> Result<Response<W>, ProviderError> {
+    let describe = wire.describe();
+    let fold = <W::Op as Operation>::fold(request, &mut Call::new(&describe, mode));
+    let shared = Mutex::new(Shared::new(fold));
+    let fed = feed(
+        &mut wire.decoder(),
+        Some(wire.reassembler()),
+        &shared,
+        frames,
+    );
+    let reply = crate::wire::Reply {
+        provider: describe.name.to_owned(),
+        raw,
+        provider_request_id: None,
+    };
+    settle(shared, fed, reply).outcome
+}
+
+/// A completion reply decoded from frames already in hand, as a handler
+/// relays it: its items, then the response, or the error that ended it.
+#[cfg(any(test, feature = "test-utils"))]
+pub(crate) fn relay_frames<W>(
+    wire: &W,
+    frames: impl IntoIterator<Item = W::Frame>,
+) -> crate::streaming::StreamEvents
+where
+    W: Wire<Op = crate::operation::Completion>,
+{
+    use crate::error::ErrorReport;
+    use crate::streaming::Relayed;
+
+    let provider = wire.describe().name.to_owned();
+    let shared = Mutex::new(Shared::new(crate::operation::ReplyFold::relayed(
+        provider.clone(),
+    )));
+    let fed = feed(
+        &mut wire.decoder(),
+        Some(wire.reassembler()),
+        &shared,
+        frames,
+    );
+    let decoded = settle(
+        shared,
+        fed,
+        crate::wire::Reply {
+            provider,
+            raw: serde_json::Value::Null,
+            provider_request_id: None,
+        },
+    );
+    let origin = decoded
+        .outcome
+        .as_ref()
+        .map(|response| response.origin.clone())
+        .ok();
+    let relayed: Vec<Result<Relayed, ErrorReport>> = origin
+        .map(|origin| Ok(Relayed::Origin(origin)))
+        .into_iter()
+        .chain(decoded.items.into_iter().map(|item| match item {
+            Ok(item) => Ok(Relayed::Item(item)),
+            Err(error) => Err(ErrorReport::from(&error)),
+        }))
+        // An error that ended the reply is already its last item.
+        .chain(
+            decoded
+                .outcome
+                .ok()
+                .map(|response| Ok(Relayed::Done(Arc::new(response)))),
+        )
+        .collect();
+    Box::pin(futures::stream::iter(relayed))
+}
+
+#[cfg(test)]
+impl Decoded<crate::operation::Completion> {
+    /// The events the reply yielded, without unmodeled payloads.
+    pub(crate) fn events(&self) -> Vec<&crate::streaming::StreamEvent> {
+        self.items
+            .iter()
+            .filter_map(|item| match item {
+                Ok(crate::streaming::Item::Event(event)) => Some(event),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// What each part ended with, in the order the parts ended.
+    pub(crate) fn ended(&self) -> Vec<crate::message::AssistantContent> {
+        self.events()
+            .into_iter()
+            .filter_map(|event| match event {
+                crate::streaming::StreamEvent::End { content, .. } => Some(content.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+}
+
+/// Decode typed `events` through `decoder` as one completion reply from
+/// `provider`, then EOF: a decoder's test harness, without frames.
+#[cfg(test)]
+macro_rules! decode_events {
+    ($decoder:expr, $provider:expr, $events:expr) => {
+        $crate::driver::decode_with(
+            $crate::operation::ReplyFold::relayed($provider),
+            $provider,
+            |reply| {
+                let mut decoder = $decoder;
+                for event in $events {
+                    if let $crate::wire::Flow::Ended(_) =
+                        $crate::wire::Decoder::decode(&mut decoder, event, reply.out())?
+                    {
+                        return Ok(());
+                    }
+                }
+                match $crate::wire::Decoder::eof(&mut decoder, reply.out())? {
+                    $crate::wire::Flow::Ended(_) => Ok(()),
+                    $crate::wire::Flow::More => Err($crate::error::ProviderError::Truncated),
+                }
+            },
+        )
+    };
+}
+#[cfg(test)]
+pub(crate) use decode_events;
+
+/// Decode `frames` through `decoder`, classifier included, as one
+/// completion reply from `provider`: what the driver does with frames it
+/// read. A reassembler, when given, sees each known event first and its
+/// document is the reply's `raw`.
+#[cfg(test)]
+macro_rules! feed_frames {
+    ($decoder:expr, $provider:expr, $frames:expr) => {
+        $crate::driver::decode_with(
+            $crate::operation::ReplyFold::relayed($provider),
+            $provider,
+            |reply| {
+                let mut decoder = $decoder;
+                reply.feed(
+                    &mut decoder,
+                    None::<$crate::wire::document::Unreassembled>,
+                    $frames,
+                )
+            },
+        )
+    };
+    ($decoder:expr, $reassembler:expr, $provider:expr, $frames:expr) => {
+        $crate::driver::decode_with(
+            $crate::operation::ReplyFold::relayed($provider),
+            $provider,
+            |reply| {
+                let mut decoder = $decoder;
+                reply.feed(&mut decoder, Some($reassembler), $frames)
+            },
+        )
+    };
+}
+#[cfg(test)]
+pub(crate) use feed_frames;
+
+/// One reply's writer, for a test that drives a decoder by hand.
+#[cfg(test)]
+pub(crate) struct Replying<'id, Op: Operation>(&'id Mutex<Shared<Op>>);
+
+#[cfg(test)]
+impl<'id, Op: Operation> Replying<'id, Op> {
+    /// A writer for the next event.
+    pub(crate) fn out(&self) -> Out<'id, Op> {
+        Out::new(self.0)
+    }
+
+    /// Feed frames through `reassembler` and `decoder`, as the driver does.
+    pub(crate) fn feed<F, D: Decoder<'id, Op, F>, R: Reassemble<D::Event>>(
+        &self,
+        decoder: &mut D,
+        reassembler: Option<R>,
+        frames: impl IntoIterator<Item = F>,
+    ) -> Result<(), ProviderError> {
+        feed(decoder, reassembler, self.0, frames)
+    }
+}
+
+/// Drive one reply by hand: `run` decodes into it until the reply ends, or
+/// fails with what ended it, and the reply folds into `fold` as a stream
+/// would.
+#[cfg(test)]
+pub(crate) fn decode_with<Op: Operation>(
+    fold: Op::Fold,
+    provider: &str,
+    run: impl for<'id> FnOnce(Replying<'id, Op>) -> Result<(), ProviderError>,
+) -> Decoded<Op> {
+    let shared = Mutex::new(Shared::new(fold));
+    let fed = run(Replying(&shared));
+    settle(
+        shared,
+        fed,
+        crate::wire::Reply {
+            provider: provider.to_owned(),
+            raw: serde_json::Value::Null,
+            provider_request_id: None,
+        },
+    )
+}
+
+/// The reply failed: the error is its last item.
+fn fail<Op: Operation>(
+    reply: &Mutex<Shared<Op>>,
+    slot: Option<&AdapterSlot>,
+    error: ProviderError,
+) {
+    if let Some(slot) = slot {
+        slot.fail(&error);
+    }
+    lock(reply).items.push_back(Err(error));
+}
+
+pub(crate) fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Read pages until one names no cursor, names the cursor it was asked
+/// with, or [`MAX_CONTINUATION_PAGES`] were read. `page` reads the page at a
+/// cursor (`None` for the first) and returns it with the next cursor.
+pub(crate) async fn follow_cursors<P, Fut>(
+    provider: &str,
+    operation: &str,
+    mut page: impl FnMut(Option<String>) -> Fut,
+) -> Result<Vec<P>, ProviderError>
+where
+    Fut: Future<Output = Result<(P, Option<String>), ProviderError>>,
+{
+    let mut pages = Vec::new();
+    let mut cursor = None;
+    loop {
+        let (read, next) = page(cursor.clone()).await?;
+        pages.push(read);
+        // Warn only when an offered page is refused: normal exhaustion is
+        // not truncation, while repeated or cycling cursors need a bound.
+        let Some(next) = next else { break };
+        if cursor.as_deref() == Some(next.as_str()) {
+            // The next request would be identical to the one just answered,
+            // so the page would repeat forever.
+            tracing::warn!(
+                provider,
+                operation,
+                pages = pages.len(),
+                "listing repeated its pagination cursor; returning the pages fetched so far"
+            );
+            break;
+        }
+        if pages.len() >= MAX_CONTINUATION_PAGES {
+            tracing::warn!(
+                provider,
+                operation,
+                pages = pages.len(),
+                "listing hit its page ceiling with a cursor still advancing; returning the pages \
+                 fetched so far"
+            );
+            break;
+        }
+        cursor = Some(next);
+    }
+    Ok(pages)
+}
+
+/// Logs an unmodeled payload's kind and serialized size, never its content.
+/// Callers must supply a structural kind label without sensitive data.
 pub fn warn_unmodeled(kind: &str, payload: &impl serde::Serialize) {
     tracing::warn!(
         kind,
@@ -347,678 +1086,18 @@ fn unknown_payload_bytes(value: &impl serde::Serialize) -> u64 {
     counter.0
 }
 
-/// Ceiling on the pages one [`call`] will follow.
-///
-/// Generous by orders of magnitude: a model catalog's page holds hundreds of
-/// entries, so a real listing finishes in one or two requests. This exists
-/// only so a cursor that keeps *changing* without advancing — a gateway
-/// alternating `c1, c2, c1, …`, or minting a fresh cursor per request —
-/// terminates. It bounds continuation-following only; the requests a batched
-/// wire encodes up front are all sent however many there are.
+/// Page count after which a listing's cursors are ignored, preventing
+/// infinite cursor cycles.
 const MAX_CONTINUATION_PAGES: usize = 1000;
 
-/// Send one request and fold its whole reply into the operation's response.
-///
-/// `context` observes the attempt; `None` records nothing. A paged operation
-/// loops on [`Decoder::continuation`].
-pub async fn call<W, H>(
-    wire: &W,
-    http: &H,
-    request: Request<W>,
-    context: Option<AdapterContext>,
-) -> Result<Response<W>, Error<W>>
-where
-    W: Wire,
-    H: HttpClientExt,
-{
-    let span =
-        <W::Op as Operation>::span(wire.name(), wire.model(), wire.telemetry(false), &request);
-    let mut fold = <W::Op as Operation>::fold(&request);
-    let Encoded {
-        requests,
-        framing,
-        request_id_header,
-        relaxed_content_type,
-    } = wire.encode(request, Mode::Unary)?;
-
-    let mut reply = Reply {
-        provider: wire.name().to_owned(),
-        raw: serde_json::Value::Null,
-        provider_request_id: None,
-    };
-
-    // One document per page. A batched wire — Cohere embeds one image per
-    // call — answers a single operation with several, and the last one is
-    // not the reply.
-    let mut documents: Vec<serde_json::Value> = Vec::new();
-    let mut pending: std::collections::VecDeque<http::Request<Body>> = requests.into();
-    // Replies read in this call, which is what MAX_CONTINUATION_PAGES bounds.
-    let mut pages: usize = 0;
-    while let Some(mut http_request) = pending.pop_front() {
-        accept_header(&mut http_request, framing);
-        // Two different facts, deliberately not one variable. `route` is the
-        // URL that was actually sent, which is what a human debugging a 404
-        // needs from `with_route`'s decoration. The observation records the
-        // *template* the wire declares, so a consumer grouping attempts by
-        // route gets one bucket per endpoint rather than one per base URL.
-        let route = http_request.uri().path().to_owned();
-        let declared = wire.route().unwrap_or(&route);
-        // What was sent, kept to recognize a continuation that would re-send
-        // it. `Uri` and `Method` clones are refcount-cheap.
-        let sent_target = (http_request.method().clone(), http_request.uri().clone());
-        let observation = context.as_ref().map(|_| AdapterSlot::default());
-        let attempt = context
-            .as_ref()
-            .and_then(|context| context.attempt_for(&http_request, declared));
-        if let Some(observation) = &observation {
-            observation.install(attempt);
-        }
-        let mut page = WireDriver::<W::Op, _>::observed(
-            // Every page this loop reads is read to its end, so the
-            // decoder's EOF is the end of an answer rather than a stream
-            // stopping early — which is what `Mode::Unary` tells it.
-            wire.decoder(Mode::Unary),
-            observation.clone(),
-        );
-        let sent = tracing::Instrument::instrument(
-            send::<W::Op, H>(http, http_request, request_id_header, observation.as_ref()),
-            span.clone(),
-        )
-        .await;
-        let page_reply = match sent {
-            Ok(page_reply) => page_reply,
-            Err(error) => {
-                let error = error.with_route(wire.name(), &route);
-                // The reply the failure carries is still the provider's:
-                // project its facts before reporting the ending.
-                if let Some(body) = error.provider_response_body() {
-                    page.project(body.as_bytes());
-                }
-                if let Some(observation) = &observation {
-                    observation.fail(&error);
-                }
-                return Err(error);
-            }
-        };
-        // The status said success, but an SSE framer over a body that is not
-        // an event stream yields no frames at all, which would fold to a
-        // contentless success. The reply the provider actually sent is the
-        // error.
-        if let Some(rejected) =
-            wrong_content_type(&page_reply.headers, framing, relaxed_content_type)
-        {
-            let error = <Error<W> as WireError>::transport(rejected)
-                .with_route(wire.name(), &route)
-                .with_provider_status(Some(page_reply.status))
-                .with_provider_request_id(page_reply.provider_request_id.clone())
-                .with_response_headers(Some(page_reply.headers.clone()));
-            page.project(&page_reply.body);
-            if let Some(observation) = &observation {
-                observation.fail(&error);
-            }
-            return Err(error);
-        }
-
-        // Frame the reply the way a stream is framed, and project each
-        // payload rather than the body: they are the same bytes only when
-        // the framing is `Whole`, and a wire whose unary reply is an event
-        // stream (the Responses endpoint on an always-streaming dialect)
-        // would otherwise hand every projector a document it cannot parse.
-        let mut framer = Framer::new(framing);
-        for payload in framer
-            .push(&page_reply.body)
-            .into_iter()
-            .chain(framer.finish())
-        {
-            page.absorb(payload);
-        }
-        page.finish();
-        let mut failure = None;
-        for item in page.drain() {
-            match item {
-                Ok(event) => {
-                    if let Err(error) = fold.absorb(event) {
-                        failure = Some(error);
-                        break;
-                    }
-                }
-                Err(error) => {
-                    failure = Some(error);
-                    break;
-                }
-            }
-        }
-        if let Some(error) = failure {
-            let error = error
-                .with_route(wire.name(), &route)
-                .with_provider_status(Some(page_reply.status))
-                .with_provider_request_id(page_reply.provider_request_id.clone())
-                .with_response_headers(Some(page_reply.headers.clone()));
-            if let Some(observation) = &observation {
-                observation.fail(&error);
-            }
-            return Err(error);
-        }
-        if let Some(observation) = &observation {
-            observation.finish(AdapterEnding::Decoded);
-        }
-
-        // The page's own bytes when they are one document; otherwise the
-        // envelope the decoder reassembled from the event stream.
-        let document = serde_json::from_slice(&page_reply.body)
-            .ok()
-            .or_else(|| page.document())
-            .unwrap_or(serde_json::Value::Null);
-        reply.provider_request_id = page_reply.provider_request_id;
-        crate::providers::internal::trace_json(
-            crate::providers::internal::LogTarget::Completions,
-            &format!("{} {} reply", wire.name(), <W::Op as Operation>::NAME),
-            &document,
-        );
-        documents.push(document);
-
-        pages += 1;
-        // When the loop stops following a cursor the provider is still
-        // naming, the catalog handed back is truncated, so say which rule
-        // stopped it. Both of these are unbounded loops if left unchecked
-        // (rig#2334): the listing never returns and the fold grows without
-        // limit.
-        //
-        // Only running out of budget is a ceiling. A reply naming no
-        // continuation is the provider ending the listing — the normal path,
-        // and silent. Inferring the ceiling from "a cursor is still held"
-        // would report one on every listing past its first page.
-        if let Some(next) = page.continuation() {
-            if (next.method(), next.uri()) == (&sent_target.0, &sent_target.1) {
-                // The next request would be identical to the one just
-                // answered, so the page would repeat forever.
-                tracing::warn!(
-                    provider = wire.name(),
-                    operation = <W::Op as Operation>::NAME,
-                    pages,
-                    "listing repeated its pagination cursor; returning the pages fetched \
-                     so far"
-                );
-            } else if pages >= MAX_CONTINUATION_PAGES {
-                tracing::warn!(
-                    provider = wire.name(),
-                    operation = <W::Op as Operation>::NAME,
-                    pages,
-                    "listing hit its page ceiling with a cursor still advancing; returning \
-                     the pages fetched so far"
-                );
-            } else {
-                pending.push_front(next);
-            }
-        }
-    }
-
-    // One page answered with one document; several answered with the
-    // sequence, which is what the per-request escape hatch returned.
-    reply.raw = if documents.len() > 1 {
-        serde_json::Value::Array(documents)
-    } else {
-        documents.pop().unwrap_or(serde_json::Value::Null)
-    };
-
-    let response = fold.finish(reply)?;
-    <W::Op as Operation>::record(&span, &response);
-    Ok(response)
-}
-
-/// Open a streamed reply.
-///
-/// An encoding error surfaces here; a connect error is the stream's only
-/// item — the semantics the per-provider `async fn stream` had.
-pub fn stream<W, H>(
-    wire: &W,
-    http: &H,
-    request: Request<W>,
-    context: Option<AdapterContext>,
-) -> Result<impl Stream<Item = Result<Event<W>, Error<W>>> + WasmCompatSend + 'static, Error<W>>
-where
-    W: Wire,
-    H: HttpClientExt + Clone + 'static,
-{
-    let span =
-        <W::Op as Operation>::span(wire.name(), wire.model(), wire.telemetry(true), &request);
-    let Encoded {
-        requests,
-        framing,
-        request_id_header,
-        relaxed_content_type,
-    } = wire.encode(request, Mode::Streaming)?;
-    // No streamed operation sends a batch: a batch exists for providers
-    // that take one item per request, and those are all unary.
-    let [http_request] = <[_; 1]>::try_from(requests).map_err(|requests| {
-        <Error<W> as WireError>::decode(format!(
-            "a streamed reply takes exactly one request, not {}",
-            requests.len()
-        ))
-    })?;
-    let mut http_request = http_request;
-    accept_header(&mut http_request, framing);
-    let http_request = byte_request(http_request)?;
-
-    let http = http.clone();
-    let observation = context.as_ref().map(|_| AdapterSlot::default());
-    let mut driver =
-        WireDriver::<W::Op, _>::observed(wire.decoder(Mode::Streaming), observation.clone());
-    let recording = span.clone();
-    // Read here rather than inside the stream: `wire` is borrowed, and the
-    // generated stream outlives this call.
-    let declared_route = wire.route().map(str::to_owned);
-
-    let frames = async_stream::stream! {
-        // The attempt is announced on the first poll, not here: a stream
-        // that is built and dropped without being polled never reaches the
-        // transport, and an observation log that already carried its
-        // `Started` would claim a send that never happened. Only the
-        // encoding above is eager, because `stream` returns a `Result` and
-        // an encode failure is not the stream's problem to deliver.
-        if let Some(observation) = &observation {
-            // The declared template, not the concrete path — see `call`.
-            let path = http_request.uri().path().to_owned();
-            let declared = declared_route.as_deref().unwrap_or(&path);
-            observation.install(
-                context
-                    .as_ref()
-                    .and_then(|context| context.attempt_for(&http_request, declared)),
-            );
-        }
-        let response = match http.send_streaming(http_request).await {
-            // The bundled transports reject a non-success reply before it
-            // gets here; a custom `HttpClientExt` may hand it back as a
-            // response. Either way the server answered, and its answer —
-            // status, headers, body — is the error, never a bare status.
-            Ok(response) if response.status() != http::StatusCode::OK => {
-                Err(reject_response(response).await)
-            }
-            Ok(response) => {
-                match wrong_content_type(response.headers(), framing, relaxed_content_type) {
-                    Some(error) => Err(error),
-                    None => Ok(response),
-                }
-            }
-            other => other,
-        };
-        let response = match response {
-            Ok(response) => response,
-            Err(error) => {
-                if let Some(observation) = &observation {
-                    observation.error_boundary(AdapterErrorBoundary::from_http(&error));
-                    if let Some(status) = error.non_success_status() {
-                        observation.response_with_headers(status, error.non_success_headers());
-                    }
-                    if let Some(body) = error.non_success_body() {
-                        driver.project(body.as_bytes());
-                    }
-                }
-                let request_id = error
-                    .non_success_headers()
-                    .and_then(|headers| request_id_from(headers, request_id_header));
-                driver.fail(
-                    <Error<W> as WireError>::transport(error)
-                        .with_provider_request_id(request_id),
-                );
-                for item in driver.drain() {
-                    yield item;
-                }
-                return;
-            }
-        };
-        if let Some(observation) = &observation {
-            observation.response_with_headers(response.status(), Some(response.headers()));
-        }
-        let request_id = request_id_from(response.headers(), request_id_header);
-        let mut body = response.into_body();
-        let mut framer = Framer::new(framing);
-        while let Some(chunk) = body.next().await {
-            let chunk = match chunk {
-                Ok(chunk) => chunk,
-                Err(error) => {
-                    // The body stream's items are already
-                    // `http_client::Result<Bytes>`, so the error IS the
-                    // transport's own: boxing it into
-                    // `http_client::Error::Instance` discarded the
-                    // non-success status, headers and body a mid-stream
-                    // failure carries, and doubled its `Display` prefix.
-                    if let Some(observation) = &observation {
-                        observation.error_boundary(AdapterErrorBoundary::Transport);
-                    }
-                    driver.fail(<Error<W> as WireError>::transport(error));
-                    for item in driver.drain() {
-                        yield stamped::<W>(item, &request_id, &recording);
-                    }
-                    return;
-                }
-            };
-            if let Some(observation) = &observation {
-                observation.bytes(&chunk);
-            }
-            for payload in framer.push(&chunk) {
-                driver.absorb(payload);
-                for item in driver.drain() {
-                    yield stamped::<W>(item, &request_id, &recording);
-                }
-                if driver.done() {
-                    return;
-                }
-            }
-        }
-        for payload in framer.finish() {
-            driver.absorb(payload);
-            for item in driver.drain() {
-                yield stamped::<W>(item, &request_id, &recording);
-            }
-            if driver.done() {
-                return;
-            }
-        }
-        driver.finish();
-        for item in driver.drain() {
-            yield stamped::<W>(item, &request_id, &recording);
-        }
-    };
-    Ok(tracing_futures::Instrument::instrument(frames, span))
-}
-
-/// Stamp the transport request id captured off the reply onto a terminal
-/// event or a preserved provider error. An id an upstream constructor
-/// already attached is never replaced: it saw the reply that carried it.
-fn stamped<W: Wire>(
-    item: Result<Event<W>, Error<W>>,
-    request_id: &Option<String>,
-    span: &tracing::Span,
-) -> Result<Event<W>, Error<W>> {
-    match item {
-        Ok(mut event) => {
-            <W::Op as Operation>::stamp_request_id(&mut event, request_id);
-            <W::Op as Operation>::record_event(span, &event);
-            Ok(event)
-        }
-        Err(error) => Err(error.with_provider_request_id(request_id.clone())),
-    }
-}
-
-/// What one send learned about its reply.
-struct Sent {
-    status: http::StatusCode,
-    headers: http::HeaderMap,
-    body: Bytes,
-    provider_request_id: Option<String>,
-}
-
-/// Send one unary request and split its reply, funnelling every non-success
-/// shape the four transport/provider cells produce (rig#2210, rig#2314).
-async fn send<Op, H>(
-    http: &H,
-    request: http::Request<Body>,
-    request_id_header: Option<&'static str>,
-    observation: Option<&AdapterSlot>,
-) -> Result<Sent, Op::Error>
-where
-    Op: Operation,
-    H: HttpClientExt,
-{
-    let (parts, body) = request.into_parts();
-    let response = match body {
-        Body::Bytes(bytes) => {
-            http.send::<_, Bytes>(http::Request::from_parts(parts, bytes))
-                .await
-        }
-        Body::Multipart(form) => {
-            http.send_multipart::<Bytes>(http::Request::from_parts(parts, form))
-                .await
-        }
-    };
-    let response = match response {
-        Ok(response) => response,
-        // A transport that reports the non-success reply as an error: the
-        // reply is the provider's, so it funnels to a preserved provider
-        // response with the id read off its headers and the headers
-        // themselves; a response-less failure stays a transport error.
-        Err(error) => {
-            if let Some(observation) = observation
-                && let Some(status) = error.non_success_status()
-            {
-                observation.response_with_headers(status, error.non_success_headers());
-            }
-            let request_id = error
-                .non_success_headers()
-                .and_then(|headers| request_id_from(headers, request_id_header));
-            return Err(Op::Error::transport(error).with_provider_request_id(request_id));
-        }
-    };
-
-    // Take the reply apart before awaiting the body: the headers are then
-    // owned, so preserving them onto an error costs no clone and every
-    // error path below can afford them.
-    let (parts, body) = response.into_parts();
-    let status = parts.status;
-    if let Some(observation) = observation {
-        observation.response_with_headers(status, Some(&parts.headers));
-    }
-    let provider_request_id = request_id_from(&parts.headers, request_id_header);
-    let body = body.await.map_err(Op::Error::transport)?;
-
-    if !status.is_success() {
-        return Err(
-            Op::Error::http_response(status, &String::from_utf8_lossy(&body))
-                .with_provider_request_id(provider_request_id)
-                .with_response_headers(Some(parts.headers)),
-        );
-    }
-    Ok(Sent {
-        status,
-        headers: parts.headers,
-        body,
-        provider_request_id,
-    })
-}
-
-/// The provider's transport request id, when it names such a header and the
-/// reply carries a non-empty value.
-fn request_id_from(headers: &http::HeaderMap, header: Option<&str>) -> Option<String> {
-    crate::providers::internal::request_id_from_headers(headers, header)
-}
-
-/// Every JSON request carries `Content-Type: application/json`, including a
-/// bodyless `GET`.
-///
-/// The deleted client layer put it in the default headers of every request
-/// it built, so recorded traffic pins it on the catalog and verification
-/// GETs as well as the POSTs. It is one line here rather than a line in
-/// every wire's `encode`, and a wire that needs another content type sets
-/// it itself.
-fn content_type(request: &mut http::Request<Body>) {
-    if matches!(request.body(), Body::Bytes(_)) {
-        request
-            .headers_mut()
-            .entry(http::header::CONTENT_TYPE)
-            .or_insert(http::HeaderValue::from_static("application/json"));
-    }
-}
-
-/// Add `Accept: text/event-stream` to an SSE request, without overriding an
-/// `Accept` the wire set itself.
-fn accept_header(request: &mut http::Request<Body>, framing: Framing) {
-    content_type(request);
-    if framing == Framing::Sse {
-        request
-            .headers_mut()
-            .entry("Accept")
-            .or_insert(http::HeaderValue::from_static("text/event-stream"));
-    }
-}
-
-/// Whether a reply's content type is not the event stream an SSE wire asked
-/// for: the framer would silently produce no frames, which reads as
-/// truncation rather than as the wrong endpoint. A reply that names no
-/// content type at all is accepted only by a wire that opted in.
-///
-/// The one predicate both paths ask, so a unary reply and a streamed one
-/// cannot disagree about what the provider sent.
-fn wrong_content_type(
-    headers: &http::HeaderMap,
-    framing: Framing,
-    relaxed: bool,
-) -> Option<http_client::Error> {
-    if framing != Framing::Sse {
-        return None;
-    }
-    let Some(content_type) = headers.get(&http::header::CONTENT_TYPE) else {
-        return (!relaxed)
-            .then(|| http_client::Error::InvalidContentType(http::HeaderValue::from_static("")));
-    };
-    let event_stream = content_type
-        .to_str()
-        .ok()
-        .and_then(|value| value.parse::<mime::Mime>().ok())
-        .is_some_and(|mime_type| {
-            matches!(
-                (mime_type.type_(), mime_type.subtype()),
-                (mime::TEXT, mime::EVENT_STREAM)
-            )
-        });
-    (!event_stream).then(|| http_client::Error::InvalidContentType(content_type.clone()))
-}
-
-/// A request whose body is bytes. Multipart replies are never streamed.
-fn byte_request<E: WireError>(request: http::Request<Body>) -> Result<http::Request<Vec<u8>>, E> {
-    let (parts, body) = request.into_parts();
-    match body {
-        Body::Bytes(bytes) => Ok(http::Request::from_parts(parts, bytes)),
-        Body::Multipart(_) => Err(E::decode(
-            "a multipart request cannot open a streamed reply".to_owned(),
-        )),
-    }
-}
-
-/// One framed payload: the bytes the observer sees, and the frame the
-/// decoder sees — a whitespace-only SSE payload is a heartbeat, which is not
-/// a frame on any wire.
-struct Framed {
-    payload: Vec<u8>,
-    frame: bool,
-}
-
-impl Framed {
-    fn payload(&self) -> &[u8] {
-        &self.payload
-    }
-
-    fn into_frame(self) -> Option<WireFrame> {
-        self.frame.then(|| match String::from_utf8(self.payload) {
-            Ok(text) => WireFrame::Text(text),
-            Err(error) => WireFrame::Bytes(error.into_bytes()),
-        })
-    }
-}
-
-/// The framer for one reply's bytes.
-enum Framer {
-    Sse(SseFramer),
-    Ndjson(NdjsonFramer),
-    Whole(Vec<u8>),
-}
-
-impl Framer {
-    fn new(framing: Framing) -> Self {
-        match framing {
-            Framing::Sse => Self::Sse(SseFramer::new()),
-            Framing::Ndjson => Self::Ndjson(NdjsonFramer::new()),
-            Framing::Whole => Self::Whole(Vec::new()),
-        }
-    }
-
-    fn push(&mut self, chunk: &[u8]) -> Vec<Framed> {
-        match self {
-            Self::Sse(framer) => framer
-                .push(chunk)
-                .map(|event| Framed {
-                    frame: !event.data.trim().is_empty(),
-                    payload: event.data.into_bytes(),
-                })
-                .collect(),
-            Self::Ndjson(framer) => framer
-                .push(chunk)
-                .map(|line| Framed {
-                    frame: true,
-                    payload: line,
-                })
-                .collect(),
-            Self::Whole(buffer) => {
-                buffer.extend_from_slice(chunk);
-                Vec::new()
-            }
-        }
-    }
-
-    fn finish(&mut self) -> Vec<Framed> {
-        match self {
-            // The grammar dispatches only on a blank line: an unterminated
-            // trailing event is not a frame.
-            Self::Sse(_) => Vec::new(),
-            Self::Ndjson(framer) => framer
-                .finish()
-                .map(|line| Framed {
-                    frame: true,
-                    payload: line,
-                })
-                .into_iter()
-                .collect(),
-            Self::Whole(buffer) => {
-                let payload = std::mem::take(buffer);
-                if payload.is_empty() {
-                    Vec::new()
-                } else {
-                    vec![Framed {
-                        frame: true,
-                        payload,
-                    }]
-                }
-            }
-        }
-    }
-}
-
-/// Bytes of a rejected reply's body kept on the error; a reply longer than
-/// this is cut there.
-const REJECTED_BODY_LIMIT: usize = 1 << 20;
-
-/// Chunks read off a rejected reply before giving up on it, so a transport
-/// that keeps yielding empty chunks cannot hold the opener.
-const REJECTED_CHUNK_LIMIT: usize = 4096;
-
-/// Turn a reply the driver will not stream (any status but 200, a 204
-/// included: a status is a status) into the non-success error, reading the
-/// body to its end (bounded in bytes and chunks) so the provider's payload
-/// and the transport's headers ride on the error.
-async fn reject_response(
-    response: http::Response<crate::http_client::BoxedStream>,
-) -> http_client::Error {
-    let status = response.status();
-    let headers = response.headers().clone();
-    let mut body = response.into_body();
-    let mut bytes: Vec<u8> = Vec::new();
-    let mut chunks = 0usize;
-    while let Some(chunk) = body.next().await {
-        chunks += 1;
-        if let Ok(chunk) = chunk {
-            let room = REJECTED_BODY_LIMIT.saturating_sub(bytes.len());
-            bytes.extend_from_slice(chunk.get(..chunk.len().min(room)).unwrap_or_default());
-        }
-        if bytes.len() >= REJECTED_BODY_LIMIT || chunks >= REJECTED_CHUNK_LIMIT {
-            break;
-        }
-    }
-    http_client::Error::InvalidStatusCodeWithDetails {
-        status,
-        body: String::from_utf8_lossy(&bytes).into_owned(),
-        headers,
+/// Record the transport request id on the call's span, success or failure.
+pub(crate) fn record_request_id(span: &tracing::Span, request_id: Option<&str>) {
+    if let Some(request_id) = request_id
+        && !span.is_disabled()
+    {
+        span.record(crate::telemetry::PROVIDER_REQUEST_ID_FIELD, request_id);
     }
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

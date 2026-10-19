@@ -2,9 +2,9 @@
 //! Requires `JEV_TOKEN`; run with `cargo run -p typesafeai_triage`.
 
 use anyhow::Result;
-use rig::prelude::*;
+use rig::error::ProviderError;
 use rig::typesafeai::{
-    Choice, ChoiceAnswer, Error, Evaluate, Jev, Noul, NoulAnswer, Query, Score, ScoreAnswer,
+    Choice, ChoiceAnswer, Evaluate, Jev, Noul, NoulAnswer, Query, Score, ScoreAnswer,
 };
 use serde::{Deserialize, Serialize};
 
@@ -34,7 +34,7 @@ struct Assessment<R = ChoiceAnswer<Route>, U = ScoreAnswer<Urgency>, D = NoulAns
 type AssessmentQuery = Assessment<Choice<Route>, Score<Urgency>, Noul>;
 
 impl AssessmentQuery {
-    fn new() -> Result<Self, Error> {
+    fn new() -> Result<Self, ProviderError> {
         Ok(Self {
             route: Choice::<Route>::new(
                 "Which support team should investigate this ticket?",
@@ -76,7 +76,7 @@ impl<R: Query, U: Query, D: Query> Query for Assessment<R, U, D> {
     type Response = Assessment<R::Response, U::Response, D::Response>;
     type Output = Assessment<R::Output, U::Output, D::Output>;
 
-    fn decode(&self, response: Self::Response) -> Result<Self::Output, Error> {
+    fn decode(&self, response: Self::Response) -> Result<Self::Output, ProviderError> {
         Ok(Assessment {
             route: self.route.decode(response.route)?,
             urgency: self.urgency.decode(response.urgency)?,
@@ -93,7 +93,7 @@ struct Ticket<'a> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let client = Jev::from_env()?.bound()?;
+    let client = Jev::from_env()?.evaluation();
     let ticket = Ticket {
         message: "My card shows two $49 charges after upgrading. Can you fix this?",
         recent_events: &[

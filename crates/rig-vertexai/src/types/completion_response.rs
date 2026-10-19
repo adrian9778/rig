@@ -1,188 +1,105 @@
-use base64::Engine as _;
-use base64::engine::general_purpose::STANDARD as BASE64;
 use google_cloud_aiplatform_v1 as vertexai;
-use rig_core::completion::{CompletionError, CompletionResponse, Usage};
-use rig_core::message::{
-    AssistantContent, ImageDetail, ImageMediaType, MediaType, MimeType, Reasoning, Text, ToolCall,
-    ToolFunction,
-};
-use rig_core::providers::gemini::completion::gemini_api_types::map_google_finish_reason;
-use serde::{Deserialize, Serialize};
-
-#[derive(Clone, Serialize, Deserialize)]
-pub struct VertexGenerateContentOutput(pub vertexai::model::GenerateContentResponse);
+use rig_core::error::ProviderError;
+use rig_core::providers::gemini::streaming::GenerateContentChunk;
+use serde_json::Value;
 
 /// Stable descriptor name reported on normalized Vertex AI responses.
 pub const PROVIDER_NAME: &str = "vertexai";
 
-/// Map Vertex AI's `finishReason` onto rig's normalized vocabulary.
-///
-/// Unmapped values are carried verbatim in their wire SCREAMING_SNAKE spelling
-/// so a reason Vertex adds later surfaces instead of reading as a natural stop.
-pub fn map_finish_reason(
-    reason: &vertexai::model::candidate::FinishReason,
-) -> Option<rig_core::completion::FinishReason> {
-    // `name()` yields the wire form (`MALFORMED_FUNCTION_CALL`) the shared
-    // Google table keys on; a value the SDK does not model falls back to
-    // `Display`, which prints the raw enum value. Formatting the variant with
-    // `Debug` would silently drop the underscores.
-    let wire_name = reason
-        .name()
-        .map_or_else(|| reason.to_string(), ToOwned::to_owned);
-
-    map_google_finish_reason(&wire_name)
-}
-
-impl TryFrom<VertexGenerateContentOutput> for CompletionResponse {
-    type Error = CompletionError;
-
-    fn try_from(value: VertexGenerateContentOutput) -> Result<Self, Self::Error> {
-        let response = &value.0;
-
-        let candidate = response.candidates.first().ok_or_else(|| {
-            CompletionError::ProviderError("No candidates in response".to_string())
-        })?;
-
-        let content = candidate
-            .content
-            .as_ref()
-            .ok_or_else(|| CompletionError::ProviderError("No content in candidate".to_string()))?;
-
-        let mut assistant_contents = Vec::new();
-        // Vertex function calls carry no id: the `index`-th call of the
-        // response mints its own handle, so two calls in one turn never
-        // share one (the position pass below is then a no-op).
-        let mut tool_index = 0u64;
-
-        // vertexai internally uses a wkt::Struct (serde_json::Map<String, serde_json::Value>) in
-        // function calling args. We need to convert that to serde_json::Value for rig_core::completion type matching
-        for part in content.parts.iter() {
-            // Gemini "thinking" models attach an opaque `thoughtSignature` to (usually) the
-            // functionCall part. It must be echoed back verbatim on subsequent turns or Vertex
-            // rejects the request with INVALID_ARGUMENT ("missing a thought_signature"). We carry
-            // it through rig-core's `ToolCall.signature` (base64, since it is raw bytes).
-            let signature = (!part.thought_signature.is_empty())
-                .then(|| BASE64.encode(&part.thought_signature));
-
-            if let Some(function_call) = part.function_call() {
-                let args_json = function_call.args.as_ref().map_or_else(
-                    || serde_json::json!({}),
-                    |s| serde_json::Value::Object(s.clone()),
-                );
-
-                // Vertex function calls carry no identifier: mint the
-                // correlation handle at the call's index — never name-as-id,
-                // which collides two same-tool calls in one turn.
-                let index = tool_index;
-                tool_index += 1;
-                assistant_contents.push(AssistantContent::ToolCall(
-                    ToolCall::from_wire_indexed(
-                        "",
-                        index,
-                        ToolFunction::new(function_call.name.clone(), args_json),
-                    )
-                    .with_signature(signature),
-                ));
-            } else if let Some(text) = part.text() {
-                if part.thought {
-                    assistant_contents.push(AssistantContent::Reasoning(
-                        Reasoning::new_with_signature(text, signature),
-                    ));
-                } else {
-                    assistant_contents.push(AssistantContent::Text(Text::new(text.clone())));
-                }
-            } else if let Some(inline_data) = part.inline_data() {
-                if signature.is_some() {
-                    return Err(CompletionError::ResponseError(
-                        "Vertex inline images with thought_signature cannot be replayed through assistant history"
-                            .to_string(),
-                    ));
-                }
-
-                // Assistant history cannot represent the `thought` flag on image parts, so
-                // avoid replaying an internal thought image as visible assistant content.
-                if part.thought {
-                    continue;
-                }
-
-                let media_type = MediaType::from_mime_type(&inline_data.mime_type);
-                match media_type {
-                    Some(MediaType::Image(
-                        media_type @ (ImageMediaType::JPEG
-                        | ImageMediaType::PNG
-                        | ImageMediaType::WEBP
-                        | ImageMediaType::HEIC
-                        | ImageMediaType::HEIF),
-                    )) => {
-                        assistant_contents.push(AssistantContent::image_base64(
-                            BASE64.encode(&inline_data.data),
-                            Some(media_type),
-                            Some(ImageDetail::default()),
-                        ));
-                    }
-                    Some(MediaType::Image(media_type)) => {
-                        return Err(CompletionError::ResponseError(format!(
-                            "Unsupported Vertex inline image media type {media_type:?}; it cannot be replayed through assistant history"
-                        )));
-                    }
-                    _ => {
-                        return Err(CompletionError::ResponseError(format!(
-                            "Unsupported Vertex inline media type {:?}",
-                            inline_data.mime_type
-                        )));
-                    }
-                }
-            } else if signature.is_some() {
-                // A signature-bearing part that is neither a function call nor text (e.g. a
-                // standalone "thinking" part). rig-core has no carrier for it, so it is dropped —
-                // log it so a later INVALID_ARGUMENT can be traced back here rather than being silent.
-                tracing::warn!(
-                    "Vertex response part carries a thought_signature but is neither a function \
-                     call nor text; signature dropped (no rig-core carrier)."
-                );
+/// `response` as the REST chunk Vertex AI sent, which the Gemini API's
+/// decoder and reassembler read: the SDK's own JSON, with each enum value
+/// respelled by name, since the SDK serializes enums by number. The SDK
+/// keeps the tool-use prompt count only per modality, so its total is the
+/// breakdown's sum. A transport of the wire transcodes each reply once,
+/// with this.
+pub fn rest_chunk(
+    response: &vertexai::model::GenerateContentResponse,
+) -> Result<GenerateContentChunk, ProviderError> {
+    let Value::Object(mut chunk) = serde_json::to_value(response)? else {
+        return Ok(GenerateContentChunk::default());
+    };
+    let candidates = chunk.get_mut("candidates").and_then(Value::as_array_mut);
+    for (candidate, json) in response
+        .candidates
+        .iter()
+        .zip(candidates.into_iter().flatten())
+    {
+        spell(json, "finishReason", candidate.finish_reason.name());
+        ratings(json, &candidate.safety_ratings);
+        // A part's enums too, so a stored part reads back whatever a store
+        // does to its numbers.
+        let parts = candidate.content.iter().flat_map(|content| &content.parts);
+        let json_parts = json
+            .pointer_mut("/content/parts")
+            .and_then(Value::as_array_mut);
+        for (part, json) in parts.zip(json_parts.into_iter().flatten()) {
+            if let (Some(code), Some(json)) =
+                (part.executable_code(), json.get_mut("executableCode"))
+            {
+                spell(json, "language", code.language.name());
+            }
+            if let (Some(result), Some(json)) = (
+                part.code_execution_result(),
+                json.get_mut("codeExecutionResult"),
+            ) {
+                spell(json, "outcome", result.outcome.name());
             }
         }
+    }
+    if let (Some(feedback), Some(json)) =
+        (&response.prompt_feedback, chunk.get_mut("promptFeedback"))
+    {
+        spell(json, "blockReason", feedback.block_reason.name());
+        ratings(json, &feedback.safety_ratings);
+    }
+    if let (Some(usage), Some(json)) = (&response.usage_metadata, chunk.get_mut("usageMetadata")) {
+        spell(json, "trafficType", usage.traffic_type.name());
+        for (key, details) in [
+            ("promptTokensDetails", &usage.prompt_tokens_details),
+            ("cacheTokensDetails", &usage.cache_tokens_details),
+            ("candidatesTokensDetails", &usage.candidates_tokens_details),
+            (
+                "toolUsePromptTokensDetails",
+                &usage.tool_use_prompt_tokens_details,
+            ),
+        ] {
+            let json = json.get_mut(key).and_then(Value::as_array_mut);
+            for (detail, json) in details.iter().zip(json.into_iter().flatten()) {
+                spell(json, "modality", detail.modality.name());
+            }
+        }
+        let tool_use: i64 = usage
+            .tool_use_prompt_tokens_details
+            .iter()
+            .map(|detail| i64::from(detail.token_count))
+            .sum();
+        if let (Some(json), true) = (json.as_object_mut(), tool_use > 0) {
+            json.entry("toolUsePromptTokenCount")
+                .or_insert_with(|| tool_use.into());
+        }
+    }
+    Ok(GenerateContentChunk(chunk))
+}
 
-        rig_core::message::normalize_missing_tool_call_ids(&mut assistant_contents);
-        let choice = rig_core::message::require_non_empty_response(assistant_contents)?;
+/// Respell the safety ratings under `json` by name.
+fn ratings(json: &mut Value, ratings: &[vertexai::model::SafetyRating]) {
+    let json = json.get_mut("safetyRatings").and_then(Value::as_array_mut);
+    for (rating, json) in ratings.iter().zip(json.into_iter().flatten()) {
+        spell(json, "category", rating.category.name());
+        spell(json, "probability", rating.probability.name());
+        spell(json, "severity", rating.severity.name());
+    }
+}
 
-        let usage = response
-            .usage_metadata
-            .as_ref()
-            .map(|usage| Usage {
-                input_tokens: Some(usage.prompt_token_count as u64),
-                output_tokens: Some(usage.candidates_token_count as u64),
-                total_tokens: Some(usage.total_token_count as u64),
-                // `prompt_token_count` is documented as "still the total
-                // effective prompt size... including the number of tokens in the
-                // cached content", so the cached count is a *subset* of the
-                // input count, matching the Gemini surface.
-                cached_input_tokens: Some(usage.cached_content_token_count as u64),
-                // Vertex reports no cache-write counter.
-                cache_creation_input_tokens: None,
-                tool_use_prompt_tokens: None,
-                // Vertex reports `thoughts_token_count`, and rig has a field for
-                // it. Hardcoding zero here silently discarded the thinking spend
-                // on every Vertex response — on the sibling Gemini surface it is
-                // routinely the largest component of the bill.
-                reasoning_tokens: Some(usage.thoughts_token_count as u64),
-            })
-            .unwrap_or_default();
-
-        let finish_reason = map_finish_reason(&candidate.finish_reason);
-        let model = Some(response.model_version.clone()).filter(|model| !model.is_empty());
-
-        Ok(CompletionResponse::new(choice, usage, PROVIDER_NAME)
-            .with_optional_finish_reason(finish_reason)
-            .with_optional_model(model)
-            .with_optional_response_id(
-                Some(response.response_id.clone()).filter(|id| !id.is_empty()),
-            ))
+/// Replace the number at `json[key]` with `name`, when both exist.
+fn spell(json: &mut Value, key: &str, name: Option<&str>) {
+    if let (Some(slot), Some(name)) = (json.get_mut(key), name) {
+        *slot = Value::String(name.to_owned());
     }
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 #[cfg(test)]
 mod vertex_usage_mapping_tests;

@@ -2,9 +2,9 @@
 
 use anyhow::{Result, bail};
 use rig::typesafeai::{
-    Choice, ChoiceAnswer, Error, Evaluate, Jev, Noul, NoulAnswer, Query, Score, ScoreAnswer,
+    Choice, ChoiceAnswer, Evaluate, Jev, Noul, NoulAnswer, Query, Score, ScoreAnswer,
 };
-use rig::{completion::Message, prelude::*, providers::openai::OpenAI};
+use rig::{completion::Message, error::ProviderError, prelude::*, providers::openai::OpenAI};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::VecDeque,
@@ -41,7 +41,7 @@ struct Assessment<R = ChoiceAnswer<Route>, U = ScoreAnswer<Urgency>, C = NoulAns
 type AssessmentQuery = Assessment<Choice<Route>, Score<Urgency>, Noul>;
 
 impl AssessmentQuery {
-    fn new() -> Result<Self, Error> {
+    fn new() -> Result<Self, ProviderError> {
         Ok(Self {
             route: Choice::<Route>::new(
                 "Select the most useful support route for the current message, using history for context.",
@@ -89,7 +89,7 @@ impl<R: Query, U: Query, C: Query> Query for Assessment<R, U, C> {
     type Response = Assessment<R::Response, U::Response, C::Response>;
     type Output = Assessment<R::Output, U::Output, C::Output>;
 
-    fn decode(&self, response: Self::Response) -> Result<Self::Output, Error> {
+    fn decode(&self, response: Self::Response) -> Result<Self::Output, ProviderError> {
         Ok(Assessment {
             route: self.route.decode(response.route)?,
             urgency: self.urgency.decode(response.urgency)?,
@@ -130,9 +130,9 @@ async fn main() -> Result<()> {
         }
     }
 
-    let jev = Jev::from_env()?.bound()?;
-    let openai = if with_agent {
-        Some(OpenAI::from_env()?.bound()?)
+    let jev = Jev::from_env()?.evaluation();
+    let assistant = if with_agent {
+        Some(OpenAI::from_env()?.completion("gpt-5.6-sol").erase())
     } else {
         None
     };
@@ -192,8 +192,8 @@ async fn main() -> Result<()> {
         );
 
         let policy = next_action(&route, clarification.noul);
-        let reply = if let Some(client) = &openai {
-            let agent = client.agent("gpt-5.6-sol")
+        let reply = if let Some(model) = &assistant {
+            let agent = AgentBuilder::new(model.clone())
                 .preamble(format!(
                     "You support a hosted document workspace. {policy} \
                      You have no account access or tools; never claim to change settings or issue refunds. \
@@ -210,7 +210,7 @@ async fn main() -> Result<()> {
                 })
                 .collect::<Vec<_>>();
             match tokio::time::timeout(TIMEOUT, agent.chat(input, &mut messages)).await {
-                Ok(Ok(response)) => response.output,
+                Ok(Ok(response)) => response.output(),
                 Ok(Err(error)) => {
                     eprintln!("Agent reply failed (conversation unchanged): {error}");
                     continue;

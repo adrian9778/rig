@@ -6,8 +6,9 @@
 //! Tool-call handles for wires that carry no id used to draw from
 //! `fastrand`; they now derive from the block that assembled the call or
 //! the call's index in the response. This guard pins the remaining random
-//! sources to the two transport headers and the LSH index, none of which
-//! can reach a request, a message or an effect record.
+//! sources to the two transport headers, the LSH index, retry jitter and
+//! a saved log's lineage token, none of which can reach a request, a
+//! message or an effect record.
 
 use std::path::{Path, PathBuf};
 
@@ -42,8 +43,20 @@ fn relative(path: &Path) -> String {
 const FASTRAND_SITES: &[(&str, &str)] = &[
     ("crates/rig-core/src/id.rs", "the id generator itself"),
     (
+        "crates/rig-ecs/src/retry.rs",
+        "retry backoff jitter; a wait, never a request or a record",
+    ),
+    (
+        "crates/rig-core/src/conversation/lineage.rs",
+        "a saved log's lineage token; in the session log's header, never a request, a message or an effect record",
+    ),
+    (
         "crates/rig-core/src/vector_store/lsh.rs",
-        "LSH hyperplanes; an index, never a request or a record",
+        "the LSH index's hyperplanes, from a constant seed: the same on every run, never a request or a record",
+    ),
+    (
+        "crates/rig-core/benches/vector_search.rs",
+        "seeded benchmark vectors; a bench input, never a request or a record",
     ),
 ];
 
@@ -59,7 +72,7 @@ const GENERATE_SITES: &[(&str, &str)] = &[
     ),
     (
         "crates/rig-core/src/providers/chatgpt/mod.rs",
-        "a `session_id` transport header",
+        "a `session-id` transport header",
     ),
 ];
 

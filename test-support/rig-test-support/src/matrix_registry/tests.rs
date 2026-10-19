@@ -2,7 +2,7 @@ use super::*;
 
 fn parse(rows: &str) -> syn::Result<GoldenMatrix> {
     syn::parse_str(&format!(
-        "wrapper: super::with_cassette, wire: wire, run: cells::run, oracle: crate::ecs_goldens::golden_effects; {rows}"
+        "wrapper: super::with_cassette, wire: wire, run: cells::run, oracle: crate::goldens::golden_effects; {rows}"
     ))
 }
 
@@ -25,7 +25,7 @@ fn literal_rows_preserve_ignored_status_and_qualified_paths() {
             .nth(1)
             .expect("helper")
             .ident,
-        "ecs_goldens"
+        "goldens"
     );
     assert_eq!(matrix.rows[0].scenario.value(), "matrix/normal");
     assert_eq!(matrix.rows[0].golden.value(), "normal");
@@ -59,30 +59,6 @@ fn comments_do_not_register_rows_or_calls() {
     .expect("valid rows");
     assert_eq!(matrix.rows.len(), 1);
     assert_eq!(matrix.rows[0].scenario.value(), "real");
-}
-
-#[test]
-fn resume_rows_preserve_scenarios_and_validate_registration() {
-    let header = "wrapper: super::with_cassette, wire: wire, run: world::run;";
-    let matrix: ResumeMatrix = syn::parse_str(&format!(r#"{header}
-        #[tokio::test] cut: ("recording", cells::CELL, Some(1), golden);
-        #[tokio::test] #[ignore = "unrecorded"] end: ("absent", cells::CELL, Some(usize::MAX), golden);
-    "#)).expect("resume matrix");
-    assert_eq!(
-        matrix.wrapper.segments.last().expect("wrapper").ident,
-        "with_cassette"
-    );
-    assert_eq!(matrix.rows[0].0.value(), "recording");
-    assert!(!matrix.rows[0].1);
-    assert!(matrix.rows[1].1);
-    for row in [
-        "",
-        "cut: (\"recording\", CELL, None, golden);",
-        "#[tokio::test] cut: (scenario(), CELL, None, golden);",
-        "#[tokio::test] cut: (\"recording\", CELL, None, golden());",
-    ] {
-        assert!(syn::parse_str::<ResumeMatrix>(&format!("{header}{row}")).is_err());
-    }
 }
 
 #[test]

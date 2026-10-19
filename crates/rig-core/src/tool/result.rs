@@ -1,4 +1,12 @@
-//! Canonical structured tool errors and execution results.
+//! Structured tool failures and model-visible execution results.
+//!
+//! ```
+//! use rig_core::tool::{ToolExecutionError, ToolResult};
+//!
+//! let result = ToolResult::failed(ToolExecutionError::invalid_args("Provide a name"));
+//! assert!(result.is_error());
+//! assert_eq!(result.output().as_text(), Some("Provide a name"));
+//! ```
 
 use std::error::Error;
 #[cfg(not(target_family = "wasm"))]
@@ -45,11 +53,8 @@ macro_rules! kind_defaults {
                 match self { $(Self::$variant => $name,)+ }
             }
 
-            /// The kind's default retryability: `Some(true)`/`Some(false)`
-            /// when the kind decides, `None` when only the tool can know —
-            /// on the wire that reads as not retryable. This is the one
-            /// table; `ToolExecutionError::is_retryable` and the wire
-            /// `ErrorReport` both derive from it.
+            /// Default retryability, or `None` when the tool must supply a verdict.
+            /// Without an override, `None` becomes non-retryable in error reports.
             pub const fn default_retryable(self) -> Option<bool> {
                 match self { $(Self::$variant => $retryable,)+ }
             }
@@ -128,7 +133,6 @@ impl std::fmt::Display for ToolErrorKind {
 /// exposes safe kind-level feedback. Use [`Self::with_model_feedback`] or
 /// [`Self::with_model_output`] to provide a purpose-built presentation.
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
-#[serde(from = "ToolExecutionErrorRepr", into = "ToolExecutionErrorRepr")]
 pub struct ToolExecutionError {
     kind: ToolErrorKind,
     message: String,
@@ -139,53 +143,12 @@ pub struct ToolExecutionError {
     refusal: bool,
     /// The concrete source, kept for downcasting on native. Browser wasm
     /// retains none: its errors are not `Send + Sync`, and this type must be
-    /// (it crosses the effect bus and the wire as part of an `Outcome`).
+    /// (it crosses the handler table and the wire as part of an `Answered`).
+    /// Live process state never crosses a wire, so a deserialized error has
+    /// none.
     #[cfg(not(target_family = "wasm"))]
+    #[serde(skip)]
     source: Option<Arc<dyn Error + Send + Sync + 'static>>,
-}
-
-/// The wire form of [`ToolExecutionError`]: every field but `source`. A
-/// source is live process state (a boxed error); it does not cross a wire
-/// and a report reconstructed from one has none.
-#[derive(serde::Serialize, serde::Deserialize)]
-struct ToolExecutionErrorRepr {
-    kind: ToolErrorKind,
-    message: String,
-    model_output: ToolOutput,
-    retryable: Option<bool>,
-    code: Option<String>,
-    http_status: Option<u16>,
-    refusal: bool,
-}
-
-impl From<ToolExecutionError> for ToolExecutionErrorRepr {
-    fn from(error: ToolExecutionError) -> Self {
-        Self {
-            kind: error.kind,
-            message: error.message,
-            model_output: error.model_output,
-            retryable: error.retryable,
-            code: error.code,
-            http_status: error.http_status,
-            refusal: error.refusal,
-        }
-    }
-}
-
-impl From<ToolExecutionErrorRepr> for ToolExecutionError {
-    fn from(repr: ToolExecutionErrorRepr) -> Self {
-        Self {
-            kind: repr.kind,
-            message: repr.message,
-            model_output: repr.model_output,
-            retryable: repr.retryable,
-            code: repr.code,
-            http_status: repr.http_status,
-            refusal: repr.refusal,
-            #[cfg(not(target_family = "wasm"))]
-            source: None,
-        }
-    }
 }
 
 impl ToolExecutionError {
@@ -217,10 +180,10 @@ impl ToolExecutionError {
 
     /// Build a safely presented `Other` error from a concrete source.
     ///
-    /// The source's display string remains available as the operator-facing
-    /// [`Self::message`] and the source remains downcastable, but the model sees
-    /// only the stable feedback for [`ToolErrorKind::Other`]. Passing an existing
-    /// `ToolExecutionError` preserves its classification and presentation.
+    /// The source's display string remains in [`Self::message`], while the model
+    /// sees stable [`ToolErrorKind::Other`] feedback. Native targets retain the
+    /// downcastable source; WASM drops it. An existing `ToolExecutionError`
+    /// retains its classification and presentation.
     pub fn from_error<E>(error: E) -> Self
     where
         E: Error + WasmCompatSend + WasmCompatSync + 'static,
@@ -509,7 +472,7 @@ impl ToolResult {
         Self { disposition }
     }
 
-    /// Canonical model-visible output before any presentation-only hook rewrite.
+    /// Current model-visible output, including replacements made by [`Self::with_output`].
     pub fn output(&self) -> &ToolOutput {
         match &self.disposition {
             ToolDisposition::Success(output) | ToolDisposition::Skipped(output) => output,
@@ -572,9 +535,8 @@ impl ToolResult {
         self.error().is_some_and(|error| error.kind == kind)
     }
 
-    /// Returns the stable telemetry name for this result disposition.
-    /// The result as the tool author's `Result`: a success or a skip is
-    /// `Ok(output)`, an error or a refusal is `Err(error)`.
+    /// Converts success or skipped dispositions to `Ok(output)` and errors or
+    /// refusals to `Err(error)`.
     pub fn into_result(self) -> Result<ToolOutput, ToolExecutionError> {
         match self.disposition {
             ToolDisposition::Success(output) | ToolDisposition::Skipped(output) => Ok(output),
@@ -582,6 +544,7 @@ impl ToolResult {
         }
     }
 
+    /// Stable telemetry disposition: `success`, `error`, `denied`, or `skipped`.
     pub fn status_name(&self) -> &'static str {
         match &self.disposition {
             ToolDisposition::Success(_) => "success",
@@ -601,6 +564,3 @@ const _: fn() = || {
 
 #[cfg(test)]
 mod tests;
-
-#[cfg(test)]
-mod migrated_tests;

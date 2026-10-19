@@ -12,33 +12,27 @@ use bytes::Bytes;
 use futures::StreamExt;
 
 use super::*;
-use crate::completion::{CompletionModel as _, FinishReason};
-use crate::driver::Bound;
+use crate::completion::FinishReason;
 use crate::message::AssistantContent;
-use crate::providers::openai::wire::{GROQ, OPENAI, OpenAI};
+use crate::providers::openai::wire::{OPENAI, OpenAIConfig};
+use crate::test_utils::json_body;
 use crate::test_utils::{MockStreamingClient, RecordingHttpClient};
 
 use super::super::tests::{recorded, recorded_json};
 
 fn wire() -> Chat {
-    OpenAI::new("sk-test")
+    OpenAIConfig::new("sk-test")
         .with_dialect(&OPENAI)
         .chat("gpt-4.1-nano")
 }
 
 fn prompt(text: &str) -> CompletionRequest {
-    CompletionRequest {
-        model: None,
-        chat_history: vec![crate::message::Message::user(text)],
-        documents: Vec::new(),
-        tools: Vec::new(),
-        temperature: Some(0.0),
-        max_tokens: Some(16),
-        tool_choice: None,
-        additional_params: None,
-        output_schema: None,
-        record_telemetry_content: false,
-    }
+    CompletionRequest::new(text).temperature(0.0).max_tokens(16)
+}
+
+/// The blocks without their provider items.
+fn canonical(choice: &[AssistantContent]) -> Vec<AssistantContent> {
+    choice.iter().map(AssistantContent::canonical).collect()
 }
 
 /// Fold both recorded shapes of one turn and hand back the two responses.
@@ -50,15 +44,15 @@ async fn fold_both(
     crate::completion::CompletionResponse,
     crate::completion::CompletionResponse,
 ) {
-    let buffered = Bound::new(
+    let buffered = crate::driver::Model::new(
         wire(),
         RecordingHttpClient::new(recorded("then", unary_cassette)),
     )
-    .completion(request.clone())
+    .call(request.clone())
     .await
     .expect("the recorded unary reply decodes");
 
-    let streaming = Bound::new(
+    let streaming = crate::driver::Model::new(
         wire(),
         MockStreamingClient {
             sse_bytes: Bytes::from(recorded("then", stream_cassette)),
@@ -66,10 +60,15 @@ async fn fold_both(
     );
     let mut response = streaming
         .stream(request)
-        .await
         .expect("the recorded stream opens");
     while response.next().await.is_some() {}
-    (buffered, response.finish())
+    (
+        buffered,
+        response
+            .finish()
+            .await
+            .expect("the stream produced a terminal record"),
+    )
 }
 
 #[tokio::test]
@@ -81,22 +80,24 @@ async fn a_recorded_text_turn_folds_alike_from_both_reply_shapes() {
     )
     .await;
 
-    assert_eq!(buffered.choice, streamed.choice);
+    // Two recordings of one turn: the same blocks, each holding its own
+    // reply's provider item.
+    assert_eq!(canonical(&buffered.choice), canonical(&streamed.choice));
     assert_eq!(buffered.usage, streamed.usage);
     assert_eq!(buffered.finish_reason(), streamed.finish_reason());
-    assert_eq!(buffered.model, streamed.model);
+    assert_eq!(buffered.model(), streamed.model());
 
     // The fixture, so a change in the recorded bytes cannot make the
     // agreement vacuous.
     assert_eq!(
-        buffered.choice.first(),
-        Some(&AssistantContent::text("pong"))
+        buffered.choice.first().map(AssistantContent::canonical),
+        Some(AssistantContent::text("pong"))
     );
     assert_eq!(buffered.usage.input_tokens, Some(15));
     assert_eq!(buffered.usage.output_tokens, Some(1));
     assert_eq!(buffered.usage.total_tokens, Some(16));
     assert_eq!(buffered.finish_reason(), Some(FinishReason::Stop));
-    assert_eq!(buffered.model.as_deref(), Some("gpt-4.1-nano-2025-04-14"));
+    assert_eq!(buffered.model(), Some("gpt-4.1-nano-2025-04-14"));
 }
 
 #[tokio::test]
@@ -110,19 +111,48 @@ async fn a_recorded_tool_call_turn_folds_alike_from_both_reply_shapes() {
     )
     .await;
 
-    assert_eq!(buffered.choice, streamed.choice);
     assert_eq!(buffered.usage, streamed.usage);
     assert_eq!(buffered.finish_reason(), streamed.finish_reason());
 
     // The unary body delivers the call whole and the stream delivers it in
     // two fragments, so equality here is the synthesis working rather than
-    // two copies of one mapping agreeing.
-    let Some(AssistantContent::ToolCall(call)) = buffered.choice.first() else {
-        panic!("the recorded turn is a tool call: {:?}", buffered.choice);
+    // two copies of one mapping agreeing. Each recording mints its own call
+    // id, so the ids are checked against their own bytes instead.
+    let ([AssistantContent::ToolCall(call)], [AssistantContent::ToolCall(streamed_call)]) =
+        (buffered.choice.as_slice(), streamed.choice.as_slice())
+    else {
+        panic!(
+            "each recorded turn is one tool call: {:?} / {:?}",
+            buffered.choice, streamed.choice
+        );
     };
+    assert_eq!(call.function, streamed_call.function);
+    for (call, cassette) in [
+        (
+            call,
+            "raw_capture_matrix/chat_tool_call_raw_round_trips_typed.yaml",
+        ),
+        (
+            streamed_call,
+            "raw_stream_capture_matrix/chat_tool_call_stream_raw_round_trips_typed.yaml",
+        ),
+    ] {
+        let id = call
+            .id
+            .provider()
+            .map(|provider| provider.as_str())
+            .expect("the call keeps the provider's id");
+        assert!(
+            recorded("then", cassette).contains(&format!("\"id\":\"{id}\"")),
+            "{cassette}: the call id {id} is the recorded one"
+        );
+        assert_eq!(
+            call.id.provider().map(|provider| provider.as_str()),
+            Some(id)
+        );
+    }
     assert_eq!(call.function.name, "ping");
-    assert_eq!(call.function.arguments, serde_json::json!({}));
-    assert_eq!(call.id.explicit(), Some("call_REDACTED_1"));
+    assert_eq!(call.function.arguments_value(), serde_json::json!({}));
     assert_eq!(buffered.finish_reason(), Some(FinishReason::ToolCalls));
     assert_eq!(buffered.usage.output_tokens, Some(10));
 }
@@ -135,13 +165,7 @@ fn the_mode_decides_whether_the_body_asks_for_a_stream() {
         let encoded = wire()
             .encode(prompt("Reply with exactly the single word: pong"), mode)
             .expect("the request encodes");
-        let [request] = encoded.requests.as_slice() else {
-            panic!("a chat turn is one request");
-        };
-        let Body::Bytes(bytes) = request.body() else {
-            panic!("a chat request body is bytes");
-        };
-        serde_json::from_slice(bytes).expect("the body is JSON")
+        json_body(&encoded.request)
     }
 
     let unary = body(Mode::Unary);
@@ -169,73 +193,125 @@ fn the_mode_decides_whether_the_body_asks_for_a_stream() {
     );
 }
 
-/// A streamed reply's framing is SSE and a unary reply's is the whole body,
-/// which is what lets the driver reject a non-event-stream 200 on a stream
-/// while reading the unary reply as one JSON document.
-#[test]
-fn the_mode_decides_the_reply_framing() {
-    let request = prompt("hi");
-    assert_eq!(
-        wire()
-            .encode(request.clone(), Mode::Unary)
-            .expect("encodes")
-            .framing,
-        Framing::Whole
-    );
-    assert_eq!(
-        wire()
-            .encode(request, Mode::Streaming)
-            .expect("encodes")
-            .framing,
-        Framing::Sse
-    );
-}
-
-/// `[DONE]` is a modeled event, not a transport filter: a stream whose only
-/// terminal signal is the sentinel still produces the terminal record.
+/// `[DONE]` before any finish reason fails the turn, as pi's
+/// `openai-completions` throws: the provider never said the turn ended.
 #[tokio::test]
-async fn the_done_sentinel_emits_the_deferred_terminal() {
+async fn the_done_sentinel_without_a_finish_fails() {
     const BODY: &str = concat!(
         "data: {\"object\":\"chat.completion.chunk\",\"id\":\"chatcmpl-1\",",
         "\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"}}]}\n\n",
         "data: [DONE]\n\n",
     );
-    let bound = Bound::new(
+    let bound = crate::driver::Model::new(
         wire(),
         MockStreamingClient {
             sse_bytes: Bytes::from_static(BODY.as_bytes()),
         },
     );
-    let mut response = bound.stream(prompt("hi")).await.expect("the stream opens");
+    let mut response = bound.stream(prompt("hi")).expect("the stream opens");
     while response.next().await.is_some() {}
-    let folded = response.finish();
-
-    assert_eq!(folded.choice.first(), Some(&AssistantContent::text("hi")));
-    // No chunk reported a reason, so the record carries none — the sentinel
-    // is the completion signal, not a fabricated `stop`.
-    assert_eq!(folded.finish_reason(), None);
-    assert_eq!(folded.response_id.as_deref(), Some("chatcmpl-1"));
+    let error = response
+        .finish()
+        .await
+        .expect_err("a stream the provider never finished has no response");
+    assert!(matches!(error, ProviderError::Truncated), "{error:?}");
 }
 
-/// A stream that reaches EOF with neither `[DONE]` nor a finish reason is
-/// truncation, and must not be dressed up as a default-usage success.
-#[tokio::test]
-async fn a_truncated_stream_yields_no_terminal_record() {
-    const BODY: &str = concat!(
-        "data: {\"object\":\"chat.completion.chunk\",\"id\":\"chatcmpl-1\",",
-        "\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"par\"}}]}\n\n",
-    );
-    let bound = Bound::new(
-        wire(),
+/// Drive `body` through a gateway whose quirks end a `[DONE]` stream that
+/// names no finish reason.
+async fn lenient_stream(
+    body: &'static str,
+) -> Result<crate::completion::CompletionResponse, ProviderError> {
+    use crate::providers::openai::wire::{Dialect, Quirks};
+
+    // Built at run time: the quirk is a `const fn` callers use in constants.
+    let dialect = Dialect::gateway("acme", "https://api.acme.test/v1", "ACME_API_KEY")
+        .with_quirks(Quirks::openai().done_without_finish_reason());
+    let bound = crate::driver::Model::new(
+        OpenAIConfig::new("k").with_dialect(&dialect).chat("m"),
         MockStreamingClient {
-            sse_bytes: Bytes::from_static(BODY.as_bytes()),
+            sse_bytes: Bytes::from_static(body.as_bytes()),
         },
     );
-    let mut response = bound.stream(prompt("hi")).await.expect("the stream opens");
+    let mut response = bound.stream(prompt("hi")).expect("the stream opens");
     while response.next().await.is_some() {}
-    let folded = response.finish();
-    assert_eq!(folded.usage, crate::completion::Usage::default());
-    assert_eq!(folded.finish_reason(), None);
+    response.finish().await
+}
+
+/// With the quirk, `[DONE]` ends a text turn that named no reason as a
+/// stop, as pi's `compat.supportsFinishReason: false` does.
+#[tokio::test]
+async fn the_done_quirk_ends_a_text_turn_as_a_stop() {
+    const BODY: &str = concat!(
+        "data: {\"object\":\"chat.completion.chunk\",\"id\":\"chatcmpl-1\",",
+        "\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"complete answer\"},",
+        "\"finish_reason\":null}]}\n\n",
+        "data: [DONE]\n\n",
+    );
+    let response = lenient_stream(BODY)
+        .await
+        .expect("the quirk ends the turn at the sentinel");
+    assert_eq!(response.finish_reason(), Some(FinishReason::Stop));
+    assert_eq!(
+        canonical(&response.choice),
+        vec![AssistantContent::text("complete answer")]
+    );
+}
+
+/// With the quirk, a turn holding a tool call ends as a tool call, and the
+/// call is delivered whole.
+#[tokio::test]
+async fn the_done_quirk_ends_a_tool_call_turn_as_tool_calls() {
+    const BODY: &str = concat!(
+        "data: {\"object\":\"chat.completion.chunk\",\"id\":\"chatcmpl-1\",\"model\":\"m\",",
+        "\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",",
+        "\"type\":\"function\",\"function\":{\"name\":\"read\",\"arguments\":\"{\\\"path\\\"\"}}]}}]}\n\n",
+        "data: {\"object\":\"chat.completion.chunk\",\"id\":\"chatcmpl-1\",\"model\":\"m\",",
+        "\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,",
+        "\"function\":{\"arguments\":\":\\\"README.md\\\"}\"}}]}}]}\n\n",
+        "data: [DONE]\n\n",
+    );
+    let response = lenient_stream(BODY)
+        .await
+        .expect("the quirk ends the turn at the sentinel");
+    assert_eq!(response.finish_reason(), Some(FinishReason::ToolCalls));
+    let [AssistantContent::ToolCall(call)] = response.choice.as_slice() else {
+        panic!("the turn is one tool call: {:?}", response.choice);
+    };
+    assert_eq!(call.function.name, "read");
+    assert_eq!(
+        call.function.arguments_value(),
+        serde_json::json!({"path": "README.md"})
+    );
+}
+
+/// The quirk never turns an empty stream into an answer: `[DONE]` with no
+/// chunk before it, or only frames the wire does not model, is truncated.
+#[tokio::test]
+async fn the_done_quirk_still_fails_a_stream_with_no_chunk() {
+    for body in ["data: [DONE]\n\n", "data: \"noise\"\n\ndata: [DONE]\n\n"] {
+        let error = lenient_stream(body)
+            .await
+            .expect_err("a stream with no chunk has no response");
+        assert!(
+            matches!(error, ProviderError::Truncated),
+            "{body}: {error:?}"
+        );
+    }
+}
+
+/// The quirk reads only the sentinel: a stream that stops without `[DONE]`
+/// or a finish reason was still cut short.
+#[tokio::test]
+async fn the_done_quirk_does_not_end_a_stream_without_the_sentinel() {
+    const BODY: &str = concat!(
+        "data: {\"object\":\"chat.completion.chunk\",\"id\":\"chatcmpl-1\",",
+        "\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"}}]}\n\n",
+    );
+    let error = lenient_stream(BODY)
+        .await
+        .expect_err("a stream cut before the sentinel has no response");
+    assert!(matches!(error, ProviderError::Truncated), "{error:?}");
 }
 
 /// The wire's in-band error envelope arrives with a 200 status, so only the
@@ -244,13 +320,13 @@ async fn a_truncated_stream_yields_no_terminal_record() {
 async fn an_in_band_error_envelope_fails_the_turn() {
     const BODY: &str =
         "data: {\"error\":{\"message\":\"rate limited\"},\"choices\":[]}\n\ndata: [DONE]\n\n";
-    let bound = Bound::new(
+    let bound = crate::driver::Model::new(
         wire(),
         MockStreamingClient {
             sse_bytes: Bytes::from_static(BODY.as_bytes()),
         },
     );
-    let mut response = bound.stream(prompt("hi")).await.expect("the stream opens");
+    let mut response = bound.stream(prompt("hi")).expect("the stream opens");
     let mut errors = Vec::new();
     while let Some(item) = response.next().await {
         if let Err(error) = item {
@@ -262,108 +338,148 @@ async fn an_in_band_error_envelope_fails_the_turn() {
         errors[0].contains("rate limited"),
         "the provider's message survives: {errors:?}"
     );
-    // A failed turn commits no terminal record, so nothing reports usage.
-    assert_eq!(response.finish().finish_reason(), None);
+    // A failed turn has nothing to fold.
+    assert!(response.finish().await.is_err());
 }
 
-/// A dialect that spells the cap `max_completion_tokens` does so only for
-/// the reasoning families, because this same wire reaches compatible servers
-/// that know only the legacy field.
-#[test]
-fn the_output_cap_spelling_follows_the_model_family() {
-    fn cap_key(model: &str) -> &'static str {
-        let encoded = OpenAI::new("sk-test")
-            .chat(model)
-            .encode(prompt("hi"), Mode::Unary)
-            .expect("encodes");
-        let [request] = encoded.requests.as_slice() else {
-            panic!("a chat turn is one request");
-        };
-        let Body::Bytes(bytes) = request.body() else {
-            panic!("a chat request body is bytes");
-        };
-        let body: serde_json::Value = serde_json::from_slice(bytes).expect("JSON");
-        if body.get("max_completion_tokens").is_some() {
-            "max_completion_tokens"
-        } else if body.get("max_tokens").is_some() {
-            "max_tokens"
-        } else {
-            "none"
+/// An in-band envelope whose numeric `code` is an HTTP status (OpenRouter
+/// and other compatible gateways send `{"error":{"code":429}}` on a 200
+/// stream) gets the verdict and code that status gets, as Gemini's stream
+/// already does.
+///
+/// Not a cassette test: a gateway rate limit or upstream failure is a
+/// transient condition that cannot be recorded on demand, and the defect
+/// is the verdict the envelope gets, which a hand-written frame pins
+/// exactly.
+#[tokio::test]
+async fn an_in_band_envelope_with_a_status_code_is_classified_by_it() -> anyhow::Result<()> {
+    for code in [429_u16, 502] {
+        let body = format!(
+            "data: {{\"error\":{{\"code\":{code},\"message\":\"upstream\"}}}}\n\ndata: [DONE]\n\n"
+        );
+        let bound = crate::driver::Model::new(
+            wire(),
+            MockStreamingClient {
+                sse_bytes: Bytes::from(body),
+            },
+        );
+        let mut response = bound.stream(prompt("hi"))?;
+        let mut errors = Vec::new();
+        while let Some(item) = response.next().await {
+            if let Err(error) = item {
+                errors.push(error);
+            }
         }
+        anyhow::ensure!(errors.len() == 1, "one terminal failure: {errors:?}");
+        let report = errors[0].report();
+        anyhow::ensure!(
+            report.retryable,
+            "code {code} must be retryable: {report:?}"
+        );
+        anyhow::ensure!(
+            report.code.as_deref() == Some(code.to_string().as_str()),
+            "code {code} must be reported: {report:?}"
+        );
     }
-
-    assert_eq!(cap_key("gpt-5.2"), "max_completion_tokens");
-    assert_eq!(cap_key("o3-mini"), "max_completion_tokens");
-    assert_eq!(cap_key("gpt-4.1-nano"), "max_tokens");
-
-    // A dialect whose endpoint was never observed to reject the legacy field
-    // keeps sending it, whatever the model is called.
-    let groq = OpenAI::new("gsk-test")
-        .with_dialect(&GROQ)
-        .chat("gpt-5.2")
-        .encode(prompt("hi"), Mode::Unary)
-        .expect("encodes");
-    let [groq_request] = groq.requests.as_slice() else {
-        panic!("a chat turn is one request");
-    };
-    let Body::Bytes(bytes) = groq_request.body() else {
-        panic!("a chat request body is bytes");
-    };
-    let body: serde_json::Value = serde_json::from_slice(bytes).expect("JSON");
-    assert!(body.get("max_tokens").is_some());
-    assert!(body.get("max_completion_tokens").is_none());
+    Ok(())
 }
 
-/// OpenRouter's message conversion refused a document carrying only a
-/// provider file id. A refusal is behaviour: dropping it would turn a legible
-/// local error into an opaque gateway 400.
+/// OpenRouter takes no provider file id, so the adapter leaves a placeholder
+/// for a document carrying only one; every other dialect sends the id.
 #[test]
-fn openrouter_refuses_a_document_that_is_only_a_file_id() {
+fn openrouter_gets_a_placeholder_for_a_file_id_document() {
     use crate::message::{Document, DocumentSourceKind, Message, UserContent};
     use crate::providers::openai::wire::OPENROUTER;
 
-    let with_file_id = || {
+    let body = |chat: Chat| {
         let mut request = prompt("read this");
-        request.chat_history = vec![Message::User {
-            content: vec![UserContent::Document(Document {
-                data: DocumentSourceKind::FileId("file-abc".to_owned()),
-                media_type: None,
-                additional_params: None,
-            })],
-        }];
-        request
+        request.chat_history = vec![
+            Message::User {
+                content: vec![UserContent::Document(Document {
+                    data: DocumentSourceKind::FileId("file-abc".to_owned()).into(),
+                    media_type: None,
+                    additional_params: None,
+                })],
+            }
+            .into(),
+        ];
+        let request = <crate::operation::Completion as crate::wire::Operation>::prepare(
+            request,
+            &chat.describe(),
+        )
+        .expect("the request prepares");
+        json_body(&chat.encode(request, Mode::Unary).expect("encodes").request).to_string()
     };
-
-    let error = OpenAI::new("k")
-        .with_dialect(&OPENROUTER)
-        .chat("openai/gpt-4o")
-        .encode(with_file_id(), Mode::Unary)
-        .expect_err("OpenRouter refuses a bare file id");
-    assert!(
-        error
-            .to_string()
-            .contains("Provider file IDs are not supported for OpenRouter document inputs"),
-        "the message is the one the conversion returned: {error}"
+    let openrouter = body(
+        OpenAIConfig::new("k")
+            .with_dialect(&OPENROUTER)
+            .chat("openai/gpt-4o"),
     );
-
-    // Every other dialect on this wire accepted them, so the refusal is
-    // OpenRouter's and not the wire's.
     assert!(
-        OpenAI::new("k")
-            .chat("gpt-4.1-nano")
-            .encode(with_file_id(), Mode::Unary)
-            .is_ok(),
-        "only OpenRouter refuses a file id"
+        openrouter.contains(crate::completion::history::DOCUMENT_UNSENDABLE)
+            && !openrouter.contains("file-abc"),
+        "{openrouter}"
+    );
+    let openai = body(wire());
+    assert!(openai.contains("\"file_id\":\"file-abc\""), "{openai}");
+}
+
+/// Another model's reasoning reaches a model with a reasoning field under
+/// that field when the request asks for it, and as text otherwise.
+#[test]
+fn foreign_reasoning_goes_under_the_reasoning_field_when_asked() {
+    use crate::message::{AssistantMessage, Message, Origin, Reasoning};
+
+    let deepseek = OpenAIConfig::new("k")
+        .with_dialect(&super::super::DEEPSEEK)
+        .chat("deepseek-chat");
+    let body = |asked: bool| {
+        let mut request = prompt("go on");
+        request.foreign_reasoning = asked;
+        request.chat_history = vec![
+            Message::user("start").into(),
+            Message::Assistant(AssistantMessage {
+                content: vec![
+                    AssistantContent::Reasoning(Reasoning::new("plan")),
+                    AssistantContent::text("done"),
+                ],
+                origin: Some(Origin::new("anthropic.messages", "anthropic", "claude")),
+                stop: Some(crate::message::StopReason::Stop),
+            })
+            .into(),
+            Message::user("go on").into(),
+        ];
+        let request = <crate::operation::Completion as crate::wire::Operation>::prepare(
+            request,
+            &deepseek.describe(),
+        )
+        .expect("the request prepares");
+        let body = json_body(
+            &deepseek
+                .encode(request, Mode::Unary)
+                .expect("encodes")
+                .request,
+        );
+        body.pointer("/messages/1").cloned().unwrap_or_default()
+    };
+    let asked = body(true);
+    assert_eq!(asked["reasoning_content"], "plan", "{asked}");
+    assert_eq!(asked["content"], "done", "{asked}");
+    let plain = body(false);
+    assert!(
+        plain["content"]
+            .as_str()
+            .is_some_and(|text| text.contains("plan")),
+        "{plain}"
     );
 }
 
-/// The terminal record is readable back out of the stream's `raw`, which is
-/// the escape hatch for every provider field this wire does not normalize.
+/// A stream's `raw` is the `chat.completion` its chunks add up to, read by
+/// the paths a unary body is read by: the escape hatch for every provider
+/// field this wire does not normalize.
 #[tokio::test]
-async fn the_streamed_terminal_reads_back_as_the_provider_record() {
-    use crate::providers::openai::wire::{ChatUsage, StreamingCompletionResponse};
-
-    let mut response = Bound::new(
+async fn the_streamed_raw_reads_back_as_the_unary_document() {
+    let mut response = crate::driver::Model::new(
         wire(),
         MockStreamingClient {
             sse_bytes: Bytes::from(recorded(
@@ -373,337 +489,37 @@ async fn the_streamed_terminal_reads_back_as_the_provider_record() {
         },
     )
     .stream(prompt("Reply with exactly the single word: pong"))
-    .await
     .expect("the stream opens");
     while response.next().await.is_some() {}
-    let folded = response.finish();
+    let folded = response.finish().await.expect("the stream ends");
 
-    // `serde_json::from_value`, not `Type::deserialize` — the latter needs
-    // `serde::Deserialize` in scope at the call site, which is the trait-bound
-    // error this spelling avoids.
-    let record: StreamingCompletionResponse<ChatUsage> =
-        serde_json::from_value(folded.raw.clone()).expect("the terminal record reads back");
+    let document = &folded.raw;
+    let usage = &document["usage"];
+    assert_eq!(usage["prompt_tokens"], 15);
+    assert_eq!(usage["completion_tokens"], 1);
+    assert_eq!(usage["total_tokens"], 16);
+    assert_eq!(document["model"], "gpt-4.1-nano-2025-04-14");
+    assert_eq!(document["id"], recorded_chunk_field("id"));
+    assert_eq!(document["object"], "chat.completion");
+    assert_eq!(document["choices"][0]["finish_reason"], "stop");
+    assert_eq!(document["choices"][0]["message"]["content"], "pong");
+    assert_eq!(document["choices"][0]["message"]["role"], "assistant");
 
-    let usage = record.usage.expect("the stream carried usage");
-    assert_eq!(usage.openai.prompt_tokens, 15);
-    assert_eq!(usage.openai.completion_tokens, Some(1));
-    assert_eq!(usage.openai.total_tokens, 16);
-    assert_eq!(record.model.as_deref(), Some("gpt-4.1-nano-2025-04-14"));
-    assert_eq!(record.response_id.as_deref(), Some("chatcmpl-REDACTED_1"));
-
-    // The provider-native fields the wire does not normalize reach the caller
-    // here, which is why `raw` is the record and not the parse.
-    let additional = record
-        .additional_params
-        .expect("the chunks carried provider metadata");
-    let additional = serde_json::Value::from(additional);
-    assert_eq!(additional["service_tier"], "default");
-    assert_eq!(additional["system_fingerprint"], "fp_REDACTED_1");
+    // The provider-native fields the wire does not normalize sit where the
+    // unary body has them.
+    assert_eq!(document["service_tier"], "default");
+    assert_eq!(
+        document["system_fingerprint"],
+        recorded_chunk_field("system_fingerprint")
+    );
+    assert!(
+        document.get("obfuscation").is_none(),
+        "stream padding is not part of the document: {document}"
+    );
 
     // And the normalized view agrees with it.
     assert_eq!(folded.usage.input_tokens, Some(15));
-    assert_eq!(folded.model.as_deref(), Some("gpt-4.1-nano-2025-04-14"));
-}
-
-/// A unary reply carrying `reasoning_content` beside text must fold through
-/// the same reasoning lifecycle the streamed path uses.
-///
-/// Open-coding the emission in the unary branch minted a reasoning part and
-/// then interleaved text into it with no derived boundary end, which trips
-/// the sequence law in debug builds — and it was the unary/stream drift this
-/// model exists to delete, reappearing in the one branch that bypassed the
-/// shared emitter.
-#[tokio::test]
-async fn a_unary_reply_with_reasoning_folds_like_the_stream_of_the_same_turn() {
-    use crate::message::Reasoning;
-
-    const UNARY: &str = concat!(
-        r#"{"object":"chat.completion","id":"chatcmpl-1","model":"m","#,
-        r#""choices":[{"index":0,"finish_reason":"stop","message":{"role":"assistant","#,
-        r#""reasoning_content":"let me think","content":"the answer"}}],"#,
-        r#""usage":{"prompt_tokens":5,"completion_tokens":7,"total_tokens":12}}"#,
-    );
-    const STREAM: &str = concat!(
-        "data: {\"object\":\"chat.completion.chunk\",\"id\":\"chatcmpl-1\",\"model\":\"m\",",
-        "\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\"let me think\"}}]}\n\n",
-        "data: {\"object\":\"chat.completion.chunk\",\"id\":\"chatcmpl-1\",\"model\":\"m\",",
-        "\"choices\":[{\"index\":0,\"delta\":{\"content\":\"the answer\"}}]}\n\n",
-        "data: {\"object\":\"chat.completion.chunk\",\"id\":\"chatcmpl-1\",\"model\":\"m\",",
-        "\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],",
-        "\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":7,\"total_tokens\":12}}\n\n",
-        "data: [DONE]\n\n",
-    );
-
-    let buffered = Bound::new(wire(), RecordingHttpClient::new(UNARY))
-        .completion(prompt("think then answer"))
-        .await
-        .expect("the unary reply decodes without tripping the sequence law");
-
-    let streaming = Bound::new(
-        wire(),
-        MockStreamingClient {
-            sse_bytes: Bytes::from_static(STREAM.as_bytes()),
-        },
-    );
-    let mut response = streaming
-        .stream(prompt("think then answer"))
-        .await
-        .expect("the stream opens");
-    while response.next().await.is_some() {}
-    let streamed = response.finish();
-
-    // Reasoning first, then the visible text — one emitter, one order.
-    let reasoning_text = |choice: &[AssistantContent]| match choice.first() {
-        Some(AssistantContent::Reasoning(Reasoning { content, .. })) => {
-            Some(format!("{content:?}"))
-        }
-        _ => None,
-    };
-    assert!(
-        reasoning_text(&buffered.choice).is_some(),
-        "the unary reply's reasoning is a reasoning block: {:?}",
-        buffered.choice
-    );
-    assert_eq!(
-        reasoning_text(&buffered.choice),
-        reasoning_text(&streamed.choice),
-        "the two shapes of one turn produce the same reasoning block"
-    );
-    assert_eq!(buffered.choice, streamed.choice);
-    assert_eq!(buffered.usage, streamed.usage);
-    assert_eq!(buffered.finish_reason(), streamed.finish_reason());
-    assert_eq!(
-        buffered.choice.last(),
-        Some(&AssistantContent::text("the answer"))
-    );
-}
-
-/// The terminal record accumulates every top-level chunk field, `object`
-/// included — a named field would have consumed the key and dropped it while
-/// its neighbours survived.
-#[tokio::test]
-async fn the_streamed_terminal_keeps_every_envelope_field() {
-    use crate::providers::openai::wire::{ChatUsage, StreamingCompletionResponse};
-
-    let mut response = Bound::new(
-        wire(),
-        MockStreamingClient {
-            sse_bytes: Bytes::from(recorded(
-                "then",
-                "raw_stream_capture_matrix/chat_stream_raw_round_trips_typed.yaml",
-            )),
-        },
-    )
-    .stream(prompt("Reply with exactly the single word: pong"))
-    .await
-    .expect("the stream opens");
-    while response.next().await.is_some() {}
-    let folded = response.finish();
-
-    let record: StreamingCompletionResponse<ChatUsage> =
-        serde_json::from_value(folded.raw.clone()).expect("the terminal record reads back");
-    let additional = serde_json::Value::from(
-        record
-            .additional_params
-            .expect("the chunks carried provider metadata"),
-    );
-    assert_eq!(
-        additional["object"], "chat.completion.chunk",
-        "`object` is on every chunk of the fixture and must survive: {additional}"
-    );
-    assert_eq!(additional["service_tier"], "default");
-    assert_eq!(additional["system_fingerprint"], "fp_REDACTED_1");
-}
-
-/// A dialect that streams a full `message` on every chunk beside its `delta`
-/// is still streaming, and its terminator's envelope fields are the ones the
-/// terminal record carries.
-///
-/// Perplexity does exactly that and tags its terminator
-/// `chat.completion.done`. Keying the whole-vs-chunk decision on "a choice
-/// carries a message" read frame one as the whole reply, emitted a terminal
-/// there, and the driver stopped — so the turn was the first frame and the
-/// accumulated envelope was frame one's.
-#[tokio::test]
-async fn a_dialect_that_streams_a_message_per_chunk_is_still_streaming() {
-    use crate::providers::openai::wire::{ChatUsage, PERPLEXITY, StreamingCompletionResponse};
-
-    const BODY: &str = concat!(
-        "data: {\"object\":\"chat.completion.chunk\",\"id\":\"78385058-uuid\",\"model\":\"sonar\",",
-        "\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"\"},",
-        "\"message\":{\"role\":\"assistant\",\"content\":\"\"}}]}\n\n",
-        "data: {\"object\":\"chat.completion.chunk\",\"id\":\"78385058-uuid\",\"model\":\"sonar\",",
-        "\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"pong\"},",
-        "\"message\":{\"role\":\"assistant\",\"content\":\"pong\"}}]}\n\n",
-        "data: {\"object\":\"chat.completion.done\",\"id\":\"78385058-uuid\",\"model\":\"sonar\",",
-        "\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"\"},",
-        "\"finish_reason\":\"stop\",\"message\":{\"role\":\"assistant\",\"content\":\"pong\"}}],",
-        "\"usage\":{\"prompt_tokens\":7,\"completion_tokens\":1,\"total_tokens\":8}}\n\n",
-    );
-
-    let wire = OpenAI::new("pplx").with_dialect(&PERPLEXITY).chat("sonar");
-    let mut response = Bound::new(
-        wire,
-        MockStreamingClient {
-            sse_bytes: Bytes::from_static(BODY.as_bytes()),
-        },
-    )
-    .stream(prompt("ping"))
-    .await
-    .expect("the stream opens");
-    while response.next().await.is_some() {}
-    let folded = response.finish();
-
-    // The whole turn, not just its first frame.
-    assert_eq!(folded.choice.first(), Some(&AssistantContent::text("pong")));
-    assert_eq!(folded.usage.input_tokens, Some(7));
-    assert_eq!(folded.usage.total_tokens, Some(8));
-    assert_eq!(folded.finish_reason(), Some(FinishReason::Stop));
-    // The body's own id, never the transport request id.
-    assert_eq!(folded.response_id.as_deref(), Some("78385058-uuid"));
-
-    // The terminator's envelope is the one the record carries: last frame
-    // wins, which is what `AdditionalParams::merge` does for a scalar.
-    let record: StreamingCompletionResponse<ChatUsage> =
-        serde_json::from_value(folded.raw.clone()).expect("the terminal record reads back");
-    let additional = serde_json::Value::from(
-        record
-            .additional_params
-            .expect("the chunks carried provider metadata"),
-    );
-    assert_eq!(
-        additional["object"], "chat.completion.done",
-        "the terminator's value, not the first chunk's: {additional}"
-    );
-    assert_eq!(record.response_id.as_deref(), Some("78385058-uuid"));
-}
-
-/// A tool call the output-token budget cut mid-arguments must not take the
-/// turn down with it — the defect [#2359](https://github.com/0xPlaygrounds/rig/pull/2359)
-/// fixed, and the one the `Chat` wire's strict argument decode reintroduced.
-///
-/// The body carries two calls under `finish_reason: "length"`: one complete,
-/// one whose argument string stops inside a JSON string. Only the cut one is
-/// unusable, and everything else — the good call, the text beside it, the
-/// usage the caller is billed for, the id, the finish reason — is output the
-/// provider genuinely delivered.
-#[tokio::test]
-async fn a_tool_call_cut_mid_arguments_drops_only_itself() {
-    const BODY: &str = concat!(
-        r#"{"id":"chatcmpl-cut","object":"chat.completion","model":"gpt-4.1-nano","#,
-        r#""choices":[{"index":0,"finish_reason":"length","message":{"role":"assistant","#,
-        r#""content":"noting both","tool_calls":["#,
-        r#"{"id":"call_whole","type":"function","function":{"name":"record","#,
-        r#""arguments":"{\"note\": \"first\"}"}},"#,
-        r#"{"id":"call_cut","type":"function","function":{"name":"record","#,
-        r#""arguments":"{\"note\": \"The"}}]}}],"#,
-        r#""usage":{"prompt_tokens":165,"completion_tokens":20,"total_tokens":185}}"#,
-    );
-
-    let folded = Bound::new(wire(), RecordingHttpClient::new(BODY))
-        .completion(prompt("Record two notes."))
-        .await
-        .expect(
-            "a body cut mid-arguments must still decode: erroring discards the turn's \
-             usage, id, finish reason and every other part over one unusable fragment",
-        );
-
-    let calls: Vec<_> = folded
-        .choice
-        .iter()
-        .filter_map(|item| match item {
-            AssistantContent::ToolCall(call) => Some(call),
-            _ => None,
-        })
-        .collect();
-    let [call] = calls.as_slice() else {
-        panic!(
-            "exactly the complete call survives — a half-parsed one must never reach \
-             the caller: {:?}",
-            folded.choice
-        );
-    };
-    assert_eq!(call.id.explicit(), Some("call_whole"));
-    assert_eq!(call.function.name, "record");
-    assert_eq!(
-        call.function.arguments,
-        serde_json::json!({"note": "first"})
-    );
-
-    // The rest of the turn, which erroring would have thrown away.
-    assert!(
-        folded
-            .choice
-            .iter()
-            .any(|item| item == &AssistantContent::text("noting both")),
-        "the text delivered beside the calls survives: {:?}",
-        folded.choice
-    );
-    assert_eq!(folded.usage.output_tokens, Some(20));
-    assert_eq!(folded.usage.input_tokens, Some(165));
-    assert_eq!(folded.finish_reason(), Some(FinishReason::Length));
-}
-
-/// The tolerance is scoped to the budget, not to bad JSON in general.
-///
-/// A `tool_calls` finish reason is the provider claiming it finished the
-/// call; malformed arguments there are its own defect, and silently rewriting
-/// the turn as though the call had never been returned would hide it.
-#[tokio::test]
-async fn malformed_arguments_on_a_completed_tool_turn_stay_a_decode_error() {
-    const BODY: &str = concat!(
-        r#"{"id":"chatcmpl-bad","object":"chat.completion","model":"gpt-4.1-nano","#,
-        r#""choices":[{"index":0,"finish_reason":"tool_calls","message":{"role":"assistant","#,
-        r#""content":null,"tool_calls":["#,
-        r#"{"id":"call_bad","type":"function","function":{"name":"record","#,
-        r#""arguments":"{\"note\": \"The"}}]}}],"#,
-        r#""usage":{"prompt_tokens":165,"completion_tokens":20,"total_tokens":185}}"#,
-    );
-
-    let error = Bound::new(wire(), RecordingHttpClient::new(BODY))
-        .completion(prompt("Record a note."))
-        .await
-        .expect_err("a completed tool-call turn with malformed arguments is a defect");
-    assert!(
-        matches!(error, CompletionError::JsonError(_)),
-        "the malformed payload must stay loud rather than be dropped: {error:?}"
-    );
-}
-
-/// Arguments that parse are never dropped, whatever they contain.
-///
-/// Under the same `length` finish reason a call whose arguments are valid
-/// JSON is usable tool input; whether its *content* matches the tool's schema
-/// is the tool's business, not the decoder's. Dropping it would delete
-/// provider output on a guess.
-#[tokio::test]
-async fn valid_arguments_survive_a_length_truncated_turn() {
-    const BODY: &str = concat!(
-        r#"{"id":"chatcmpl-odd","object":"chat.completion","model":"gpt-4.1-nano","#,
-        r#""choices":[{"index":0,"finish_reason":"length","message":{"role":"assistant","#,
-        r#""content":null,"tool_calls":["#,
-        r#"{"id":"call_odd","type":"function","function":{"name":"record","#,
-        r#""arguments":"{\"unexpected\": 1}"}}]}}],"#,
-        r#""usage":{"prompt_tokens":165,"completion_tokens":20,"total_tokens":185}}"#,
-    );
-
-    let folded = Bound::new(wire(), RecordingHttpClient::new(BODY))
-        .completion(prompt("Record a note."))
-        .await
-        .expect("valid arguments decode");
-
-    let Some(AssistantContent::ToolCall(call)) = folded.choice.first() else {
-        panic!(
-            "a parseable call is kept even under a truncated turn: {:?}",
-            folded.choice
-        );
-    };
-    assert_eq!(call.id.explicit(), Some("call_odd"));
-    assert_eq!(
-        call.function.arguments,
-        serde_json::json!({"unexpected": 1})
-    );
-    assert_eq!(folded.finish_reason(), Some(FinishReason::Length));
+    assert_eq!(folded.model(), Some("gpt-4.1-nano-2025-04-14"));
 }
 
 /// Mira's gateway can answer a chat request with a bare JSON string instead
@@ -714,231 +530,453 @@ async fn valid_arguments_survive_a_length_truncated_turn() {
 async fn a_gateway_may_answer_with_a_bare_string() {
     use crate::providers::openai::wire::MIRA;
 
-    let response = Bound::new(
-        OpenAI::new("k").with_dialect(&MIRA).chat("gpt-4o"),
+    let response = crate::driver::Model::new(
+        OpenAIConfig::new("k").with_dialect(&MIRA).chat("gpt-4o"),
         RecordingHttpClient::new(r#""the whole answer""#),
     )
-    .completion(prompt("ask"))
+    .call(prompt("ask"))
     .await
     .expect("a bare string is the whole reply");
 
     assert_eq!(
-        response.choice.first(),
-        Some(&AssistantContent::text("the whole answer"))
+        response.choice.first().map(AssistantContent::canonical),
+        Some(AssistantContent::text("the whole answer"))
     );
-    // No metadata and no terminal reason: that is what the gateway sent.
-    assert_eq!(response.finish_reason(), None);
+    // No metadata and no terminal reason: the whole answer is a stop, as
+    // pi ends a reply on a wire that states none.
+    assert_eq!(response.finish_reason(), Some(FinishReason::Stop));
     assert_eq!(response.usage, crate::completion::Usage::default());
-    assert_eq!(response.response_id, None);
+    assert_eq!(response.response_id(), None);
 
     // Only the dialects measured to do it are tolerant; elsewhere a bare
     // string is still an unmodeled frame, which the classifier warn-skips
-    // — so the reply delivered nothing and reported nothing, and that is
-    // the shared empty-response rejection rather than a silent, empty
-    // success.
-    let strict = Bound::new(wire(), RecordingHttpClient::new(r#""the whole answer""#))
-        .completion(prompt("ask"))
-        .await;
-    let Err(CompletionError::ResponseError(message)) = &strict else {
-        panic!("openai does not answer with a bare string: {strict:?}");
-    };
-    assert_eq!(message, crate::message::EMPTY_RESPONSE_ERROR);
+    // — so the provider never ended the reply, and that is truncation
+    // rather than a silent, empty success.
+    let strict =
+        crate::driver::Model::new(wire(), RecordingHttpClient::new(r#""the whole answer""#))
+            .call(prompt("ask"))
+            .await;
+    assert!(
+        matches!(strict, Err(ProviderError::Truncated)),
+        "openai does not answer with a bare string: {strict:?}"
+    );
 }
 
-/// One unary `chat.completion` body whose single choice is empty, ending
-/// for `finish_reason` (absent when `None`).
-fn empty_turn_body(finish_reason: Option<&str>) -> String {
-    let reason = finish_reason.map_or(serde_json::Value::Null, |reason| {
-        serde_json::Value::String(reason.to_owned())
-    });
-    serde_json::json!({
-        "id": "chatcmpl-empty",
-        "object": "chat.completion",
-        "created": 0,
+/// The last value of a top-level `field` across the recorded text stream's
+/// chunks, so an assertion follows the fixture's own bytes.
+fn recorded_chunk_field(field: &str) -> String {
+    recorded(
+        "then",
+        "raw_stream_capture_matrix/chat_stream_raw_round_trips_typed.yaml",
+    )
+    .lines()
+    .filter_map(|line| line.trim().strip_prefix("data:"))
+    .filter_map(|data| serde_json::from_str::<serde_json::Value>(data.trim()).ok())
+    .filter_map(|chunk| {
+        chunk
+            .get(field)
+            .and_then(|value| value.as_str().map(str::to_owned))
+    })
+    .next_back()
+    .expect("the recorded chunks carry the field")
+}
+
+/// One frame of a chunked reply, as the decoder reads it.
+fn frame(chunk: &serde_json::Value) -> crate::wire::WireFrame {
+    crate::wire::WireFrame::Text(chunk.to_string())
+}
+
+/// A `chat.completion.chunk` whose primary choice carries `delta`.
+fn delta_chunk(delta: serde_json::Value, finish: Option<&str>) -> crate::wire::WireFrame {
+    frame(&serde_json::json!({
+        "id": "chatcmpl-items",
         "model": "gpt-4.1-nano",
+        "object": "chat.completion.chunk",
+        "choices": [{"index": 0, "delta": delta, "finish_reason": finish}],
+    }))
+}
+
+/// The whole reply below, and the same turn streamed.
+fn invented_turn() -> (Vec<crate::wire::WireFrame>, Vec<crate::wire::WireFrame>) {
+    let call = serde_json::json!({
+        "id": "call_probe",
+        "type": "function",
+        "function": {"name": "add", "arguments": "{\"x\":1}"},
+        "x_call_probe": {"kept": true},
+    });
+    let whole = serde_json::json!({
+        "id": "chatcmpl-items",
+        "model": "gpt-4.1-nano",
+        "object": "chat.completion",
         "choices": [{
             "index": 0,
-            "finish_reason": reason,
-            "message": {"role": "assistant", "content": ""},
+            "finish_reason": "tool_calls",
+            "message": {
+                "role": "assistant",
+                "content": "adding",
+                "x_message_probe": [{"kind": "invented"}],
+                "tool_calls": [call],
+            },
         }],
-        "usage": {"prompt_tokens": 900, "completion_tokens": 32, "total_tokens": 932},
-    })
-    .to_string()
+    });
+    let streamed = vec![
+        delta_chunk(
+            serde_json::json!({"role": "assistant", "content": "add"}),
+            None,
+        ),
+        delta_chunk(
+            serde_json::json!({"content": "ing", "x_message_probe": [{"kind": "invented"}]}),
+            None,
+        ),
+        delta_chunk(
+            serde_json::json!({"tool_calls": [{
+                "index": 0,
+                "id": "call_probe",
+                "type": "function",
+                "function": {"name": "add", "arguments": "{\"x\""},
+                "x_call_probe": {"kept": true},
+            }]}),
+            None,
+        ),
+        delta_chunk(
+            serde_json::json!({"tool_calls": [{"index": 0, "function": {"arguments": ":1}"}}]}),
+            None,
+        ),
+        delta_chunk(serde_json::json!({}), Some("tool_calls")),
+        crate::wire::WireFrame::Text("[DONE]".to_owned()),
+    ];
+    (vec![frame(&whole)], streamed)
 }
 
-/// An empty turn the provider CUT SHORT is kept, because the reason is the
-/// only diagnostic the caller has and the usage is what it is billed for.
-///
-/// The accepting half of [`FinishReason::truncated_output`], which is the
-/// one statement of the rule; this wire routes through it rather than
-/// restating which reasons are legally empty. Live traffic cannot enumerate
-/// the vocabulary — no prompt reliably produces an empty `content_filter`
-/// turn — so the boundary is asserted here and the recorded matrices
-/// (`crates/rig-cassette/tests/providers/openai/cassette/truncated_turn_matrix.rs`) confirm the
-/// `length` half against real bytes.
-#[tokio::test]
-async fn an_empty_turn_the_provider_cut_short_keeps_its_reason_and_usage() {
-    for (reason, expected) in [
-        ("length", FinishReason::Length),
-        ("content_filter", FinishReason::ContentFilter),
-    ] {
-        let response = Bound::new(
-            wire(),
-            RecordingHttpClient::new(empty_turn_body(Some(reason))),
-        )
-        .completion(prompt("ask"))
-        .await
-        .unwrap_or_else(|error| panic!("`{reason}` is a cut-short turn, not a defect: {error}"));
-
-        assert!(
-            response.choice.is_empty(),
-            "{reason}: {:?}",
-            response.choice
-        );
-        assert_eq!(response.finish_reason(), Some(expected), "{reason}");
-        // Raising would have thrown these away, which is the whole reason
-        // the cut-short turn is kept.
-        assert_eq!(response.usage.input_tokens, Some(900), "{reason}");
-        assert_eq!(response.usage.output_tokens, Some(32), "{reason}");
-        assert_eq!(response.usage.total_tokens, Some(932), "{reason}");
-    }
-}
-
-/// An empty turn that RAN TO COMPLETION is a provider defect, and so is one
-/// that named no terminal at all.
-///
-/// The rejecting half of the same predicate. `stop` is the case worth
-/// naming twice: a provider that says the model finished and hands back
-/// nothing has misbehaved, so `stop` must stay out of the legal set even
-/// though a stop sequence can consume a whole answer — which is exactly
-/// what `crates/rig-cassette/tests/providers/llamacpp/cassette/content_matrix.rs`'s
-/// stop-sequence cell records.
-#[tokio::test]
-async fn an_empty_turn_that_ran_to_completion_is_a_provider_defect() {
-    for reason in [
-        Some("stop"),
-        Some("tool_calls"),
-        Some("bespoke_reason"),
-        None,
-    ] {
-        let folded = Bound::new(wire(), RecordingHttpClient::new(empty_turn_body(reason)))
-            .completion(prompt("ask"))
-            .await;
-
-        let Err(CompletionError::ResponseError(message)) = &folded else {
-            panic!("`{reason:?}` does not license an empty turn: {folded:?}");
-        };
-        assert_eq!(message, crate::message::EMPTY_RESPONSE_ERROR, "{reason:?}");
-    }
-}
-
-/// Mistral validates message content as a tagged union of its own chunks, so
-/// an OpenAI content part has to be rebuilt rather than forwarded — and a
-/// part it has no chunk for must fail loudly rather than be dropped.
-///
-/// The bug this guards is rig#2290: a text-only flattening kept only parts
-/// with a `text`/`refusal` key, so an attached image, document or audio clip
-/// vanished from the request and the caller got an ordinary completion
-/// answering a prompt it never sent.
+/// A message field rig has never seen stays in the turn's message, for
+/// display, but never goes back: the message is rebuilt from its blocks. A
+/// field rig has never seen on a tool call is the call's own item, and goes
+/// back to the model that sent it.
 #[test]
-fn the_mistral_body_rebuilds_content_as_its_own_chunks() {
-    use crate::message::{Document, DocumentMediaType, Image, Message, UserContent};
-    use crate::providers::openai::wire::MISTRAL;
+fn an_invented_call_field_replays_and_an_invented_message_field_does_not() {
+    use crate::message::{AssistantMessage, Message};
+    use crate::wire::Mode;
 
-    let encode = |content: Vec<UserContent>| {
-        let mut request = prompt("look at this");
-        request.chat_history = vec![Message::User { content }];
-        OpenAI::new("k")
-            .with_dialect(&MISTRAL)
-            .chat("mistral-small-latest")
-            .encode(request, Mode::Unary)
-            .map(|encoded| {
-                let [http_request] = encoded.requests.as_slice() else {
-                    panic!("one request")
-                };
-                let Body::Bytes(bytes) = http_request.body() else {
-                    panic!("bytes")
-                };
-                serde_json::from_slice::<serde_json::Value>(bytes).expect("JSON")
-            })
+    let wire = wire();
+    let (whole, streamed) = invented_turn();
+    crate::test_utils::history::assert_restated_agrees(&wire, whole.clone(), streamed.clone());
+    for (mode, frames) in [(Mode::Unary, whole), (Mode::Streaming, streamed)] {
+        let response =
+            crate::test_utils::history::decode(&wire, mode, frames).expect("the reply decodes");
+        let turn = AssistantMessage {
+            content: response.choice.clone(),
+            ..response.head()
+        };
+        let call = turn
+            .content
+            .iter()
+            .find_map(AssistantContent::native_item)
+            .filter(|item| item.get("x_call_probe").is_some())
+            .expect("the call keeps its item");
+        assert_eq!(call["x_call_probe"]["kept"], true, "{mode:?}");
+
+        let mut request = prompt("and then?");
+        request.chat_history = crate::completion::history::adapt(
+            &[
+                Message::user("add one"),
+                Message::Assistant(turn.clone()),
+                Message::tool_result(
+                    crate::message::CallId::from_wire("call_probe"),
+                    crate::message::ToolName::new("add").expect("tool name"),
+                    "1",
+                ),
+            ],
+            &wire,
+        )
+        .into_iter()
+        .map(Into::into)
+        .collect();
+        let body = json_body(&wire.encode(request, Mode::Unary).expect("encodes").request);
+        let replayed = &body["messages"][1];
+        assert!(
+            replayed.get("x_message_probe").is_none(),
+            "{mode:?}: {replayed}"
+        );
+        assert_eq!(
+            replayed["tool_calls"][0]["x_call_probe"]["kept"], true,
+            "{mode:?}"
+        );
+        assert_eq!(replayed["content"], "adding", "{mode:?}");
+    }
+}
+
+/// OpenRouter streams its reasoning details as fragments; the reasoning
+/// block keeps each detail's id, format and kind as the provider sent them,
+/// the encrypted entry whole beside the merged summary.
+#[test]
+fn a_streamed_reasoning_detail_keeps_its_id_format_and_kind() {
+    use crate::wire::Mode;
+
+    let summary = |text: &str| {
+        serde_json::json!({"reasoning": text, "reasoning_details": [{
+            "type": "reasoning.summary", "format": "openai-responses-v1", "index": 0, "summary": text,
+        }]})
     };
+    let frames = vec![
+        delta_chunk(summary("Weighing "), None),
+        delta_chunk(summary("it up"), None),
+        delta_chunk(
+            serde_json::json!({"reasoning_details": [{
+                "type": "reasoning.encrypted", "id": "rs_1", "format": "openai-responses-v1",
+                "index": 0, "data": "gAAA",
+            }]}),
+            None,
+        ),
+        delta_chunk(serde_json::json!({"content": "done"}), Some("stop")),
+        crate::wire::WireFrame::Text("[DONE]".to_owned()),
+    ];
+    let wire = OpenAIConfig::new("k")
+        .with_dialect(&super::super::OPENROUTER)
+        .chat("m");
+    let response = crate::test_utils::history::decode(&wire, Mode::Streaming, frames)
+        .expect("the reply decodes");
+    let Some(AssistantContent::Reasoning(reasoning)) = response.choice.first() else {
+        panic!("the reasoning leads: {:?}", response.choice);
+    };
+    assert_eq!(reasoning.text, "Weighing it up");
+    let item = &reasoning
+        .native
+        .as_ref()
+        .expect("the block keeps its fields")
+        .item;
+    assert_eq!(
+        item["reasoning_details"],
+        serde_json::json!([
+            {"type": "reasoning.summary", "format": "openai-responses-v1", "index": 0, "summary": "Weighing it up"},
+            {"type": "reasoning.encrypted", "id": "rs_1", "format": "openai-responses-v1", "index": 0, "data": "gAAA"},
+        ])
+    );
+    assert_eq!(item["reasoning"], "Weighing it up");
+}
 
-    // Text-only content keeps the plain-string form it always took.
-    let body = encode(vec![UserContent::text("just words")]).expect("encodes");
-    assert_eq!(body["messages"][0]["content"], "just words");
+/// pi's id rule for this wire (`openai-completions.js`, `normalizeToolCallId`).
+/// The hashes are pi's `shortHash`. Mistral takes the same ids (checked live
+/// on eight models), where pi derives nine alphanumerics.
+#[test]
+fn foreign_call_ids_are_normalized_the_way_pi_does() {
+    use crate::completion::ReplayTarget;
 
-    // An image rides as Mistral's own `image_url` chunk, in an array \u2014 not
-    // flattened away.
-    let body = encode(vec![
-        UserContent::text("describe"),
-        UserContent::Image(Image {
-            data: crate::message::DocumentSourceKind::Url("https://x.invalid/a.png".to_owned()),
-            media_type: None,
-            detail: None,
-            additional_params: None,
-        }),
-    ])
-    .expect("encodes");
-    let parts = body["messages"][0]["content"]
-        .as_array()
-        .unwrap_or_else(|| panic!("content is a chunk array: {}", body["messages"][0]));
-    assert_eq!(parts.len(), 2, "the image survives: {parts:?}");
-    assert_eq!(parts[0]["type"], "text");
-    assert_eq!(parts[1]["type"], "image_url");
+    let openai = wire();
+    assert_eq!(
+        openai.normalize_tool_call_id("call_abc123", openai.model(), None),
+        "call_abc123"
+    );
+    // OpenAI's own ids are cut to 40; nothing else about them changes.
+    assert_eq!(
+        openai.normalize_tool_call_id(
+            "toolu_01ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghij",
+            openai.model(),
+            None
+        ),
+        "toolu_01ABCDEFGHIJKLMNOPQRSTUVWXYZabcdef"
+    );
+    assert_eq!(
+        openai.normalize_tool_call_id("a.b:c", openai.model(), None),
+        "a.b:c"
+    );
+    // A Responses `call|item` id joins its sanitized halves, hashed past 40.
+    assert_eq!(
+        openai.normalize_tool_call_id("call_1|fc+ab/c", openai.model(), None),
+        "call_1_fc_ab_c"
+    );
+    assert_eq!(
+        openai.normalize_tool_call_id(
+            "call_abcdefghijklmnopqrstuvwxyz0123|fc_0123456789abcdefghijklmnopqrstuvwxyz",
+            openai.model(),
+            None
+        ),
+        "call_abcdefghijklmnopqrstuvwxyz_7gi8bx11"
+    );
+    // Any other dialect keeps the id.
+    let deepseek = OpenAIConfig::new("k")
+        .with_dialect(&super::super::DEEPSEEK)
+        .chat("m");
+    assert_eq!(
+        deepseek.normalize_tool_call_id(
+            "toolu_01ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghij",
+            deepseek.model(),
+            None
+        ),
+        "toolu_01ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghij"
+    );
 
-    // Content Mistral has no chunk for fails here rather than being removed.
-    let refused = encode(vec![
-        UserContent::text("watch"),
-        UserContent::Video(crate::message::Video {
-            data: crate::message::DocumentSourceKind::Url("https://x.invalid/a.mp4".to_owned()),
-            media_type: None,
-            additional_params: None,
-        }),
+    let mistral = OpenAIConfig::new("k")
+        .with_dialect(&super::super::MISTRAL)
+        .chat("m");
+    assert_eq!(
+        mistral.normalize_tool_call_id("abc123XYZ", mistral.model(), None),
+        "abc123XYZ"
+    );
+    assert_eq!(
+        mistral.normalize_tool_call_id("call_abc123", mistral.model(), None),
+        "call_abc123"
+    );
+}
+
+/// A streamed function call that never gets a name is dropped, since
+/// nothing can answer it; a custom call is a call whose arguments are its
+/// `{"input"}`, kept with its item; a call of a kind rig cannot answer is
+/// kept but never sent back; and content that is not text fails the reply.
+#[test]
+fn malformed_and_unknown_calls_are_never_dropped_silently() {
+    use crate::wire::Mode;
+
+    let wire = wire();
+    let nameless = vec![delta_chunk(
+        serde_json::json!({"tool_calls": [{"index": 0, "id": "call_1", "type": "function",
+                "function": {"arguments": "{}"}}]}),
+        Some("tool_calls"),
+    )];
+    let response = crate::test_utils::history::decode(&wire, Mode::Streaming, nameless)
+        .expect("a nameless call does not fail the reply");
+    assert!(response.choice.is_empty(), "{:?}", response.choice);
+
+    let custom = vec![delta_chunk(
+        serde_json::json!({"tool_calls": [{"index": 0, "id": "call_1", "type": "custom",
+                "custom": {"name": "grep", "input": "x"}}]}),
+        Some("tool_calls"),
+    )];
+    let response = crate::test_utils::history::decode(&wire, Mode::Streaming, custom)
+        .expect("a custom call decodes");
+    let [AssistantContent::ToolCall(call)] = response.choice.as_slice() else {
+        panic!("a custom call is a call: {:?}", response.choice);
+    };
+    assert_eq!(call.function.name.as_str(), "grep");
+    assert_eq!(
+        call.function.arguments_value(),
+        serde_json::json!({"input": "x"})
+    );
+    assert_eq!(
+        call.native
+            .as_ref()
+            .map(|native| native.item["type"].clone()),
+        Some(serde_json::json!("custom"))
+    );
+
+    let invented = vec![delta_chunk(
+        serde_json::json!({"tool_calls": [{"index": 0, "id": "call_1", "type": "x_rig_invented",
+                "x_rig_invented": {"name": "grep"}}]}),
+        Some("tool_calls"),
+    )];
+    let response = crate::test_utils::history::decode(&wire, Mode::Streaming, invented)
+        .expect("an unknown call kind decodes");
+    assert!(
+        matches!(response.choice.as_slice(), [AssistantContent::Opaque(opaque)]
+            if !opaque.replay && opaque.item["type"] == "x_rig_invented"),
+        "{:?}",
+        response.choice
+    );
+
+    // Content of no content type is read leniently, as nothing.
+    let numeric = vec![
+        delta_chunk(serde_json::json!({"content": 42}), Some("stop")),
+        crate::wire::WireFrame::Text("[DONE]".to_owned()),
+    ];
+    let response = crate::test_utils::history::decode(&wire, Mode::Streaming, numeric)
+        .expect("a reply with numeric content decodes");
+    assert!(response.choice.is_empty(), "{:?}", response.choice);
+}
+
+/// The assistant message `wire` sends back for `turn`: the second message
+/// of a request that continues it, prepared as the driver prepares it.
+pub(super) fn replayed(wire: &Chat, turn: crate::message::AssistantMessage) -> serde_json::Value {
+    use crate::message::Message;
+    use crate::wire::Operation;
+    let request = CompletionRequest::from(vec![
+        Message::user("q"),
+        Message::Assistant(turn),
+        Message::user("next"),
     ]);
-    let error = refused.expect_err("Mistral carries no video chunk");
-    assert!(
-        error.to_string().contains("Mistral cannot carry"),
-        "the error names the constraint: {error}"
-    );
+    let request = crate::operation::Completion::prepare(request, &wire.describe())
+        .expect("the request prepares");
+    let body = json_body(&wire.encode(request, Mode::Unary).expect("encodes").request);
+    body["messages"][1].clone()
+}
 
-    // A document with inline bytes becomes `document_url`, carrying its name
-    // in Mistral's own optional field.
-    let body = encode(vec![UserContent::Document(Document {
-        data: crate::message::DocumentSourceKind::Base64("ZGF0YQ==".to_owned()),
-        media_type: Some(DocumentMediaType::PDF),
-        additional_params: None,
-    })])
-    .expect("encodes");
-    let parts = body["messages"][0]["content"]
-        .as_array()
-        .unwrap_or_else(|| panic!("content is a chunk array: {}", body["messages"][0]));
-    assert_eq!(parts[0]["type"], "document_url");
-    assert!(
-        parts[0].get("document_url").is_some(),
-        "the payload is under Mistral's own key: {parts:?}"
-    );
+/// A gateway that reports usage on the choice rather than the top level
+/// still has its usage observed: the decoder accepts `choices[0].usage` for
+/// `Finish`, and the driver observes that `Finish` usage, so the
+/// observation sees the same counts.
+#[tokio::test]
+async fn per_choice_usage_is_observed_as_the_decoder_reads_it() {
+    let payload = r#"{"id":"c","model":"m","choices":[{"index":0,"delta":{},"finish_reason":"stop","usage":{"prompt_tokens":3,"completion_tokens":4,"total_tokens":7}}]}"#;
+    let (observed, usage) = crate::driver::tests::observed_usage(
+        wire(),
+        MockStreamingClient {
+            sse_bytes: Bytes::from(format!("data: {payload}\n\ndata: [DONE]\n\n")),
+        },
+        Mode::Streaming,
+    )
+    .await;
+    let counts: Vec<(Option<u64>, Option<u64>)> = observed
+        .iter()
+        .map(|usage| (usage.input_tokens, usage.output_tokens))
+        .collect();
+    assert_eq!(counts, [(Some(3), Some(4))], "per-choice usage is observed");
+    assert_eq!(observed, [crate::wire::AdapterUsage::from(&usage)]);
+}
 
-    // And no other dialect rebuilds content this way.
-    let mut request = prompt("describe");
-    request.chat_history = vec![Message::User {
-        content: vec![UserContent::Image(Image {
-            data: crate::message::DocumentSourceKind::Url("https://x.invalid/a.png".to_owned()),
-            media_type: None,
-            detail: None,
+/// A whole reply must hold a choice, and its choice a message.
+#[test]
+fn a_whole_reply_without_a_choice_or_its_message_fails() {
+    for (choices, says) in [
+        (serde_json::json!([]), "Response contained no choices"),
+        (
+            serde_json::json!([{"index": 0, "finish_reason": "stop"}]),
+            "did not contain a valid message",
+        ),
+    ] {
+        let whole = frame(&serde_json::json!({
+            "id": "chatcmpl-1",
+            "object": "chat.completion",
+            "model": "gpt-4.1-nano",
+            "choices": choices,
+        }));
+        let decoded =
+            crate::test_utils::history::decode(&wire(), crate::wire::Mode::Unary, [whole]);
+        assert!(
+            matches!(&decoded, Err(ProviderError::Response(message)) if message.contains(says)),
+            "{decoded:?}"
+        );
+    }
+}
+
+/// A part Chat Completions cannot carry is refused when it is encoded: a
+/// document file that is not a PDF, or audio a URL names.
+#[test]
+fn a_part_chat_cannot_carry_is_refused() {
+    use crate::message::{Audio, Document};
+    let parts = [
+        UserContent::Document(Document {
+            data: Source::base64("YSxiCjEsMgo=").into(),
+            media_type: Some(DocumentMediaType::CSV),
             additional_params: None,
-        })],
-    }];
-    let openai = wire().encode(request, Mode::Unary).expect("encodes");
-    let [http_request] = openai.requests.as_slice() else {
-        panic!("one request")
+        }),
+        UserContent::Audio(Audio {
+            data: Source::url("https://example.invalid/a.mp3"),
+            media_type: None,
+        }),
+    ];
+    for part in parts {
+        let error = user_part(&part).expect_err("the part is refused");
+        assert!(
+            error.to_string().contains("Chat Completions cannot carry"),
+            "{error}"
+        );
+    }
+}
+
+/// Chat Completions forces one named tool at most.
+#[test]
+fn chat_forces_one_named_tool_at_most() {
+    let names = ["a", "b"].map(|name| crate::message::ToolName::new(name).expect("a name"));
+    let choice = crate::message::ToolChoice::Specific {
+        function_names: names.to_vec(),
     };
-    let Body::Bytes(bytes) = http_request.body() else {
-        panic!("bytes")
-    };
-    let body: serde_json::Value = serde_json::from_slice(bytes).expect("JSON");
-    assert_eq!(body["messages"][0]["content"][0]["type"], "image_url");
-    assert!(
-        body["messages"][0]["content"][0]["image_url"]["url"].is_string(),
-        "OpenAI keeps its own nesting: {body}"
-    );
+    assert!(tool_choice_value(choice).is_err());
 }

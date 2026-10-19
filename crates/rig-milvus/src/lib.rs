@@ -1,22 +1,20 @@
-//! Milvus vector store integration for Rig.
+//! Milvus vector store for Rig.
 //!
-//! This crate provides [`MilvusVectorStore`], a Rig vector store implementation
-//! that talks to Milvus over its HTTP API.
-//!
-//! The root `rig` facade re-exports this crate as `rig::milvus` when the
-//! `milvus` feature is enabled.
+//! [`MilvusVectorStore`] inserts and searches entities through the Milvus v2
+//! HTTP API, narrowed by a [`Filter`] expression. The `rig` facade re-exports
+//! this crate as `rig::milvus` under the `milvus` feature.
 
 mod filter;
 
 pub use filter::{Filter, MilvusValue};
 
 use reqwest::StatusCode;
-// The same mapping this crate used to define for itself; see rig#2426's review.
 use rig_core::{
     Embed,
-    embeddings::{Embedding, EmbeddingModel},
+    embeddings::Embedding,
     vector_store::{
-        InsertDocuments, VectorStoreError, VectorStoreIndex,
+        InsertDocuments, VectorSearchIdResult, VectorSearchResult, VectorStoreError,
+        VectorStoreIndex,
         request::{SearchFilter, VectorSearchRequest},
     },
     wasm_compat::WasmCompatSend,
@@ -24,14 +22,12 @@ use rig_core::{
 use rig_reqwest::from_reqwest;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
-/// Represents a vector store implementation using Milvus - <https://milvus.io/> as the backend.
+/// Vector store backed by a [Milvus](https://milvus.io/) collection.
 ///
-/// The store is generic over its embedding model `M`, which is fixed for the
-/// store's lifetime: an index populated under one model is only meaningful under
-/// that same model.
-pub struct MilvusVectorStore<M> {
-    /// Model used to generate embeddings for the vector store
-    model: M,
+/// Queries are embedded with the same model that populated the collection,
+/// so results are meaningless under another model.
+pub struct MilvusVectorStore {
+    model: rig_core::DynModel<rig_core::operation::Embedding>,
     base_url: String,
     client: reqwest::Client,
     database_name: String,
@@ -39,6 +35,8 @@ pub struct MilvusVectorStore<M> {
     token: Option<String>,
 }
 
+/// One row written by [`InsertDocuments`], holding the document serialized as a
+/// JSON string alongside its embedding and source text.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct CreateRecord {
     document: String,
@@ -91,17 +89,18 @@ struct SearchResultDataOnlyId {
     distance: f64,
 }
 
-impl<M: EmbeddingModel> MilvusVectorStore<M> {
-    /// Creates a new instance of `MilvusVectorStore`.
-    ///
-    /// # Arguments
-    /// * `model` - Embedding model instance
-    /// * `base_url` - The URL of where your Milvus instance is located. Alternatively if you're using the Milvus offering provided by Zilliz, your cluster endpoint.
-    /// * `database_name` - The name of your database
-    /// * `collection_name` - The name of your collection
-    pub fn new(model: M, base_url: String, database_name: String, collection_name: String) -> Self {
+impl MilvusVectorStore {
+    /// Creates a store over a collection reached at `base_url`, which is the
+    /// Milvus instance or Zilliz cluster endpoint. Requests are unauthenticated
+    /// until [`MilvusVectorStore::auth`] supplies credentials.
+    pub fn new(
+        model: impl Into<rig_core::DynModel<rig_core::operation::Embedding>>,
+        base_url: String,
+        database_name: String,
+        collection_name: String,
+    ) -> Self {
         Self {
-            model,
+            model: model.into(),
             base_url,
             client: reqwest::Client::new(),
             database_name,
@@ -110,7 +109,8 @@ impl<M: EmbeddingModel> MilvusVectorStore<M> {
         }
     }
 
-    /// Forms the auth token for Milvus from your username and password. Required if using a Milvus instance that requires authentication.
+    /// Sets the credentials sent as a `Bearer username:password` authorization
+    /// header on every request.
     pub fn auth(mut self, username: &str, password: &str) -> Self {
         let str = format!("{username}:{password}");
         self.token = Some(str);
@@ -118,7 +118,6 @@ impl<M: EmbeddingModel> MilvusVectorStore<M> {
         self
     }
 
-    /// Creates a Milvus insertion request.
     fn create_insert_request(&self, data: Vec<CreateRecord>) -> InsertRequest<'_> {
         InsertRequest {
             data,
@@ -127,7 +126,8 @@ impl<M: EmbeddingModel> MilvusVectorStore<M> {
         }
     }
 
-    /// Creates a Milvus semantic search request.
+    /// Builds the search body. Any request threshold becomes a
+    /// `distance >= threshold` condition combined with the request filter.
     fn create_search_request(
         &self,
         data: Vec<f64>,
@@ -165,7 +165,8 @@ impl<M: EmbeddingModel> MilvusVectorStore<M> {
         }
     }
 
-    /// Embeds the query, runs the Milvus search endpoint, and parses the response.
+    /// Embeds the query and posts it to the search endpoint, returning the
+    /// decoded body. Any non-200 status is returned as an error with its body.
     async fn search<T: for<'a> Deserialize<'a>>(
         &self,
         req: &VectorSearchRequest<Filter>,
@@ -199,7 +200,7 @@ impl<M: EmbeddingModel> MilvusVectorStore<M> {
     }
 }
 
-impl<M: EmbeddingModel> InsertDocuments for MilvusVectorStore<M> {
+impl InsertDocuments for MilvusVectorStore {
     async fn insert_documents<Doc: Serialize + Embed + WasmCompatSend>(
         &self,
         documents: Vec<(Doc, Vec<Embedding>)>,
@@ -240,38 +241,43 @@ impl<M: EmbeddingModel> InsertDocuments for MilvusVectorStore<M> {
     }
 }
 
-impl<M: EmbeddingModel> VectorStoreIndex for MilvusVectorStore<M> {
+impl VectorStoreIndex for MilvusVectorStore {
     type Filter = Filter;
 
-    /// Search for the top `n` nearest neighbors to the given query within the Milvus vector store.
-    /// Returns a vector of tuples containing the score, ID, and payload of the nearest neighbors.
+    /// Returns matches scored by distance, in the order Milvus reports.
     async fn top_n<T: DeserializeOwned + WasmCompatSend>(
         &self,
         req: VectorSearchRequest<Filter>,
-    ) -> Result<Vec<(f64, String, T)>, VectorStoreError> {
+    ) -> Result<Vec<VectorSearchResult<T>>, VectorStoreError> {
         let json: SearchResult<SearchResultData<T>> = self.search(&req, false).await?;
 
         let res = json
             .data
             .into_iter()
-            .map(|x| (x.distance, x.id.to_string(), x.document))
+            .map(|x| VectorSearchResult {
+                score: x.distance,
+                id: x.id.to_string(),
+                document: x.document,
+            })
             .collect();
 
         Ok(res)
     }
 
-    /// Search for the top `n` nearest neighbors to the given query within the Milvus vector store.
-    /// Returns a vector of tuples containing the score and ID of the nearest neighbors.
+    /// Like `top_n` but returns only scores and ids, without requesting documents.
     async fn top_n_ids(
         &self,
         req: VectorSearchRequest<Filter>,
-    ) -> Result<Vec<(f64, String)>, VectorStoreError> {
+    ) -> Result<Vec<VectorSearchIdResult>, VectorStoreError> {
         let json: SearchResult<SearchResultDataOnlyId> = self.search(&req, true).await?;
 
         let res = json
             .data
             .into_iter()
-            .map(|x| (x.distance, x.id.to_string()))
+            .map(|x| VectorSearchIdResult {
+                score: x.distance,
+                id: x.id.to_string(),
+            })
             .collect();
 
         Ok(res)

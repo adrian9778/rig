@@ -1,5 +1,6 @@
 //! Explicit runtime-defined evaluation queries.
-use crate::{Error, Query, types::Question};
+use crate::{Query, types::Question};
+use rig_core::error::ProviderError;
 use std::collections::BTreeMap;
 
 /// Runtime-defined questions with runtime-keyed answers. Choose this explicitly
@@ -11,11 +12,9 @@ pub struct DynamicQuery {
 }
 impl DynamicQuery {
     /// Validate runtime question definitions before accepting them.
-    pub fn new(definitions: BTreeMap<String, Question>) -> Result<Self, Error> {
+    pub fn new(definitions: BTreeMap<String, Question>) -> Result<Self, ProviderError> {
         if definitions.is_empty() {
-            return Err(Error::InvalidRequest(
-                "at least one question is required".into(),
-            ));
+            return Err(ProviderError::request("at least one question is required"));
         }
         for (id, question) in &definitions {
             crate::questions::validate_definition(id, question)?;
@@ -26,9 +25,9 @@ impl DynamicQuery {
 impl Query for DynamicQuery {
     type Output = BTreeMap<String, crate::types::Answer>;
     type Response = BTreeMap<String, crate::types::Answer>;
-    fn decode(&self, response: Self::Response) -> Result<Self::Output, Error> {
+    fn decode(&self, response: Self::Response) -> Result<Self::Output, ProviderError> {
         if !self.definitions.keys().eq(response.keys()) {
-            return Err(Error::InvalidResponse(
+            return Err(ProviderError::Response(
                 "response question IDs differ from request".into(),
             ));
         }
@@ -37,7 +36,7 @@ impl Query for DynamicQuery {
             .map(|(id, question)| {
                 let answer = response
                     .get(id)
-                    .ok_or_else(|| Error::InvalidResponse(format!("missing answer: {id}")))?;
+                    .ok_or_else(|| ProviderError::Response(format!("missing answer: {id}")))?;
                 crate::questions::validate(question, answer)?;
                 Ok((id.clone(), answer.clone()))
             })

@@ -1,3 +1,13 @@
+//! Terminal chat loops for agents and custom chat implementations.
+//!
+//! ```no_run
+//! use rig_agent::{Agent, completion::PromptError, integrations::cli_chatbot::ChatBotBuilder};
+//! async fn chat(agent: Agent) -> Result<(), PromptError> {
+//!     ChatBotBuilder::new().agent(agent).max_turns(3).build().run().await
+//! }
+//! ```
+
+use rig_core::error::ProviderError;
 use rig_core::{
     markers::{Missing, Provided},
     message::Message,
@@ -5,8 +15,8 @@ use rig_core::{
 
 use crate::{
     agent::{Agent, MultiTurnStreamItem},
-    completion::{CompletionError, PromptError, Usage},
-    streaming::{Delta, StreamEvent},
+    completion::{PromptError, Usage},
+    streaming::{Item, StreamEvent},
 };
 use rig_core::wasm_compat::WasmCompatSend;
 
@@ -32,7 +42,7 @@ impl Chat for Agent {
     ) -> Result<String, PromptError> {
         Agent::chat(self, prompt, history)
             .await
-            .map(|response| response.output)
+            .map(|response| response.output())
     }
 }
 use futures::StreamExt;
@@ -57,7 +67,7 @@ pub struct ChatBotBuilder<T = Missing>(T);
 /// A terminal chat loop over an agent or a [`Chat`]; see [`ChatBot::run`].
 pub struct ChatBot<T>(T);
 
-/// Trait to abstract message behavior away from cli_chat/`run` loop
+/// Execute and display turns with optional usage reporting.
 #[allow(private_interfaces)]
 trait CliChat {
     async fn request(
@@ -105,7 +115,7 @@ impl CliChat for AgentImpl {
             .stream();
 
         let mut acc = String::new();
-        let mut messages = None;
+        let mut messages = Vec::new();
 
         let result = loop {
             let Some(chunk) = response_stream.next().await else {
@@ -114,35 +124,24 @@ impl CliChat for AgentImpl {
             };
 
             match chunk {
-                Ok(MultiTurnStreamItem::StreamAssistantItem(StreamEvent::BlockDelta {
-                    delta: Delta::Text { text },
+                Ok(MultiTurnStreamItem::StreamAssistantItem(Item::Event(StreamEvent::Text {
+                    text,
                     ..
-                })) => {
+                }))) => {
                     print!("{text}");
                     acc.push_str(&text);
                 }
                 Ok(MultiTurnStreamItem::FinalResponse(final_response)) => {
                     self.usage = final_response.usage();
-                    messages = final_response
-                        .messages()
-                        .map(<[rig_core::completion::Message]>::to_vec);
+                    messages = final_response.messages;
                 }
-                Err(e) => {
-                    // The stream's error is the run's error: the provider's
-                    // report, a cancel, a memory failure — not its `Display`.
-                    break Err(crate::agent::streaming_error_into_prompt(e));
-                }
+                Err(e) => break Err(e),
                 _ => continue,
             }
         };
 
-        if let Ok(response) = &result {
-            if let Some(messages) = messages {
-                history.extend(messages);
-            } else {
-                history.push(Message::user(prompt));
-                history.push(Message::assistant(response.as_str()));
-            }
+        if result.is_ok() {
+            history.extend(messages);
         }
 
         result
@@ -224,7 +223,8 @@ impl<T> ChatBot<T>
 where
     T: CliChat,
 {
-    /// Read prompts from stdin and print answers until EOF or `exit`.
+    /// Read prompts from stdin and print answers until `exit`.
+    /// Returns prompt failures and stdout flush errors; input read errors are printed.
     pub async fn run(mut self) -> Result<(), PromptError> {
         let stdin = io::stdin();
         let mut stdout = io::stdout();
@@ -233,7 +233,7 @@ where
         loop {
             print!("> ");
             stdout.flush().map_err(|e| {
-                PromptError::CompletionError(CompletionError::ResponseError(format!(
+                PromptError::Provider(ProviderError::Response(format!(
                     "failed to flush stdout: {e}"
                 )))
             })?;

@@ -1,16 +1,14 @@
 //! `check-test-layout`: every test module is a sibling file, never an inline
 //! block.
 //!
-//! The rule: a `mod` item gated by a test-only `#[cfg(...)]` (`cfg(test)`, or an
-//! `all(...)` with `test` among its operands) must be a declaration,
-//! `mod tests;`, whose body lives in the file rustc resolves it to. An inline
-//! body, `mod tests { ... }`, is rejected. Inline bodies are what turned
-//! `agent/runner.rs` into an 11,000-line file with 800 lines of code (#2433
-//! moved 214 of them out); this task keeps them out.
+//! A `mod` item gated by a test-only `#[cfg(...)]`, meaning `cfg(test)` or an
+//! `all(...)` including `test`, must be a declaration whose body lives in the
+//! file rustc resolves it to. Inline bodies are rejected because they let source
+//! files grow without bound.
 //!
-//! Files reachable only through a test-gated declaration are test code
-//! themselves and may nest modules however they like. Test-onlyness follows
-//! declarations transitively: anything a test-only file declares is test-only.
+//! Files reachable only through a test-gated declaration are themselves test
+//! code and may nest modules freely. Test-onlyness follows declarations
+//! transitively.
 //!
 //! Source is parsed with `syn`, so attributes inside strings or comments cannot
 //! trip the check and a `cfg` predicate is inspected structurally rather than by
@@ -21,9 +19,12 @@ use std::path::{Path, PathBuf};
 
 use syn::{Item, ItemMod, Meta, Token, punctuated::Punctuated};
 
-/// Run the check over every `crates/*/src` tree under `workspace`.
+/// Run the check over every `crates/*/src`, `plugins/*/src` and
+/// `corpus/*/src` tree under `workspace`.
 pub(crate) fn check(workspace: &Path) -> Result<(), String> {
-    let files = source_files(&workspace.join("crates"))?;
+    let mut files = source_files(&workspace.join("crates"))?;
+    files.extend(source_files(&workspace.join("plugins"))?);
+    files.extend(source_files(&workspace.join("corpus"))?);
     if files.len() < 100 {
         return Err(format!(
             "the source walk found only {} files under crates/; refusing to pass vacuously",
@@ -71,7 +72,7 @@ pub(crate) fn check(workspace: &Path) -> Result<(), String> {
     Err(message)
 }
 
-/// Every `.rs` file under `crates/*/src`, sorted for stable output.
+/// Every `.rs` file under `<folder>/*/src`, sorted for stable output.
 fn source_files(crates: &Path) -> Result<Vec<PathBuf>, String> {
     let mut out = Vec::new();
     let entries = std::fs::read_dir(crates)
@@ -80,32 +81,16 @@ fn source_files(crates: &Path) -> Result<Vec<PathBuf>, String> {
         let entry = entry.map_err(|error| format!("could not read crate entry: {error}"))?;
         let src = entry.path().join("src");
         if src.is_dir() {
-            walk(&src, &mut out)?;
+            out.extend(crate::support::files_under(&src, Some("rs"))?);
         }
     }
     out.sort();
     Ok(out)
 }
 
-fn walk(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), String> {
-    let entries = std::fs::read_dir(dir)
-        .map_err(|error| format!("could not read {}: {error}", dir.display()))?;
-    for entry in entries {
-        let path = entry
-            .map_err(|error| format!("could not read entry in {}: {error}", dir.display()))?
-            .path();
-        if path.is_dir() {
-            walk(&path, out)?;
-        } else if path.extension().is_some_and(|ext| ext == "rs") {
-            out.push(path);
-        }
-    }
-    Ok(())
-}
-
 /// The set of files reachable only through a test-gated `mod x;` declaration,
 /// closed under "declared by a test-only file".
-fn test_only_files(parsed: &[(PathBuf, syn::File)]) -> BTreeSet<PathBuf> {
+pub(crate) fn test_only_files(parsed: &[(PathBuf, syn::File)]) -> BTreeSet<PathBuf> {
     let mut test_only = BTreeSet::new();
     loop {
         let before = test_only.len();

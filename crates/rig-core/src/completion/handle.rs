@@ -1,37 +1,21 @@
-//! The string identity a runtime names a model by.
+//! Serializable model labels resolved to live handles by a runtime.
 //!
-//! Live model behaviour is reached through the effect bus: a
-//! `ModelHandle` (`rig_agent::bus`) is a typed view bound to the key
-//! a [`CompletionAdapter`](crate::serve::adapters::CompletionAdapter) was
-//! registered under. `ModelRef` is the serializable half — the label under
-//! which a runtime resolves that key.
+//! ```
+//! use rig_core::completion::ModelRef;
+//!
+//! let model = ModelRef::new("assistant");
+//! assert_eq!(model.as_str(), "assistant");
+//! ```
 
 use std::{fmt, sync::Arc};
 
 use serde::{Deserialize, Serialize};
 
-/// The string identity a specification, asset, or registry names a model by.
-///
-/// A handle is live process state and is never serialized; a `ModelRef` is
-/// the serializable half — the label under which a runtime resolves a
-/// handle (`ModelRef → HandlerKey → ModelHandle`). It carries no provider
-/// semantics: two refs are equal when their strings are equal.
-#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+/// Model label serialized as a string. Equality compares labels without
+/// provider interpretation; resolving a label to a live handle is the runtime's responsibility.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(transparent)]
 pub struct ModelRef(Arc<str>);
-
-// Transparent string (de)serialization without serde's `rc` feature.
-impl Serialize for ModelRef {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.serialize_str(&self.0)
-    }
-}
-
-impl<'de> Deserialize<'de> for ModelRef {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let label = <std::borrow::Cow<'de, str>>::deserialize(deserializer)?;
-        Ok(Self(Arc::from(&*label)))
-    }
-}
 
 impl ModelRef {
     /// Build a reference from any string-like value.

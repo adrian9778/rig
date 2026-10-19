@@ -9,178 +9,190 @@
         clippy::unreachable
     )
 )]
-//! The bundled `reqwest` transport for Rig.
+//! The bundled reqwest HTTP transport for Rig.
 //!
-//! `rig-core` is transport-agnostic: a provider's wire says what to send and
-//! how to read the reply, and [`Bound`](rig_core::driver::Bound) pairs it with
-//! an `H: HttpClientExt` — defaulting to the erased
-//! [`BoxedHttpClient`] — to make a model. rig-core itself depends on neither
-//! reqwest nor tokio. This crate supplies:
+//! [`ReqwestClient::default()`] is the process-wide client: built once on
+//! first use and shared by every clone, so every provider client made with
+//! it shares one connection pool. Construction never fails. On a host with
+//! no CA certificates, the `rustls` build trusts the bundled Mozilla roots
+//! instead. When reqwest still cannot build its client, every send reports
+//! that build failure in-band.
 //!
-//! - [`ReqwestClient`], a newtype over [`reqwest::Client`] implementing
-//!   [`HttpClientExt`] (and, behind the `reqwest-middleware` feature,
-//!   [`ReqwestMiddlewareClient`] over `reqwest_middleware::ClientWithMiddleware`).
-//! - The construction convenience the `rig` facade re-exports:
-//!   [`client::DefaultTransport`], whose `bound()` builds the erased default
-//!   over a `ReqwestClient`, so
-//!   `openai::wire::OpenAI::from_env()?.bound()?` yields a usable provider
-//!   without naming a transport. Name one explicitly with
-//!   [`Bind::bind`](rig_core::driver::Bind::bind) instead and the concrete
-//!   type stays in the signature.
+//! Native requests and bodies enter the captured Tokio context on each poll
+//! ([`rig_http::runtime`]), using a lazy fallback when no runtime is current. Callers retain ownership;
+//! dropping an operation cancels local work, not accepted remote work. Hosts
+//! must keep their runtime driven with I/O and timers enabled until operations
+//! finish. Missing drivers can panic; a stopped runtime causes I/O failure.
 //!
-//! # Running without a tokio runtime
+//! ```no_run
+//! use rig_reqwest::ReqwestClient;
 //!
-//! Async reqwest needs a tokio reactor on native targets. Inside a tokio
-//! runtime this transport awaits reqwest futures directly. Outside one —
-//! Bevy task pools, smol, `futures::executor::block_on` — it drives them on a
-//! lazily started single-worker fallback runtime and hands the caller plain
-//! runtime-agnostic futures (a tokio `JoinHandle`, a `futures` channel receiver
-//! for streamed bodies), so nothing is ever `block_on`'d and no thread parks.
+//! let shared = ReqwestClient::default();
+//! let custom = ReqwestClient::from(rig_reqwest::reqwest::Client::new());
+//! # let _ = (shared, custom);
+//! ```
 
 pub use reqwest;
 
-/// The bundled transport: a thin newtype over [`reqwest::Client`] that
-/// implements [`HttpClientExt`].
+/// A reqwest client implementing [`HttpClientExt`].
 ///
-/// A newtype rather than `reqwest::Client` itself because the orphan rule
-/// forbids implementing rig-core's trait for reqwest's type from this crate.
-/// That is the whole of its job, so its surface is deliberately small: convert
-/// in with [`From`] or [`Default`], borrow the inner client with [`AsRef`],
-/// take it back with [`into_inner`](Self::into_inner).
-///
-/// It used to expose the inner client three ways at once — a public field,
-/// `Deref`, and `From`. `Deref` on a type that is not a smart pointer makes
-/// reqwest's whole inherent API look like this type's own, which it is not;
-/// the two explicit accessors say the same thing without the illusion.
-#[derive(Clone, Debug, Default)]
-pub struct ReqwestClient(reqwest::Client);
+/// [`Default`] is the process-wide client, built once and shared by every
+/// clone; `From<reqwest::Client>` wraps a configured client and keeps its
+/// connection pool.
+#[derive(Clone, Debug)]
+pub struct ReqwestClient(Built);
+
+/// The process-wide client, erased behind [`DynHttpClient`].
+pub fn shared() -> DynHttpClient {
+    DynHttpClient::new(ReqwestClient::default())
+}
+
+/// What building the client produced: the client, or why reqwest refused.
+#[derive(Clone, Debug)]
+enum Built {
+    Client(Arc<reqwest::Client>),
+    /// The shared client could not be built: every send reports this, so
+    /// the failure surfaces where the first request is made rather than
+    /// where the client was named.
+    Failed(Arc<reqwest::Error>),
+}
+
+impl Default for ReqwestClient {
+    /// The process-wide client, built on first use. It never panics: a
+    /// client reqwest cannot build reports the build error on every send.
+    fn default() -> Self {
+        fn build() -> ReqwestClient {
+            let built = reqwest::Client::builder().build();
+            #[cfg(all(feature = "rustls", not(target_family = "wasm")))]
+            let built = built.or_else(with_bundled_roots);
+            ReqwestClient(match built {
+                Ok(client) => Built::Client(Arc::new(client)),
+                Err(error) => Built::Failed(Arc::new(error)),
+            })
+        }
+        #[cfg(not(target_family = "wasm"))]
+        {
+            static SHARED: std::sync::LazyLock<ReqwestClient> = std::sync::LazyLock::new(build);
+            SHARED.clone()
+        }
+        #[cfg(target_family = "wasm")]
+        {
+            thread_local! {
+                static SHARED: ReqwestClient = build();
+            }
+            SHARED.with(Clone::clone)
+        }
+    }
+}
 
 impl ReqwestClient {
-    /// Wrap an already-configured `reqwest::Client` — timeouts, proxies, a
-    /// connection pool shared with the rest of the host.
-    #[must_use]
-    pub fn new(client: reqwest::Client) -> Self {
-        Self(client)
+    /// The reqwest client, or `None` for the shared client when reqwest
+    /// could not build it.
+    pub fn inner(&self) -> Option<&reqwest::Client> {
+        match &self.0 {
+            Built::Client(client) => Some(client),
+            Built::Failed(_) => None,
+        }
     }
 
-    /// Take the inner client back.
-    #[must_use]
-    pub fn into_inner(self) -> reqwest::Client {
-        self.0
+    /// Whether `self` and `other` are clones of one client.
+    #[cfg(test)]
+    fn same(&self, other: &Self) -> bool {
+        match (&self.0, &other.0) {
+            (Built::Client(a), Built::Client(b)) => Arc::ptr_eq(a, b),
+            (Built::Failed(a), Built::Failed(b)) => Arc::ptr_eq(a, b),
+            _ => false,
+        }
     }
+}
 
-    /// Erase this transport behind [`BoxedHttpClient`], for hosts that hold
-    /// one transport for many providers without naming it in their types.
-    #[must_use]
-    pub fn boxed(self) -> BoxedHttpClient {
-        BoxedHttpClient::new(self)
-    }
+/// The shared client trusting only the bundled Mozilla roots, after the
+/// default build failed with `error`. That build differs only in reading
+/// the system's root store, which a host without CA certificates lacks.
+/// Returns `error` when this build fails too.
+#[cfg(all(feature = "rustls", not(target_family = "wasm")))]
+fn with_bundled_roots(error: reqwest::Error) -> reqwest::Result<reqwest::Client> {
+    let roots = webpki_root_certs::TLS_SERVER_ROOT_CERTS
+        .iter()
+        .filter_map(|der| reqwest::Certificate::from_der(der).ok());
+    let Ok(client) = reqwest::Client::builder().tls_certs_only(roots).build() else {
+        return Err(error);
+    };
+    tracing::warn!(
+        "the system's CA certificates could not be loaded ({}), so rig trusts its bundled \
+         Mozilla roots; install the system's CA certificates, or set SSL_CERT_FILE or \
+         SSL_CERT_DIR, to trust those instead",
+        Chain(&error)
+    );
+    Ok(client)
+}
+
+/// The error every send on an unbuilt client reports.
+fn unbuilt(error: &Arc<reqwest::Error>) -> Error {
+    Error::unbuilt(TransportBuildError(Arc::clone(error)))
 }
 
 impl From<reqwest::Client> for ReqwestClient {
     fn from(client: reqwest::Client) -> Self {
-        Self(client)
+        Self(Built::Client(Arc::new(client)))
     }
-}
-
-impl From<ReqwestClient> for BoxedHttpClient {
-    fn from(client: ReqwestClient) -> Self {
-        client.boxed()
-    }
-}
-
-impl AsRef<reqwest::Client> for ReqwestClient {
-    fn as_ref(&self) -> &reqwest::Client {
-        &self.0
-    }
-}
-
-/// [`HttpClientExt`] for a `reqwest_middleware::ClientWithMiddleware`.
-///
-/// The same shape as [`ReqwestClient`], minus `Default`: a middleware client
-/// with no middleware is just a `reqwest::Client` with extra indirection, so
-/// there is no default worth having — build one with
-/// `reqwest_middleware::ClientBuilder` and convert it in.
-#[cfg(feature = "reqwest-middleware")]
-#[cfg_attr(docsrs, doc(cfg(feature = "reqwest-middleware")))]
-#[derive(Clone, Debug)]
-pub struct ReqwestMiddlewareClient(reqwest_middleware::ClientWithMiddleware);
-
-#[cfg(feature = "reqwest-middleware")]
-impl ReqwestMiddlewareClient {
-    /// Wrap a built `ClientWithMiddleware`.
-    #[must_use]
-    pub fn new(client: reqwest_middleware::ClientWithMiddleware) -> Self {
-        Self(client)
-    }
-
-    /// Take the inner client back.
-    #[must_use]
-    pub fn into_inner(self) -> reqwest_middleware::ClientWithMiddleware {
-        self.0
-    }
-
-    /// Erase this transport behind [`BoxedHttpClient`], as
-    /// [`ReqwestClient::boxed`] does — a host that erases its transport should
-    /// not lose the option by having chosen middleware.
-    #[must_use]
-    pub fn boxed(self) -> BoxedHttpClient {
-        BoxedHttpClient::new(self)
-    }
-}
-
-#[cfg(feature = "reqwest-middleware")]
-impl From<reqwest_middleware::ClientWithMiddleware> for ReqwestMiddlewareClient {
-    fn from(client: reqwest_middleware::ClientWithMiddleware) -> Self {
-        Self(client)
-    }
-}
-
-#[cfg(feature = "reqwest-middleware")]
-impl From<ReqwestMiddlewareClient> for BoxedHttpClient {
-    fn from(client: ReqwestMiddlewareClient) -> Self {
-        client.boxed()
-    }
-}
-
-#[cfg(feature = "reqwest-middleware")]
-impl AsRef<reqwest_middleware::ClientWithMiddleware> for ReqwestMiddlewareClient {
-    fn as_ref(&self) -> &reqwest_middleware::ClientWithMiddleware {
-        &self.0
-    }
-}
-
-pub mod client;
-#[cfg(not(target_family = "wasm"))]
-mod runtime;
-
-/// Bring the construction traits into scope.
-pub mod prelude {
-    pub use crate::client::DefaultTransport;
 }
 
 use bytes::Bytes;
-use rig_core::http_client::{
-    BoxedHttpClient, Error, HttpClientExt, LazyBody, MultipartForm, Request, Response, Result,
+use rig_http::http_client::{
+    DynHttpClient, Error, HttpClientExt, LazyBody, MultipartForm, Request, Response, Result,
     StreamingResponse, multipart::PartContent,
 };
-use rig_core::wasm_compat::*;
+use rig_http::wasm_compat::*;
 use std::pin::Pin;
+use std::sync::Arc;
 
-/// Map a transport-level `reqwest::Error` onto the transport-agnostic
-/// [`Error`].
+/// A transport build failure that displays the source chain and retains the
+/// original reqwest error as its source.
+#[derive(Debug)]
+struct TransportBuildError(Arc<reqwest::Error>);
+
+impl std::fmt::Display for TransportBuildError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "could not build the bundled reqwest transport: {}",
+            Chain(&*self.0)
+        )
+    }
+}
+
+/// An error followed by each of its sources, separated by `: `.
+struct Chain<'a>(&'a (dyn std::error::Error + 'static));
+
+impl std::fmt::Display for Chain<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)?;
+        let mut source = self.0.source();
+        while let Some(cause) = source {
+            write!(f, ": {cause}")?;
+            source = cause.source();
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for TransportBuildError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&*self.0)
+    }
+}
+
+/// Wrap a reqwest transport error as [`Error::Instance`], retaining its source.
 ///
-/// This is the response-less side (connect, decode, timeout): a reply the
-/// server made is read off the `reqwest::Response` with its body and headers
-/// by the send path instead, never reduced to a bare status.
-/// Rig never calls `error_for_status`, so a `reqwest::Error` here carries no
-/// reply to preserve.
+/// HTTP status failures are handled separately to preserve response headers
+/// and bodies.
 pub fn from_reqwest(err: reqwest::Error) -> Error {
     Error::instance(err)
 }
 
 /// Read the status, headers and body off a failed `reqwest::Response` and
-/// build the headers-preserving non-success error (rig#2314).
+/// build a non-success error that preserves the headers.
 async fn non_success_status_error(response: reqwest::Response) -> Error {
     let status = response.status();
     let headers = response.headers().clone();
@@ -191,26 +203,8 @@ async fn non_success_status_error(response: reqwest::Response) -> Error {
     Error::non_success_with_details(status, headers, body)
 }
 
-/// When the body is read.
-///
-/// The two moments look alike and are not interchangeable: the caller decides
-/// which by whether it can still poll reqwest when it awaits the body.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum BodyTiming {
-    /// Hand back a body future the caller awaits later. Only valid where the
-    /// caller can poll reqwest futures — inside a tokio runtime, or on wasm.
-    Lazy,
-    /// Read the body now and hand back a ready future. This is the off-runtime
-    /// path: the future it returns may be polled by an executor that cannot
-    /// drive reqwest, so nothing reqwest-shaped may survive into it.
-    Eager,
-}
-
-/// Build the transport-agnostic response, reading the body at `timing`.
-async fn into_response<U>(
-    response: reqwest::Response,
-    timing: BodyTiming,
-) -> Result<Response<LazyBody<U>>>
+/// Keep successful bodies lazy and owned by the response on every executor.
+async fn into_response<U>(mut response: reqwest::Response) -> Result<Response<LazyBody<U>>>
 where
     U: From<Bytes>,
     U: WasmCompatSend + 'static,
@@ -221,35 +215,20 @@ where
 
     let mut res = Response::builder().status(response.status());
     if let Some(headers) = res.headers_mut() {
-        *headers = response.headers().clone();
+        *headers = std::mem::take(response.headers_mut());
     }
 
-    let body: LazyBody<U> = match timing {
-        BodyTiming::Lazy => Box::pin(async {
-            let bytes = response.bytes().await.map_err(Error::instance)?;
-            Ok(U::from(bytes))
-        }),
-        BodyTiming::Eager => {
-            let bytes = response.bytes().await.map_err(Error::instance)?;
-            Box::pin(std::future::ready(Ok(U::from(bytes))))
-        }
+    let body = async {
+        let bytes = response.bytes().await.map_err(Error::instance)?;
+        Ok(U::from(bytes))
     };
-
+    #[cfg(not(target_family = "wasm"))]
+    let body = rig_http::runtime::bind(body)?;
+    let body: LazyBody<U> = Box::pin(body);
     res.body(body).map_err(Error::Protocol)
 }
 
-/// The timing the off-runtime side of [`drive`] needs.
-///
-/// On wasm there is no fallback runtime and no off-runtime path, so the body
-/// stays lazy; natively the off-runtime side must not hand reqwest futures to
-/// an executor that cannot poll them.
-const OFF_RUNTIME_TIMING: BodyTiming = if cfg!(target_family = "wasm") {
-    BodyTiming::Lazy
-} else {
-    BodyTiming::Eager
-};
-
-fn streaming_head(response: &reqwest::Response) -> http::response::Builder {
+fn streaming_head(response: &mut reqwest::Response) -> http::response::Builder {
     #[cfg(not(target_family = "wasm"))]
     let mut res = Response::builder()
         .status(response.status())
@@ -259,55 +238,27 @@ fn streaming_head(response: &reqwest::Response) -> http::response::Builder {
     let mut res = Response::builder().status(response.status());
 
     if let Some(hs) = res.headers_mut() {
-        *hs = response.headers().clone();
+        *hs = std::mem::take(response.headers_mut());
     }
     res
 }
 
 /// Convert an already-sent streaming response into the transport-agnostic
 /// [`StreamingResponse`], rejecting non-success statuses with the
-/// headers-preserving error. The byte stream is reqwest's own, so this is
-/// only valid where the caller can poll reqwest futures.
-async fn into_streaming_response(response: reqwest::Response) -> Result<StreamingResponse> {
+/// headers-preserving error. The body retains the request's reactor context.
+async fn into_streaming_response(mut response: reqwest::Response) -> Result<StreamingResponse> {
     if !response.status().is_success() {
         return Err(non_success_status_error(response).await);
     }
-    let res = streaming_head(&response);
+    let res = streaming_head(&mut response);
 
     use futures::StreamExt;
-    let mapped_stream: Pin<Box<dyn WasmCompatSendStream<InnerItem = Result<Bytes>>>> = Box::pin(
-        response
-            .bytes_stream()
-            .map(|chunk| chunk.map_err(Error::instance)),
-    );
-
-    res.body(mapped_stream).map_err(Error::Protocol)
-}
-
-/// Off-runtime streaming: the body is *driven* on the fallback runtime and
-/// forwarded through a bounded channel; the caller's executor polls only the
-/// receiver, which is a plain `futures` stream.
-#[cfg(not(target_family = "wasm"))]
-async fn into_forwarded_streaming_response(
-    response: reqwest::Response,
-) -> Result<StreamingResponse> {
-    if !response.status().is_success() {
-        return Err(non_success_status_error(response).await);
-    }
-    let res = streaming_head(&response);
-
-    use futures::{SinkExt, StreamExt};
-    let (mut tx, rx) = futures::channel::mpsc::channel::<Result<Bytes>>(16);
-    runtime::spawn_off_runtime(async move {
-        let mut body = response.bytes_stream();
-        while let Some(chunk) = body.next().await {
-            if tx.send(chunk.map_err(Error::instance)).await.is_err() {
-                // Receiver dropped: the consumer stopped reading.
-                break;
-            }
-        }
-    })?;
-    let stream: Pin<Box<dyn WasmCompatSendStream<InnerItem = Result<Bytes>>>> = Box::pin(rx);
+    let stream = response
+        .bytes_stream()
+        .map(|chunk| chunk.map_err(Error::instance));
+    #[cfg(not(target_family = "wasm"))]
+    let stream = rig_http::runtime::bind_stream(stream)?;
+    let stream: Pin<Box<dyn WasmCompatSendStream<InnerItem = Result<Bytes>>>> = Box::pin(stream);
     res.body(stream).map_err(Error::Protocol)
 }
 
@@ -322,12 +273,7 @@ struct InvalidPartContentType {
 
 /// Render a [`MultipartForm`] as a `reqwest::multipart::Form`.
 ///
-/// Fails when a part names a content type reqwest rejects. That used to be
-/// swallowed — the part was rebuilt without its content type and the request
-/// went out anyway — so a typo'd MIME reached the provider as a *missing* one
-/// and came back as an opaque provider error about the payload. A content type
-/// the caller asked for and did not get is a caller bug worth reporting at the
-/// call site.
+/// Returns an error when a binary part has a content type reqwest rejects.
 pub fn multipart_form(value: MultipartForm) -> Result<reqwest::multipart::Form> {
     let mut form = reqwest::multipart::Form::new();
 
@@ -338,7 +284,8 @@ pub fn multipart_form(value: MultipartForm) -> Result<reqwest::multipart::Form> 
                 form = form.text(name, text);
             }
             PartContent::Binary(bytes) => {
-                let mut req_part = reqwest::multipart::Part::bytes(bytes.to_vec());
+                // A `Bytes` body is the same reusable part `Part::bytes` makes, uncopied.
+                let mut req_part = reqwest::multipart::Part::stream(bytes);
                 if let Some(content_type) = content_type.as_ref() {
                     req_part = req_part.mime_str(content_type.as_ref()).map_err(|source| {
                         Error::instance(InvalidPartContentType {
@@ -361,175 +308,69 @@ pub fn multipart_form(value: MultipartForm) -> Result<reqwest::multipart::Form> 
     Ok(form)
 }
 
-/// The one request-driving routine both reqwest-flavoured clients share:
-/// `reqwest::Client` and `ClientWithMiddleware` expose the same
-/// `request(..) -> RequestBuilder` / `send()` surface but are unrelated types,
-/// so the shared code is written once against a tiny private trait.
-trait ReqwestLike: Clone + WasmCompatSend + WasmCompatSync + 'static {
-    type Builder: RequestBuilderLike;
-    fn request_builder(&self, method: http::Method, url: String) -> Self::Builder;
+/// What a request carries: bytes, or a multipart form.
+enum Payload {
+    Bytes(Bytes),
+    Form(reqwest::multipart::Form),
 }
 
-trait RequestBuilderLike: Sized + WasmCompatSend + 'static {
-    fn with_headers(self, headers: http::HeaderMap) -> Self;
-    fn with_body(self, body: reqwest::Body) -> Self;
-    fn with_multipart(self, form: reqwest::multipart::Form) -> Self;
-    fn send_request(self) -> impl Future<Output = Result<reqwest::Response>> + WasmCompatSend;
+/// A reqwest client, plain or with middleware.
+trait Execute: WasmCompatSend + WasmCompatSync {
+    /// The send of `parts` with `payload`, or why it cannot be sent.
+    fn execute(
+        &self,
+        parts: http::request::Parts,
+        payload: Result<Payload>,
+    ) -> Result<impl Future<Output = Result<reqwest::Response>> + WasmCompatSend + 'static>;
 }
 
-impl ReqwestLike for ReqwestClient {
-    type Builder = reqwest::RequestBuilder;
-    fn request_builder(&self, method: http::Method, url: String) -> Self::Builder {
-        self.0.request(method, url)
-    }
-}
-
-impl RequestBuilderLike for reqwest::RequestBuilder {
-    fn with_headers(self, headers: http::HeaderMap) -> Self {
-        self.headers(headers)
-    }
-    fn with_body(self, body: reqwest::Body) -> Self {
-        self.body(body)
-    }
-    fn with_multipart(self, form: reqwest::multipart::Form) -> Self {
-        self.multipart(form)
-    }
-    async fn send_request(self) -> Result<reqwest::Response> {
-        self.send().await.map_err(Error::instance)
-    }
-}
-
-#[cfg(feature = "reqwest-middleware")]
-impl ReqwestLike for ReqwestMiddlewareClient {
-    type Builder = reqwest_middleware::RequestBuilder;
-    fn request_builder(&self, method: http::Method, url: String) -> Self::Builder {
-        self.0.request(method, url)
+impl Execute for ReqwestClient {
+    fn execute(
+        &self,
+        parts: http::request::Parts,
+        payload: Result<Payload>,
+    ) -> Result<impl Future<Output = Result<reqwest::Response>> + WasmCompatSend + 'static> {
+        let client = match &self.0 {
+            Built::Client(client) => client,
+            Built::Failed(error) => return Err(unbuilt(error)),
+        };
+        let request = client
+            .request(parts.method, parts.uri.to_string())
+            .headers(parts.headers);
+        let request = match payload? {
+            Payload::Bytes(bytes) => request.body(bytes),
+            Payload::Form(form) => request.multipart(form),
+        };
+        Ok(async move { request.send().await.map_err(Error::instance) })
     }
 }
 
-#[cfg(feature = "reqwest-middleware")]
-impl RequestBuilderLike for reqwest_middleware::RequestBuilder {
-    fn with_headers(self, headers: http::HeaderMap) -> Self {
-        self.headers(headers)
-    }
-    fn with_body(self, body: reqwest::Body) -> Self {
-        self.body(body)
-    }
-    fn with_multipart(self, form: reqwest::multipart::Form) -> Self {
-        self.multipart(form)
-    }
-    async fn send_request(self) -> Result<reqwest::Response> {
-        self.send().await.map_err(Error::instance)
-    }
-}
-
-/// Drive `request` and convert its response on whichever side can poll
-/// reqwest: directly when inside tokio (or on wasm), on the fallback runtime
-/// otherwise — in which case `off_runtime` must produce a response whose
-/// body no longer needs reqwest to be polled.
-async fn drive<B, T, OnRt, OffRt, FutOn, FutOff>(
-    request: B,
-    on_runtime: OnRt,
-    off_runtime: OffRt,
-) -> Result<T>
-where
-    B: RequestBuilderLike,
-    T: WasmCompatSend + 'static,
-    OnRt: FnOnce(reqwest::Response) -> FutOn + WasmCompatSend + 'static,
-    FutOn: Future<Output = Result<T>> + WasmCompatSend,
-    OffRt: FnOnce(reqwest::Response) -> FutOff + WasmCompatSend + 'static,
-    FutOff: Future<Output = Result<T>> + WasmCompatSend,
-{
-    #[cfg(not(target_family = "wasm"))]
-    if !runtime::in_tokio() {
-        return runtime::run_off_runtime(async move {
-            let response = request.send_request().await?;
-            off_runtime(response).await
-        })
-        .await?;
-    }
-    #[cfg(target_family = "wasm")]
-    let _ = &off_runtime;
-    let response = request.send_request().await?;
-    on_runtime(response).await
-}
-
-fn send_via<C, T, U>(
+/// Sends `parts` with `payload` through `client` and reads the reply with
+/// `convert`. The reactor is selected on first poll and kept through the
+/// conversion.
+fn send_with<C, T, F>(
     client: &C,
-    req: Request<T>,
-) -> impl Future<Output = Result<Response<LazyBody<U>>>> + WasmCompatSend + 'static
+    parts: http::request::Parts,
+    payload: Result<Payload>,
+    convert: impl FnOnce(reqwest::Response) -> F + WasmCompatSend + 'static,
+) -> impl Future<Output = Result<T>> + WasmCompatSend + 'static
 where
-    C: ReqwestLike,
-    T: Into<Bytes>,
-    U: From<Bytes> + WasmCompatSend + 'static,
+    C: Execute,
+    F: Future<Output = Result<T>> + WasmCompatSend,
 {
-    let (parts, body) = req.into_parts();
-    let req = client
-        .request_builder(parts.method, parts.uri.to_string())
-        .with_headers(parts.headers)
-        .with_body(body.into().into());
-
-    drive(
-        req,
-        |response| into_response::<U>(response, BodyTiming::Lazy),
-        |response| into_response::<U>(response, OFF_RUNTIME_TIMING),
-    )
-}
-
-fn send_multipart_via<C, U>(
-    client: &C,
-    req: Request<MultipartForm>,
-) -> impl Future<Output = Result<Response<LazyBody<U>>>> + WasmCompatSend + 'static
-where
-    C: ReqwestLike,
-    U: From<Bytes> + WasmCompatSend + 'static,
-{
-    let (parts, body) = req.into_parts();
-    // The form is rendered before the request is driven, so an unusable
-    // content type fails here rather than reaching the provider as a silently
-    // missing one.
-    let form = multipart_form(body);
-    let req = form.map(|form| {
-        client
-            .request_builder(parts.method, parts.uri.to_string())
-            .with_headers(parts.headers)
-            .with_multipart(form)
-    });
-
+    let sent = client.execute(parts, payload);
     async move {
-        drive(
-            req?,
-            |response| into_response::<U>(response, BodyTiming::Lazy),
-            |response| into_response::<U>(response, OFF_RUNTIME_TIMING),
-        )
-        .await
+        let sent = sent?;
+        let operation = async move { convert(sent.await?).await };
+        #[cfg(not(target_family = "wasm"))]
+        let operation = rig_http::runtime::bind(operation)?;
+        operation.await
     }
 }
 
-fn send_streaming_via<C, T>(
-    client: &C,
-    req: Request<T>,
-) -> impl Future<Output = Result<StreamingResponse>> + WasmCompatSend
-where
-    C: ReqwestLike,
-    T: Into<Bytes> + WasmCompatSend,
-{
-    let (parts, body) = req.into_parts();
-    let req = client
-        .request_builder(parts.method, parts.uri.to_string())
-        .with_headers(parts.headers)
-        .with_body(body.into().into());
-
-    #[cfg(not(target_family = "wasm"))]
-    let off = into_forwarded_streaming_response;
-    #[cfg(target_family = "wasm")]
-    let off = into_streaming_response;
-    drive(req, into_streaming_response, off)
-}
-
-macro_rules! impl_http_client_ext_via {
-    ($(#[$attribute:meta])* $client:ty) => {
-        $(#[$attribute])*
+/// [`HttpClientExt`] for a client that implements [`Execute`].
+macro_rules! http_client_ext {
+    ($client:ty) => {
         impl HttpClientExt for $client {
             fn send<T, U>(
                 &self,
@@ -539,7 +380,9 @@ macro_rules! impl_http_client_ext_via {
                 T: Into<Bytes>,
                 U: From<Bytes> + WasmCompatSend + 'static,
             {
-                send_via(self, req)
+                let (parts, body) = req.into_parts();
+                let payload = Ok(Payload::Bytes(body.into()));
+                send_with(self, parts, payload, into_response::<U>)
             }
 
             fn send_multipart<U>(
@@ -549,7 +392,10 @@ macro_rules! impl_http_client_ext_via {
             where
                 U: From<Bytes> + WasmCompatSend + 'static,
             {
-                send_multipart_via(self, req)
+                let (parts, form) = req.into_parts();
+                // Reject invalid MIME types locally rather than sending incomplete metadata.
+                let payload = multipart_form(form).map(Payload::Form);
+                send_with(self, parts, payload, into_response::<U>)
             }
 
             fn send_streaming<T>(
@@ -559,19 +405,25 @@ macro_rules! impl_http_client_ext_via {
             where
                 T: Into<Bytes> + WasmCompatSend,
             {
-                send_streaming_via(self, req)
+                let (parts, body) = req.into_parts();
+                let payload = Ok(Payload::Bytes(body.into()));
+                send_with(self, parts, payload, into_streaming_response)
             }
         }
     };
 }
+http_client_ext!(ReqwestClient);
 
-impl_http_client_ext_via!(ReqwestClient);
-
-impl_http_client_ext_via!(
-    #[cfg(feature = "reqwest-middleware")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "reqwest-middleware")))]
-    ReqwestMiddlewareClient
-);
+#[cfg(any(
+    feature = "reqwest-middleware-rustls",
+    feature = "reqwest-middleware-native-tls"
+))]
+mod middleware;
+#[cfg(any(
+    feature = "reqwest-middleware-rustls",
+    feature = "reqwest-middleware-native-tls"
+))]
+pub use middleware::ReqwestMiddlewareClient;
 
 // Compile-time thread-safety contract: the transport handle is shared across
 // threads by every host runtime.

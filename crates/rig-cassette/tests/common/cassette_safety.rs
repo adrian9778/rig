@@ -29,13 +29,13 @@ const PROVIDER_CASSETTE_SUITES: &[ProviderCassetteSuite] = &[
             "with_openai_lifecycle_cassette",
             "with_openai_prompt_caching_cassette",
             "with_openai_completions_prompt_caching_cassette",
-            "with_openai_turn_metadata_cassette",
             "with_openai_cassette_bogus_key",
             "with_openai_completions_cassette",
             "with_openai_cassette_result",
             "with_openai_completions_cassette_result",
             "with_openai_vllm_cassette",
             "with_local_reasoning_content_cassette",
+            "with_local_dual_reasoning_keys_cassette",
             "with_openai_refusal_cassette",
             "with_openai_max_tokens_cassette",
             "with_openai_image_params_cassette",
@@ -48,6 +48,8 @@ const PROVIDER_CASSETTE_SUITES: &[ProviderCassetteSuite] = &[
             "with_openai_transcription_cassette",
             "with_openai_audio_cassette",
             "with_openai_websocket_cassette",
+            "with_openai_long_run_cassette",
+            "with_openai_model_session_cassette",
         ],
     },
     ProviderCassetteSuite {
@@ -73,6 +75,9 @@ const PROVIDER_CASSETTE_SUITES: &[ProviderCassetteSuite] = &[
         source_dir: "tests/providers/anthropic/cassette",
         wrapper_names: &[
             "with_anthropic_cassette",
+            "with_anthropic_checked_cassette",
+            "with_anthropic_long_run_cassette",
+            "with_anthropic_model_session_cassette",
             "with_anthropic_lifecycle_cassette",
             "with_anthropic_turn_metadata_cassette",
             "with_anthropic_cassette_result",
@@ -89,11 +94,9 @@ const PROVIDER_CASSETTE_SUITES: &[ProviderCassetteSuite] = &[
             "with_anthropic_corpus_endings_cassette",
             "with_anthropic_corpus_output_cassette",
             "with_anthropic_corpus_host_cassette",
-            "with_anthropic_corpus_memory_cassette",
             "with_anthropic_corpus_shaping_cassette",
             "with_anthropic_corpus_oracle_cassette",
             "with_anthropic_corpus_causal_cassette",
-            "with_anthropic_corpus_layers_cassette",
         ],
     },
     ProviderCassetteSuite {
@@ -136,6 +139,7 @@ const PROVIDER_CASSETTE_SUITES: &[ProviderCassetteSuite] = &[
         wrapper_names: &[
             "with_gemini_prompt_caching_cassette",
             "with_gemini_cassette",
+            "with_gemini_checked_cassette",
             "with_gemini_corpus_retrieval_cassette",
             "with_gemini_corpus_delta_cassette",
             "with_gemini_corpus_breadth_cassette",
@@ -146,6 +150,7 @@ const PROVIDER_CASSETTE_SUITES: &[ProviderCassetteSuite] = &[
             "with_gemini_interactions_cassette",
             "with_gemini_stream_terminal_cassette",
             "with_gemini_thought_text_cassette",
+            "with_gemini_auto_caching_cassette",
         ],
     },
     ProviderCassetteSuite {
@@ -194,8 +199,10 @@ const PROVIDER_CASSETTE_SUITES: &[ProviderCassetteSuite] = &[
         wrapper_names: &[
             "with_openrouter_prompt_caching_cassette",
             "with_openrouter_cassette",
+            "with_openrouter_checked_cassette",
             "with_openrouter_cassette_result",
             "with_openrouter_cassette_bogus_key_result",
+            "with_openrouter_jev_cassette_result",
             "with_openrouter_openai_cassette",
             "with_openrouter_refusal_cassette",
             "with_openrouter_usage_cassette",
@@ -392,6 +399,191 @@ fn cassette_files_match_registered_scenarios() {
     );
 }
 
+/// A committed reply that is an account failure (a refused credential, a
+/// spent quota, a rate limit, an empty balance) must be the declared subject
+/// of the cell that recorded it: declared on its `CassetteSpec`, or by the
+/// wrapper that presents the rejected credential. The recorder refuses an
+/// undeclared one at record time; this keeps the committed corpus to the
+/// same rule. Each binary checks its own provider's fixtures.
+#[test]
+fn account_failures_are_declared_by_their_cells() {
+    let own = env!("CARGO_CRATE_NAME");
+    let Some(suite) = PROVIDER_CASSETTE_SUITES
+        .iter()
+        .find(|suite| suite.provider == own)
+    else {
+        return;
+    };
+    let mut failures = Vec::new();
+
+    let mut declaring = std::collections::BTreeMap::<String, Vec<String>>::new();
+    for dir in [format!("tests/providers/{own}"), "tests/common".to_owned()] {
+        let dir = repo_path(&dir);
+        if !dir.exists() {
+            continue;
+        }
+        for source in collect_rust_files(&dir) {
+            let contents = fs::read_to_string(&source).expect("test source should be readable");
+            match rig_test_support::scenario_registry::declaring_functions(&contents) {
+                Ok(functions) => {
+                    for (function, kinds) in functions {
+                        let entry = declaring.entry(function).or_default();
+                        for kind in kinds {
+                            if !entry.contains(&kind) {
+                                entry.push(kind);
+                            }
+                        }
+                    }
+                }
+                Err(error) => failures.push(format!("{}: {error}", display_repo_path(&source))),
+            }
+        }
+    }
+
+    let mut declared = std::collections::BTreeMap::<PathBuf, BTreeSet<String>>::new();
+    for source in collect_rust_files(&repo_path(suite.source_dir)) {
+        let contents = fs::read_to_string(&source).expect("test source should be readable");
+        let sites = match rig_test_support::scenario_registry::cassette_scenario_sites(
+            &contents,
+            suite.wrapper_names,
+        ) {
+            Ok(sites) => sites,
+            Err(error) => {
+                failures.push(format!("{}: {error}", display_repo_path(&source)));
+                continue;
+            }
+        };
+        for site in sites {
+            let kinds = declared
+                .entry(crate::cassettes::cassette_path(
+                    suite.provider,
+                    &site.scenario,
+                ))
+                .or_default();
+            kinds.extend(site.declared);
+            kinds.extend(declaring.get(&site.wrapper).into_iter().flatten().cloned());
+        }
+    }
+
+    for fixture in collect_yaml_files(&Path::new(CASSETTE_ROOT).join(own)) {
+        let contents = fs::read_to_string(&fixture).expect("cassette should be readable");
+        for found in crate::cassettes::cassette_account_failures(&contents) {
+            let kind = format!("{:?}", found.failure);
+            if !declared
+                .get(&fixture)
+                .is_some_and(|kinds| kinds.contains(&kind))
+            {
+                failures.push(format!(
+                    "{} interaction {} ({}, status {}) is an undeclared {kind} failure",
+                    display_repo_path(&fixture),
+                    found.index,
+                    found.request,
+                    found.status
+                ));
+            }
+        }
+    }
+
+    assert!(
+        failures.is_empty(),
+        "account failures without a declaring cell:\n{}",
+        failures.join("\n")
+    );
+}
+
+/// Fixtures recorded before the recorder refused stored state: each stores a
+/// Responses response it never deletes. The cleanup pass removes that state;
+/// re-recording one of them must send `store: false` and drop its line.
+const STORED_STATE_GRANDFATHERED: &str = include_str!("stored_state_grandfathered.txt");
+
+/// A committed Responses fixture on a storing provider sends `store: false`
+/// or deletes what it stored in the same cassette, unless it predates the
+/// rule and is grandfathered. A grandfathered line that no longer stores
+/// state, or names no fixture, is stale and must go.
+#[test]
+fn stored_responses_are_deleted_or_grandfathered() {
+    let own = env!("CARGO_CRATE_NAME");
+    let grandfathered: BTreeSet<&str> = STORED_STATE_GRANDFATHERED
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect();
+    let root = Path::new(CASSETTE_ROOT);
+    let mut failures = Vec::new();
+    let mut storing = BTreeSet::new();
+    for fixture in collect_yaml_files(&root.join(own)) {
+        let contents = fs::read_to_string(&fixture).expect("cassette should be readable");
+        let stored = crate::cassettes::cassette_stored_state(own, &contents);
+        let relative = fixture
+            .strip_prefix(root)
+            .expect("fixture under the cassette root")
+            .display()
+            .to_string();
+        if stored.is_empty() {
+            continue;
+        }
+        storing.insert(relative.clone());
+        if !grandfathered.contains(relative.as_str()) {
+            failures.push(format!(
+                "{relative} stores responses it never deletes ({}): send `store: false` or \
+                 delete them in the same cassette",
+                stored.join(", ")
+            ));
+        }
+    }
+    for line in grandfathered
+        .iter()
+        .filter(|line| line.split('/').next() == Some(own))
+    {
+        if !storing.contains(*line) {
+            failures.push(format!(
+                "stored_state_grandfathered.txt lists {line}, which no longer stores state: \
+                 remove the line"
+            ));
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "stored Responses state check failed:\n{}",
+        failures.join("\n")
+    );
+}
+
+/// No cassette test compares a volatile key (one the recorder normalizes)
+/// exactly outside replay: such a comparison passes in CI and fails only on
+/// the next recording. Each binary checks its own provider's sources and the
+/// shared ones.
+#[test]
+fn volatile_keys_are_not_compared_exactly_outside_replay() {
+    let own = env!("CARGO_CRATE_NAME");
+    let mut failures = Vec::new();
+    for dir in [format!("tests/providers/{own}"), "tests/common".to_owned()] {
+        let dir = repo_path(&dir);
+        if !dir.exists() {
+            continue;
+        }
+        for source in collect_rust_files(&dir) {
+            let contents = fs::read_to_string(&source).expect("test source should be readable");
+            match rig_test_support::comparison_guard::exact_volatile_comparisons(
+                &contents,
+                crate::cassettes::volatile_json_keys(),
+            ) {
+                Ok(found) => failures.extend(
+                    found
+                        .into_iter()
+                        .map(|finding| format!("{}: {finding}", display_repo_path(&source))),
+                ),
+                Err(error) => failures.push(format!("{}: {error}", display_repo_path(&source))),
+            }
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "volatile keys compared exactly outside replay:\n{}",
+        failures.join("\n")
+    );
+}
+
 fn scan_dir(dir: &Path, failures: &mut Vec<String>) {
     for entry in fs::read_dir(dir).expect("cassette directory should be readable") {
         let entry = entry.expect("cassette directory entry should be readable");
@@ -399,6 +591,24 @@ fn scan_dir(dir: &Path, failures: &mut Vec<String>) {
 
         if path.is_dir() {
             scan_dir(&path, failures);
+            continue;
+        }
+
+        if let Some(stem) = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .and_then(|name| name.strip_suffix(".requests.json"))
+        {
+            // A request snapshot describes its fixture's recorded requests.
+            if !path.with_file_name(format!("{stem}.yaml")).is_file() {
+                failures.push(format!(
+                    "{} is a request snapshot with no fixture beside it; run \
+                     `cargo xtask cassette snapshots`",
+                    display_repo_path(&path)
+                ));
+            }
+            let contents = fs::read_to_string(&path).expect("snapshot should be readable as UTF-8");
+            failures.extend(crate::cassettes::artifact_safety_failures(&path, &contents));
             continue;
         }
 

@@ -1,49 +1,15 @@
 //! Moonshot AI (Kimi) endpoints and model identifiers.
 //!
-//! Moonshot serves the same models over two wires from two regions, so this
-//! module is data for all four combinations and nothing else:
+//! [`from_env`] and [`new`] build a client on the
+//! [`MOONSHOT`](crate::providers::openai::wire::MOONSHOT) dialect, the module's
+//! primary one; [`anthropic_from_env`] and [`anthropic_new`] build a
+//! Messages-format client. Environment configuration reads `MOONSHOT_API_KEY`.
 //!
-//! - the OpenAI chat-completions wire, as
-//!   [`openai::wire::MOONSHOT`](crate::providers::openai::wire::MOONSHOT)
-//!   (global) and
-//!   [`openai::wire::MOONSHOT_CHINA`](crate::providers::openai::wire::MOONSHOT_CHINA)
-//!   — one dialect at two base URLs, also serving the model listing
-//!   (`GET /models`). Its quirks are Moonshot's: `json_schema` response
-//!   formats are refused, a forced specific tool is an error, and
-//!   `tool_choice: "required"` is coerced to `auto` with a steering message;
-//! - the Anthropic Messages wire, as
-//!   [`anthropic::wire::MOONSHOT`](crate::providers::anthropic::wire::MOONSHOT),
-//!   whose China endpoint is [`CHINA_ANTHROPIC_API_BASE_URL`].
-//!
-//! Every combination reads `MOONSHOT_API_KEY`.
-//!
-//! A wire is the config plus a model; `.bind(transport)` (or `.bound()` from
-//! `rig-reqwest`) turns it into the model.
-//!
-//! # OpenAI-compatible example
 //! ```no_run
-//! use rig_core::providers::moonshot;
-//! use rig_core::providers::openai::wire::{MOONSHOT, MOONSHOT_CHINA, OpenAI};
-//!
-//! # fn run() -> Result<(), Box<dyn std::error::Error>> {
-//! let kimi = OpenAI::from_env_with(&MOONSHOT)?.chat(moonshot::KIMI_K3);
-//!
-//! // The China entrypoint is the same dialect at `CHINA_API_BASE_URL`.
-//! let china = OpenAI::from_env_with(&MOONSHOT_CHINA)?.chat(moonshot::KIMI_K3);
-//! # let _ = (kimi, china);
-//! # Ok(())
-//! # }
-//! ```
-//!
-//! # Anthropic-compatible example
-//! ```no_run
-//! use rig_core::providers::anthropic::wire::{Anthropic, MOONSHOT};
 //! use rig_core::providers::moonshot;
 //!
 //! # fn run() -> Result<(), Box<dyn std::error::Error>> {
-//! let kimi = Anthropic::from_env_with(&MOONSHOT)?
-//!     .with_base_url(moonshot::CHINA_ANTHROPIC_API_BASE_URL)
-//!     .messages(moonshot::KIMI_K3);
+//! let kimi = moonshot::from_env()?.chat(moonshot::KIMI_K3);
 //! # let _ = kimi;
 //! # Ok(())
 //! # }
@@ -58,17 +24,41 @@ pub const ANTHROPIC_API_BASE_URL: &str = "https://api.moonshot.ai/anthropic";
 /// China Anthropic-compatible base URL.
 pub const CHINA_ANTHROPIC_API_BASE_URL: &str = "https://api.moonshot.cn/anthropic";
 
-// Model IDs follow <https://platform.kimi.ai/docs/models>, which also lists the
-// discontinued `moonshot-v1-*`, `kimi-k2*` and `kimi-k2.5` IDs.
-
-/// Kimi K3 — flagship multimodal model with a 1M-token context window.
+/// Identifier for the Kimi K3 model.
 pub const KIMI_K3: &str = "kimi-k3";
 
-/// Kimi K2.7 Code — coding-focused model with a 256K context window.
+/// Identifier for the Kimi K2.7 Code model.
 pub const KIMI_K2_7_CODE: &str = "kimi-k2.7-code";
 
-/// Kimi K2.7 Code (high-speed) — faster-output variant of `kimi-k2.7-code`.
+/// Identifier for the high-speed Kimi K2.7 Code model.
 pub const KIMI_K2_7_CODE_HIGHSPEED: &str = "kimi-k2.7-code-highspeed";
 
-/// Kimi K2.6 — general-purpose multimodal model with thinking and non-thinking modes, 256K context.
+/// Identifier for the Kimi K2.6 model.
 pub const KIMI_K2_6: &str = "kimi-k2.6";
+
+/// Whether Kimi `model` reads images: Kimi K2 before K2.5 and the
+/// `moonshot-v1` text models do not; K2.5 and later, and `*-vision-*`, do.
+/// Every wire Moonshot serves applies this rule to an id the catalog does
+/// not list.
+pub(crate) fn reads_images(model: &str) -> bool {
+    !(model == "kimi-k2"
+        || model.starts_with("kimi-k2-")
+        || (model.starts_with("moonshot-v1") && !model.contains("vision")))
+}
+
+pub mod extension;
+
+/// The provider key: the dialect name, a reply's `Origin::provider` and
+/// the typed provider-options key.
+pub const PROVIDER_NAME: &str = "moonshot";
+
+crate::client::macros::openai_vendor!(crate::providers::openai::wire::MOONSHOT, "Moonshot");
+crate::client::macros::anthropic_vendor!(
+    crate::providers::anthropic::wire::MOONSHOT,
+    "Moonshot",
+    anthropic_from_env,
+    anthropic_new
+);
+
+#[cfg(test)]
+mod tests;

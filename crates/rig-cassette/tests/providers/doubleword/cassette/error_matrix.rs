@@ -10,69 +10,48 @@
 //! |---|---|---|---|
 //! | invalid key | 403 | 403 | nested `error` |
 //! | unknown model | 404 | 404 | nested `error` |
-//! | `temperature: 100` | 400 | 400 | top-level `message` / `type` / `code` |
+//! | `temperature: 100` | 400 | 400 | nested `error` |
+//!
+//! The out-of-range cells first recorded a flat top-level `message` / `type`
+//! / `code` envelope; Doubleword now answers them with the nested envelope
+//! too, so every failure class shares one shape.
 //!
 //! Streaming status failures open a rig stream successfully and surface the
-//! preserved `CompletionError` as its first in-band item. The matrix treats
+//! preserved `ProviderError` as its first in-band item. The matrix treats
 //! that as the streaming contract and proves the body/status match blocking.
 
 use futures::StreamExt;
-use rig::completion::{CompletionError, CompletionModel};
 use rig::error::ErrorReport;
+use rig::error::ProviderError;
 use rig::providers::doubleword;
+use rig_test_support::cassette_models::OpenAiModels;
 use serde_json::json;
 
 use super::super::support::{
-    BoundDoubleword, recorded_chat_calls, with_doubleword_bogus_key_cassette,
-    with_doubleword_cassette,
+    recorded_chat_calls, with_doubleword_bogus_key_cassette, with_doubleword_cassette,
 };
+use rig::completion::CompletionRequest;
 
 const PROMPT: &str = "Reply with error-probe.";
-const UNKNOWN_MODEL: &str = "rig/definitely-not-a-doubleword-model";
 
-#[derive(Clone, Copy, Debug)]
-enum ErrorEnvelope {
-    Nested,
-    Flat,
-}
-
-fn assert_error_envelope(json: &serde_json::Value, expected: ErrorEnvelope) {
+fn assert_nested_error_envelope(json: &serde_json::Value) {
     let has_nested_error = json.get("error").is_some_and(serde_json::Value::is_object);
     let has_flat_fields = ["message", "type", "code"]
         .iter()
         .all(|field| json.get(*field).is_some());
-
-    match expected {
-        ErrorEnvelope::Nested => assert!(
-            has_nested_error && !has_flat_fields,
-            "expected nested error envelope, got: {json}"
-        ),
-        ErrorEnvelope::Flat => assert!(
-            has_flat_fields && !has_nested_error,
-            "expected flat error envelope, got: {json}"
-        ),
-    }
-}
-
-fn assert_preserved_client_error(
-    error: &CompletionError,
-    expected_status: u16,
-    expected_envelope: ErrorEnvelope,
-) {
-    assert_preserved_client_error_report(
-        &ErrorReport::from(error),
-        expected_status,
-        expected_envelope,
+    assert!(
+        has_nested_error && !has_flat_fields,
+        "expected nested error envelope, got: {json}"
     );
 }
 
+fn assert_preserved_client_error(error: &ProviderError, expected_status: u16) {
+    assert_preserved_client_error_report(&ErrorReport::from(error), expected_status);
+}
+
 /// The streaming twin: an in-band stream failure is an `ErrorReport`, which
-/// carries the same preserved provider response as the `CompletionError`.
-fn assert_preserved_client_error_report(
-    report: &ErrorReport,
-    expected_status: u16,
-    expected_envelope: ErrorEnvelope,
-) {
+/// carries the same preserved provider response as the `ProviderError`.
+fn assert_preserved_client_error_report(report: &ErrorReport, expected_status: u16) {
     let status = report
         .provider_response_status()
         .expect("provider status should be preserved");
@@ -83,13 +62,12 @@ fn assert_preserved_client_error_report(
     assert!(!body.trim().is_empty());
     let json: serde_json::Value =
         serde_json::from_str(body).expect("Doubleword error body should be JSON");
-    assert_error_envelope(&json, expected_envelope);
+    assert_nested_error_envelope(&json);
 }
 
 fn assert_recorded_error(
     scenario: &str,
     expected_status: u16,
-    expected_envelope: ErrorEnvelope,
     request_field: Option<(&str, serde_json::Value)>,
 ) {
     let calls = recorded_chat_calls(scenario);
@@ -103,7 +81,7 @@ fn assert_recorded_error(
         .response_json
         .as_ref()
         .expect("recorded JSON error body");
-    assert_error_envelope(body, expected_envelope);
+    assert_nested_error_envelope(body);
     assert!(call.stream_chunks.is_empty());
 }
 
@@ -119,82 +97,35 @@ fn assert_recorded_transport_parity(blocking_scenario: &str, streaming_scenario:
     );
 }
 
-async fn unknown_model_blocking_body(client: BoundDoubleword) {
-    let model = client.completion(UNKNOWN_MODEL);
-    let error = model
-        .completion(model.completion_request(PROMPT).max_tokens(8).build())
-        .await
-        .expect_err("an unknown model should be rejected");
-    assert_preserved_client_error(&error, 404, ErrorEnvelope::Nested);
-}
-
-async fn unknown_model_streaming_body(client: BoundDoubleword) {
-    let model = client.completion(UNKNOWN_MODEL);
-    let result = model
-        .stream(model.completion_request(PROMPT).max_tokens(8).build())
-        .await;
-    let mut stream = result.expect("streaming HTTP failures are delivered in-band");
-    let error = loop {
-        match stream.next().await {
-            Some(Err(error)) => break error,
-            Some(Ok(_)) => continue,
-            None => panic!("unknown-model stream ended without its provider error"),
-        }
-    };
-    assert_preserved_client_error_report(&error, 404, ErrorEnvelope::Nested);
-}
-
-async fn invalid_key_blocking_body(client: BoundDoubleword) {
+async fn invalid_key_blocking_body(client: OpenAiModels) {
     let model = client.completion(doubleword::QWEN3_5_9B);
     let error = model
-        .completion(model.completion_request(PROMPT).max_tokens(8).build())
+        .call(CompletionRequest::new(PROMPT).max_tokens(8))
         .await
         .expect_err("invalid credentials should be rejected");
-    assert_preserved_client_error(&error, 403, ErrorEnvelope::Nested);
+    assert_preserved_client_error(&error, 403);
 }
 
-async fn invalid_key_streaming_body(client: BoundDoubleword) {
-    let model = client.completion(doubleword::QWEN3_5_9B);
-    let result = model
-        .stream(model.completion_request(PROMPT).max_tokens(8).build())
-        .await;
-    let mut stream = result.expect("streaming HTTP failures are delivered in-band");
-    let error = loop {
-        match stream.next().await {
-            Some(Err(error)) => break error,
-            Some(Ok(_)) => continue,
-            None => panic!("invalid-key stream ended without its provider error"),
-        }
-    };
-    assert_preserved_client_error_report(&error, 403, ErrorEnvelope::Nested);
-}
-
-async fn invalid_temperature_blocking_body(client: BoundDoubleword) {
+async fn invalid_temperature_blocking_body(client: OpenAiModels) {
     let model = client.completion(doubleword::QWEN3_5_9B);
     let error = model
-        .completion(
-            model
-                .completion_request(PROMPT)
+        .call(
+            CompletionRequest::new(PROMPT)
                 .additional_params(json!({ "temperature": 100 }))
-                .max_tokens(8)
-                .build(),
+                .max_tokens(8),
         )
         .await
         .expect_err("an out-of-range temperature should be rejected");
-    assert_preserved_client_error(&error, 400, ErrorEnvelope::Flat);
+    assert_preserved_client_error(&error, 400);
 }
 
-async fn invalid_temperature_streaming_body(client: BoundDoubleword) {
+async fn invalid_temperature_streaming_body(client: OpenAiModels) {
     let model = client.completion(doubleword::QWEN3_5_9B);
-    let result = model
-        .stream(
-            model
-                .completion_request(PROMPT)
-                .additional_params(json!({ "temperature": 100 }))
-                .max_tokens(8)
-                .build(),
-        )
-        .await;
+    let result = model.stream(
+        CompletionRequest::new(PROMPT)
+            .additional_params(json!({ "temperature": 100 }))
+            .max_tokens(8),
+    );
     let mut stream = result.expect("streaming HTTP failures are delivered in-band");
     let error = loop {
         match stream.next().await {
@@ -203,43 +134,7 @@ async fn invalid_temperature_streaming_body(client: BoundDoubleword) {
             None => panic!("invalid-temperature stream ended without its provider error"),
         }
     };
-    assert_preserved_client_error_report(&error, 400, ErrorEnvelope::Flat);
-}
-
-#[tokio::test]
-async fn unknown_model_blocking() {
-    const SCENARIO: &str = "error_matrix/unknown_model_blocking";
-    with_doubleword_cassette(
-        "error_matrix/unknown_model_blocking",
-        unknown_model_blocking_body,
-    )
-    .await;
-    assert_recorded_error(
-        SCENARIO,
-        404,
-        ErrorEnvelope::Nested,
-        Some(("model", json!(UNKNOWN_MODEL))),
-    );
-}
-
-#[tokio::test]
-async fn unknown_model_streaming() {
-    const SCENARIO: &str = "error_matrix/unknown_model_streaming";
-    with_doubleword_cassette(
-        "error_matrix/unknown_model_streaming",
-        unknown_model_streaming_body,
-    )
-    .await;
-    assert_recorded_error(
-        SCENARIO,
-        404,
-        ErrorEnvelope::Nested,
-        Some(("model", json!(UNKNOWN_MODEL))),
-    );
-    assert_recorded_transport_parity(
-        "error_matrix/unknown_model_blocking",
-        "error_matrix/unknown_model_streaming",
-    );
+    assert_preserved_client_error_report(&rig::ErrorReport::from(&error), 400);
 }
 
 #[tokio::test]
@@ -253,28 +148,7 @@ async fn invalid_key_blocking() {
     assert_recorded_error(
         SCENARIO,
         403,
-        ErrorEnvelope::Nested,
         Some(("model", json!(doubleword::QWEN3_5_9B))),
-    );
-}
-
-#[tokio::test]
-async fn invalid_key_streaming() {
-    const SCENARIO: &str = "error_matrix/invalid_key_streaming";
-    with_doubleword_bogus_key_cassette(
-        "error_matrix/invalid_key_streaming",
-        invalid_key_streaming_body,
-    )
-    .await;
-    assert_recorded_error(
-        SCENARIO,
-        403,
-        ErrorEnvelope::Nested,
-        Some(("model", json!(doubleword::QWEN3_5_9B))),
-    );
-    assert_recorded_transport_parity(
-        "error_matrix/invalid_key_blocking",
-        "error_matrix/invalid_key_streaming",
     );
 }
 
@@ -286,12 +160,7 @@ async fn invalid_temperature_blocking() {
         invalid_temperature_blocking_body,
     )
     .await;
-    assert_recorded_error(
-        SCENARIO,
-        400,
-        ErrorEnvelope::Flat,
-        Some(("temperature", json!(100))),
-    );
+    assert_recorded_error(SCENARIO, 400, Some(("temperature", json!(100))));
 }
 
 #[tokio::test]
@@ -302,12 +171,7 @@ async fn invalid_temperature_streaming() {
         invalid_temperature_streaming_body,
     )
     .await;
-    assert_recorded_error(
-        SCENARIO,
-        400,
-        ErrorEnvelope::Flat,
-        Some(("temperature", json!(100))),
-    );
+    assert_recorded_error(SCENARIO, 400, Some(("temperature", json!(100))));
     assert_recorded_transport_parity(
         "error_matrix/invalid_temperature_blocking",
         "error_matrix/invalid_temperature_streaming",

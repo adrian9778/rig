@@ -1,6 +1,6 @@
 {
   "header": {
-    "run_spec": 1030837007388641174,
+    "run_spec": 14716740328437968975,
     "handlers": [
       {
         "key": "golden/model:default",
@@ -19,11 +19,6 @@
     "hooks": [],
     "required": {
       "golden/model:default": "completion"
-    },
-    "bus": {
-      "command_capacity": 16,
-      "stream_capacity": 64,
-      "serial_per_handler": false
     }
   },
   "records": [
@@ -91,11 +86,7 @@
             {
               "type": "toolcall",
               "id": {
-                "origin": "explicit",
-                "id": "toolu_REDACTED_1"
-              },
-              "provider": {
-                "call_id": "toolu_REDACTED_1"
+                "provider": "toolu_01Nxkoi9aMtspRv56j85VWio"
               },
               "function": {
                 "name": "final_result",
@@ -105,8 +96,22 @@
                   "title": "Seattle Rust Meetup"
                 }
               },
-              "signature": null,
-              "additional_params": null
+              "native": {
+                "item": {
+                  "caller": {
+                    "type": "direct"
+                  },
+                  "id": "toolu_01Nxkoi9aMtspRv56j85VWio",
+                  "input": {
+                    "category": "Technology / Programming",
+                    "summary": "A local gathering for Rust programming language enthusiasts in Seattle. Attendees share projects, discuss best practices, explore new features of the Rust ecosystem, and network with fellow developers passionate about systems programming and memory-safe software development.",
+                    "title": "Seattle Rust Meetup"
+                  },
+                  "name": "final_result",
+                  "type": "tool_use"
+                },
+                "fingerprint": "f48d745167320145"
+              }
             }
           ],
           "usage": {
@@ -114,21 +119,32 @@
             "output_tokens": 141,
             "total_tokens": 820,
             "cached_input_tokens": 0,
-            "cache_creation_input_tokens": 0
+            "cache_creation_input_tokens": 0,
+            "cost": {
+              "input": 0.002037,
+              "output": 0.002115,
+              "cache_read": 0.0,
+              "cache_write": 0.0,
+              "total": 0.004152
+            }
           },
-          "message_id": "msg_REDACTED_1",
-          "response_id": null,
-          "provider_request_id": "req_REDACTED_1",
+          "origin": {
+            "api": "anthropic.messages",
+            "provider": "anthropic",
+            "model": "claude-sonnet-4-6",
+            "response_model": "claude-sonnet-4-6",
+            "response_id": "msg_011Cfio24Q4BiowNbq8Xy1Lr"
+          },
+          "provider_request_id": "req_011Cfio243DcxAJz8rxbVArb",
           "finish_reason": "tool_calls",
-          "provider": "anthropic",
-          "model": "claude-sonnet-4-6",
           "raw": {
+            "container": null,
             "content": [
               {
                 "caller": {
                   "type": "direct"
                 },
-                "id": "toolu_REDACTED_1",
+                "id": "toolu_01Nxkoi9aMtspRv56j85VWio",
                 "input": {
                   "category": "Technology / Programming",
                   "summary": "A local gathering for Rust programming language enthusiasts in Seattle. Attendees share projects, discuss best practices, explore new features of the Rust ecosystem, and network with fellow developers passionate about systems programming and memory-safe software development.",
@@ -138,7 +154,8 @@
                 "type": "tool_use"
               }
             ],
-            "id": "msg_REDACTED_1",
+            "diagnostics": null,
+            "id": "msg_011Cfio24Q4BiowNbq8Xy1Lr",
             "model": "claude-sonnet-4-6",
             "role": "assistant",
             "stop_details": null,

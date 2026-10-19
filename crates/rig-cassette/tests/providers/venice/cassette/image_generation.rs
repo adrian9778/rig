@@ -5,10 +5,10 @@
 //! request body is what pins that shape — a regression to OpenAI's
 //! `/images/generations` body would fail as a mock miss.
 
-use rig::image_generation::ImageGenerationModel;
 use rig::providers::venice;
 
 use super::super::support::with_venice_cassette;
+use rig::image_generation::ImageGenerationRequestBuilder;
 
 #[tokio::test]
 async fn image_generation_smoke() {
@@ -17,36 +17,37 @@ async fn image_generation_smoke() {
         |client| async move {
             let model = client.image_generation(venice::VENICE_SD35);
             let response = model
-                .image_generation_request()
-                .prompt("A lighthouse on a rocky cliff at sunrise, clean illustrative style.")
-                .width(256)
-                .height(256)
-                .additional_params(serde_json::json!({
-                    "format": "webp",
-                    "seed": 42,
-                    "steps": 4,
-                    "safe_mode": true,
-                    "embed_exif_metadata": false,
-                }))
-                .send()
+                .call(
+                    ImageGenerationRequestBuilder::new(
+                        "A lighthouse on a rocky cliff at sunrise, clean illustrative style.",
+                    )
+                    .width(256)
+                    .height(256)
+                    .additional_params(serde_json::json!({
+                        "format": "webp",
+                        "seed": 42,
+                        "steps": 4,
+                        "safe_mode": true,
+                        "embed_exif_metadata": false,
+                    }))
+                    .build(),
+                )
                 .await
                 .expect("Venice image generation should succeed");
 
-            assert!(
-                !response.image.is_empty(),
-                "expected decoded image bytes from the base64 payload"
+            assert_eq!(
+                crate::support::assert_image_bytes(&response.image),
+                crate::support::ImageContainer::Webp,
+                "the requested webp format reaches the bytes"
             );
             assert_eq!(response.provider, "venice");
-            let raw: rig::providers::venice::ImageGenerationResponse =
-                serde_json::from_value(response.raw)
-                    .expect("raw payload should round-trip to Venice's own type");
             assert!(
-                !raw.id.is_empty(),
+                response.raw["id"].as_str().is_some_and(|id| !id.is_empty()),
                 "expected Venice to report a generation id"
             );
             assert_eq!(
-                raw.images.len(),
-                1,
+                response.raw["images"].as_array().map(Vec::len),
+                Some(1),
                 "expected exactly one image for a single-variant request"
             );
         },

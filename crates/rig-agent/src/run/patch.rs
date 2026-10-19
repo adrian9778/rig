@@ -1,7 +1,12 @@
-//! A per-turn request patch: what a driver may change about one model call
-//! before [`prepare_request`](super::prepare::prepare_request)
-//! binds it — plain data, produced by hooks in rig-agent and by any other
-//! driver's equivalent.
+//! Per-turn overrides applied before request preparation without changing agent defaults.
+//!
+//! ```
+//! use rig_agent::run::patch::RequestPatch;
+//! let patch = RequestPatch::new().temperature(0.2).max_tokens(256);
+//! assert!(!patch.is_empty());
+//! ```
+
+use std::sync::Arc;
 
 use rig_core::completion::Document;
 use rig_core::message::{Message, ToolChoice};
@@ -38,7 +43,7 @@ pub struct RequestPatch {
     /// Context documents appended to the request for this turn.
     pub extra_context: Vec<Document>,
     /// Conversation history to use instead of the current history for this turn.
-    pub history: Option<Vec<Message>>,
+    pub history: Option<Vec<Arc<Message>>>,
 }
 
 fn merge_last_wins<T>(earlier: Option<T>, later: Option<T>, field: &str) -> Option<T> {
@@ -121,9 +126,9 @@ impl RequestPatch {
     /// Replaces the conversation history for this turn.
     pub fn history<I>(mut self, values: I) -> Self
     where
-        I: IntoIterator<Item = Message>,
+        I: IntoIterator<Item: Into<Arc<Message>>>,
     {
-        self.history = Some(values.into_iter().collect());
+        self.history = Some(values.into_iter().map(Into::into).collect());
         self
     }
 

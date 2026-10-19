@@ -16,6 +16,14 @@ signatures, module paths, and feature flags.
 - Do not make commits, comments, stage changes, push branches, or open PRs unless the user explicitly asks.
 - Do not discard user changes.
 
+## Fast Loop
+
+- Iterate with `cargo nextest run --locked --profile local -p <crate> [filter]`;
+  leave workspace-wide and facade `--all-features` runs to CI.
+- Before pushing, run `cargo xtask verify --affected --base origin/main`: every
+  test of the changed packages and of the packages depending on them.
+- Keep incremental compilation on.
+
 ## Efficient Investigation
 
 - Reuse instructions and unchanged source already in context. Read the relevant
@@ -36,10 +44,12 @@ signatures, module paths, and feature flags.
 - Core crate: `crates/rig-core`
 - Companion provider, vector-store, memory, and integration crates: `crates/rig-*`
 - Derive macros: `crates/rig-derive`
+- The rig coding agent: its core `crates/rig-harness` (on `crates/rig-ecs` and `crates/rig-tools`), its plugin crates `plugins/rig-*`, their shared test support `test-support/rig-harness-test-support`, and `test-support/rig-defaults-test-support` (the default plugins for tests, and the test that each can be left out); all but the two test-support crates are published
+- The plugin corpus `corpus/*`: plugins written against the harness's public API that shaped and prove the kernel, one per module (`src/<plugin>.rs` with its tests in `src/<plugin>/tests.rs`) of a few `publish = false` packages named `corpus-<directory>` (`shared`, which the others build on; `base`; one per held-out series; `library`, programs with no Bevy), so their tests link nine binaries, not one per plugin. CI builds, lints and tests every one, so a kernel change that breaks one fails CI
 - Verification planner and source-tree checks: `xtask/`
 - Workspace example packages: `examples/*`; per-crate examples: `crates/<crate>/examples/`
 - Root integration test targets: `tests/*.rs`
-- Record/replay home: `crates/rig-cassette` — the engine (`src/`), the provider cassette corpus (`fixtures/cassettes/<provider>/`), the effect-log golden corpus (`fixtures/effects/`), every cassette-backed provider target (`tests/<provider>.rs` with `tests/providers/<provider>/` and the shared drivers in `tests/common/`), the cache-prefix guard, and the effect-bus verification targets `verify` and `world_replay`. Corpora and `tests/` are excluded from the published package.
+- Record/replay home: `crates/rig-cassette` — the engine (`src/`), the provider cassette corpus (`fixtures/cassettes/<provider>/`), the effect-log golden corpus (`fixtures/effects/`), every cassette-backed provider target (`tests/<provider>.rs` with `tests/providers/<provider>/` and the shared drivers in `tests/common/`), the cache-prefix guard, and the effect-bus verification target `verify`. Corpora and `tests/` are excluded from the published package.
 - Live-only provider test modules stay in the facade: `tests/providers/<provider>/`, driven by `tests/<provider>.rs`
 - External-service integration tests: `tests/integrations/`
 - Unpublished vector-store test runner: `test-support/service-tests`
@@ -61,6 +71,7 @@ types do.
 
 - Do not use `String` as an error type for new fallible APIs;
 - Workspace clippy lints forbid `unwrap`, `expect`, `todo`, and `unimplemented`.
+- Tests are linted too: `indexing_slicing` and `panic_in_result_fn` apply in test code, so index with `.get(..)`, and do not assert in a test that returns `Result`.
 - Prefer `?` and meaningful error conversions.
 
 ## Documentation
@@ -93,7 +104,19 @@ errors, and use the WASM-compatible bounds.
 
 ## Style
 
-- Comments should explain why, not restate what the code does.
+- Module docs state the module's purpose in at most three paragraphs and include
+  one short example when there is a public entry point. No headers, tables,
+  history, or rhetorical phrasing.
+- Item docs state the contract, inputs, outputs, errors, and caller invariants.
+  Allow one sentence of non-obvious rationale. No issue numbers, bug narratives,
+  or comparisons with other providers.
+- Inline comments explain a non-obvious why in one or two sentences. Delete
+  restated code, control-flow narration, and design discussions.
+- Use short sentences and no em-dashes. Keep true `# Safety` and `# Panics`
+  sections. Doc examples must compile with current APIs; use `no_run` for
+  credentials, network access, or services.
+- Move needed design rationale to the crate's CONTRACT.md or README, checking
+  for and merging existing coverage rather than duplicating it.
 - Follow local naming, module layout, and test patterns.
 - Test modules are sibling files, never inline blocks: write
   `#[cfg(test)] mod tests;` and put the body in `foo/tests.rs` (for `foo.rs`)

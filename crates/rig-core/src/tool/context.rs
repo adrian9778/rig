@@ -1,141 +1,22 @@
-//! Typed per-call context passed through tool execution.
+//! Typed inbound context and explicitly published host-only tool-result metadata.
 //!
-//! A runtime hands every tool call a [`ToolContext`]: a serde map of typed
-//! inbound values (auth tokens, session ids, request metadata the model never
-//! sees) plus a serde result map a tool can publish host-only data into. rig-agent's
-//! contextual tools, context-aware [`PortableDynamicTool`](super::PortableDynamicTool)s,
-//! and companion adapters (e.g. MCP `_meta` passthrough in `rig-rmcp`) all
-//! share this one type, so the same values flow regardless of runtime.
+//! ```
+//! use rig_core::tool::{ContextValue, ToolContext};
+//! #[derive(serde::Serialize, serde::Deserialize)]
+//! struct Session(String);
+//! impl ContextValue for Session { const KEY: &'static str = "session"; }
+//! let mut context = ToolContext::new();
+//! context.insert(Session("example".into()))?;
+//! assert_eq!(context.require::<Session>()?.0, "example");
+//! # Ok::<(), rig_core::tool::ToolContextError>(())
+//! ```
 
-use std::any::{Any, TypeId};
-use std::collections::{BTreeMap, HashMap};
-use std::hash::{BuildHasherDefault, Hasher};
+use std::any::Any;
+use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 use super::ToolExecutionError;
-use crate::wasm_compat::{WasmCompatSend, WasmCompatSync};
-
-type AnyMap = HashMap<TypeId, Box<dyn AnyClone>, BuildHasherDefault<IdHasher>>;
-
-#[derive(Default)]
-struct IdHasher(u64);
-
-impl Hasher for IdHasher {
-    fn write_u64(&mut self, id: u64) {
-        self.0 = id;
-    }
-
-    fn write(&mut self, bytes: &[u8]) {
-        for &byte in bytes {
-            self.0 = self.0.rotate_left(8) ^ u64::from(byte);
-        }
-    }
-
-    fn finish(&self) -> u64 {
-        self.0
-    }
-}
-
-trait AnyClone: Any + WasmCompatSend + WasmCompatSync {
-    fn clone_box(&self) -> Box<dyn AnyClone>;
-    fn as_any(&self) -> &dyn Any;
-    fn as_any_mut(&mut self) -> &mut dyn Any;
-    fn into_any(self: Box<Self>) -> Box<dyn Any>;
-}
-
-impl<T> AnyClone for T
-where
-    T: Clone + WasmCompatSend + WasmCompatSync + 'static,
-{
-    fn clone_box(&self) -> Box<dyn AnyClone> {
-        Box::new(self.clone())
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn as_any_mut(&mut self) -> &mut dyn Any {
-        self
-    }
-
-    fn into_any(self: Box<Self>) -> Box<dyn Any> {
-        self
-    }
-}
-
-impl Clone for Box<dyn AnyClone> {
-    fn clone(&self) -> Self {
-        (**self).clone_box()
-    }
-}
-
-/// A clone-on-dispatch map of live values keyed by type. Not the storage
-/// behind [`ToolContext`] (which is serde data); runtimes use it for
-/// in-process per-run state that never crosses a wire (rig-agent's hook state
-/// does).
-#[derive(Default, Clone)]
-pub struct TypeMap {
-    map: AnyMap,
-}
-
-impl TypeMap {
-    pub fn insert<T>(&mut self, value: T) -> Option<T>
-    where
-        T: Clone + WasmCompatSend + WasmCompatSync + 'static,
-    {
-        self.map
-            .insert(TypeId::of::<T>(), Box::new(value))
-            .and_then(|previous| previous.into_any().downcast::<T>().ok())
-            .map(|value| *value)
-    }
-
-    pub fn get<T>(&self) -> Option<&T>
-    where
-        T: 'static,
-    {
-        self.map
-            .get(&TypeId::of::<T>())
-            .and_then(|value| (**value).as_any().downcast_ref::<T>())
-    }
-
-    pub fn get_mut<T>(&mut self) -> Option<&mut T>
-    where
-        T: 'static,
-    {
-        self.map
-            .get_mut(&TypeId::of::<T>())
-            .and_then(|value| (**value).as_any_mut().downcast_mut::<T>())
-    }
-
-    pub fn remove<T>(&mut self) -> Option<T>
-    where
-        T: 'static,
-    {
-        self.map
-            .remove(&TypeId::of::<T>())
-            .and_then(|value| value.into_any().downcast::<T>().ok())
-            .map(|value| *value)
-    }
-
-    pub fn contains<T>(&self) -> bool
-    where
-        T: 'static,
-    {
-        self.map.contains_key(&TypeId::of::<T>())
-    }
-
-    /// Number of values held.
-    pub fn len(&self) -> usize {
-        self.map.len()
-    }
-
-    /// Whether the map holds no values.
-    pub fn is_empty(&self) -> bool {
-        self.map.is_empty()
-    }
-}
 
 /// Context passed to every tool execution.
 ///
@@ -168,12 +49,8 @@ pub struct ToolContext {
     inbound: BTreeMap<String, serde_json::Value>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     result: BTreeMap<String, serde_json::Value>,
-    /// The driver's scopes for the call — not data: never on the wire, not
-    /// part of equality, dropped by the adapter before the result is
-    /// resolved. The adapter copies them from the sink it serves
-    /// (`Dispatch::scopes`) so a tool can reach its runtime by type —
-    /// rig-agent's bus hands a `Dispatcher` whose every dispatch, and every agent
-    /// built over it, descends from this call. Empty for an inline call.
+    /// Live runtime scopes, excluded from serialization and equality.
+    /// Publication clears them before the result is resolved.
     #[serde(skip)]
     scopes: Vec<std::sync::Arc<dyn Any + Send + Sync>>,
 }
@@ -208,15 +85,9 @@ impl PartialEq for ToolContext {
 
 impl Eq for ToolContext {}
 
-/// A value that may be stored in a [`ToolContext`]: serde data under a key
-/// the type declares. The key is what survives a refactor, a persisted
-/// effect log (`rig_cassette::effect_log`), or a different toolchain —
-/// unlike `std::any::type_name`, which changes with a rename or a module
-/// move and is not stable across compiler versions.
-///
-/// Derive it (`#[derive(ContextValue)]`, key defaults to the type's name;
-/// `#[context(key = "…")]` overrides) or write the one-line impl. Two
-/// value types must not share a key.
+/// Serializable context data with a stable slot key. Distinct value types must
+/// use distinct keys, and persisted keys must remain stable across schema changes.
+/// The derive macro defaults to the type name; `#[context(key = "…")]` overrides it.
 #[diagnostic::on_unimplemented(
     message = "`{Self}` declares no `ToolContext` key",
     label = "not a `ContextValue`",
@@ -230,21 +101,19 @@ pub trait ContextValue: Serialize + DeserializeOwned + 'static {
 fn encode<T: ContextValue>(value: &T) -> Result<serde_json::Value, ToolContextError> {
     serde_json::to_value(value).map_err(|error| ToolContextError::Encode {
         key: T::KEY,
-        message: error.to_string(),
+        source: error,
     })
 }
 
 fn decode<T: ContextValue>(value: &serde_json::Value) -> Result<T, ToolContextError> {
-    serde_json::from_value(value.clone()).map_err(|error| ToolContextError::Decode {
+    T::deserialize(value).map_err(|error| ToolContextError::Decode {
         key: T::KEY,
-        message: error.to_string(),
+        source: error,
     })
 }
 
-/// Store `value`; the value it displaced when that decodes as `T`. A slot
-/// holding something that does not decode as `T` is simply replaced: the
-/// write succeeded, and a shape mismatch is a defect at the writer, not a
-/// reason to unwind the caller after the fact.
+/// Replaces a slot after successful encoding, returning the displaced value
+/// only if it decodes as `T`.
 fn insert_slot<T: ContextValue>(
     map: &mut BTreeMap<String, serde_json::Value>,
     value: T,
@@ -263,12 +132,6 @@ fn get_slot<T: ContextValue>(
     map.get(T::KEY).map(decode).transpose()
 }
 
-fn require_slot<T: ContextValue>(
-    map: &BTreeMap<String, serde_json::Value>,
-) -> Result<T, ToolContextError> {
-    get_slot(map)?.ok_or(ToolContextError::Missing(T::KEY))
-}
-
 impl ToolContext {
     /// Create an empty context.
     pub const fn new() -> Self {
@@ -283,8 +146,7 @@ impl ToolContext {
     /// as `T`. A differently shaped displaced value is replaced successfully and
     /// returns `None`; decoding the previous value cannot undo a successful write.
     ///
-    /// Fails only when `value` cannot be represented as JSON (a map with
-    /// non-string keys, a float `NaN`).
+    /// Returns an encoding error if serialization fails, leaving the slot unchanged.
     pub fn insert<T: ContextValue>(&mut self, value: T) -> Result<Option<T>, ToolContextError> {
         insert_slot(&mut self.inbound, value)
     }
@@ -297,7 +159,7 @@ impl ToolContext {
 
     /// Require an inbound typed value.
     pub fn require<T: ContextValue>(&self) -> Result<T, ToolContextError> {
-        require_slot(&self.inbound)
+        get_slot(&self.inbound)?.ok_or(ToolContextError::Missing(T::KEY))
     }
 
     /// Remove an inbound typed value. The slot is removed even if decoding its
@@ -320,11 +182,6 @@ impl ToolContext {
     /// Read host-only result metadata.
     pub fn result<T: ContextValue>(&self) -> Result<Option<T>, ToolContextError> {
         get_slot(&self.result)
-    }
-
-    /// Require host-only result metadata.
-    pub fn require_result<T: ContextValue>(&self) -> Result<T, ToolContextError> {
-        require_slot(&self.result)
     }
 
     /// Whether this context contains the inbound type `T`.
@@ -360,8 +217,7 @@ impl ToolContext {
         self
     }
 
-    /// The driver's scope of type `T` for the call, if the driver attached
-    /// one; `None` inline, or under another runtime.
+    /// Returns the first attached scope of type `T`, or `None` if absent.
     pub fn scope<T: Any + Send + Sync>(&self) -> Option<std::sync::Arc<T>> {
         self.scopes
             .iter()
@@ -382,6 +238,11 @@ impl ToolContext {
     /// Snapshot only the values explicitly published with `insert_result`.
     pub fn result_context(&self) -> ToolResultContext {
         ToolResultContext(self.result.clone())
+    }
+
+    /// The values explicitly published with `insert_result`, taken.
+    pub fn into_result_context(self) -> ToolResultContext {
+        ToolResultContext(self.result)
     }
 
     /// Restore durable output while preserving this dispatch's inbound values.
@@ -405,11 +266,12 @@ impl std::fmt::Debug for ToolContext {
     }
 }
 
-/// What a tool published into its dispatch context, handed back beside the
-/// sink rather than on the wire: the driver attaches an empty one to the
-/// sink's scope (`Dispatch::with_scope`), the adapter fills it once the
-/// tool ran, the driver reads it after the outcome. One per dispatch; a
-/// second publish replaces the first.
+/// What one dispatch published beside its answer, passed back beside the
+/// sink rather than on the wire. A tool's adapter fills it with the tool's
+/// whole context (a second publish replaces the first); any other layer,
+/// such as a stream rewrite
+/// ([`ErasedHandler::map_stream`](crate::serve::ErasedHandler::map_stream)),
+/// adds single facts with [`insert`](Self::insert).
 #[derive(Debug, Default)]
 pub struct PublishedContext(std::sync::Mutex<Option<ToolContext>>);
 
@@ -441,6 +303,22 @@ impl PublishedContext {
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(context);
     }
 
+    /// Adds `value` to what is published, beside what is there, as
+    /// [`ToolContext::insert_result`] does, and returns the value it
+    /// replaced. Publish before the dispatch's answer is resolved, as for
+    /// [`publish`](Self::publish).
+    ///
+    /// # Errors
+    ///
+    /// When `value` cannot be encoded; nothing changes then.
+    pub fn insert<T: ContextValue>(&self, value: T) -> Result<Option<T>, ToolContextError> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get_or_insert_with(ToolContext::new)
+            .insert_result(value)
+    }
+
     /// The driver's read: what was published, if anything, leaving nothing.
     pub fn take(&self) -> Option<ToolContext> {
         self.0
@@ -451,26 +329,28 @@ impl PublishedContext {
 }
 
 /// A [`ToolContext`] slot could not be read or written.
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[derive(Debug, thiserror::Error)]
 pub enum ToolContextError {
     /// A required typed value was absent.
     #[error("required tool context value `{0}` was not found")]
     Missing(&'static str),
     /// A value could not be represented as JSON.
-    #[error("tool context value `{key}` could not be encoded: {message}")]
+    #[error("tool context value `{key}` could not be encoded: {source}")]
     Encode {
         /// The slot's type name.
         key: &'static str,
-        /// The serializer's message.
-        message: String,
+        /// The serializer's failure.
+        #[source]
+        source: serde_json::Error,
     },
     /// A stored value could not be decoded as the requested type.
-    #[error("tool context value `{key}` could not be decoded: {message}")]
+    #[error("tool context value `{key}` could not be decoded: {source}")]
     Decode {
         /// The slot's type name.
         key: &'static str,
-        /// The deserializer's message.
-        message: String,
+        /// The deserializer's failure.
+        #[source]
+        source: serde_json::Error,
     },
 }
 

@@ -1,79 +1,75 @@
-use crate::completion::CompletionModel;
 use google_cloud_aiplatform_v1 as vertexai;
-use google_cloud_auth::credentials;
+use google_cloud_auth::build_errors;
 use google_cloud_auth::credentials::Credentials;
-use rig_core::client::VerifyError;
-use rig_core::driver::CompletionProvider;
+use google_cloud_gax::client_builder;
 use std::sync::Arc;
 use thiserror::Error;
 use tokio::sync::OnceCell;
 
+use crate::anthropic::RawPredict;
+use crate::auth::build_credentials;
+use crate::completion::GenerateContent;
+use rig_core::Model;
+use rig_core::http_client::{DynHttpClient, HttpClientExt};
+
 // Env vars and terminology (location, project) chosen to match google genai client
 // https://googleapis.github.io/python-genai/genai.html#genai.client.Client
 
-/// Default location for Vertex AI Gemini models.
-///
-/// The `global` endpoint is recommended for Gemini models as it provides higher availability
-/// and reduces resource exhaustion errors. Regional endpoints (e.g., `us-central1`, `europe-west4`)
-/// are also supported and can be specified via `ClientBuilder::with_location()`.
-/// Regional endpoints may be preferred for data residency requirements or to use regional quotas.
+/// Default model-resource location, used when neither the builder nor environment sets one.
 pub const DEFAULT_LOCATION: &str = "global";
 
 #[derive(Clone, Debug, Error)]
 pub enum VertexAiClientError {
     #[error(
-        "Google Cloud project is required. Set it via `ClientBuilder::with_project()` or `GOOGLE_CLOUD_PROJECT`"
+        "Google Cloud project is required. Set it via `VertexAiBuilder::with_project()` or `GOOGLE_CLOUD_PROJECT`"
     )]
     MissingProject,
-    #[error("failed to build source credentials: {0}")]
-    SourceCredentials(String),
-    #[error("failed to build impersonated credentials: {0}")]
-    ImpersonatedCredentials(String),
-    #[error("failed to build Vertex AI prediction service: {0}")]
-    PredictionService(String),
     #[error(
-        "Vertex AI uses Application Default Credentials (ADC). Use `Client::from_env()` for default credentials or `Client::builder().with_credentials(...).build()` for explicit credentials."
+        "construct Vertex ADC credentials inside a Tokio runtime context; the host must retain and drive that runtime"
     )]
-    InvalidInput,
-}
-
-/// Helper function to build credentials with optional service account impersonation.
-fn build_credentials(
-    explicit_creds: Option<Credentials>,
-) -> Result<Credentials, VertexAiClientError> {
-    if let Some(creds) = explicit_creds {
-        Ok(creds)
-    } else {
-        // Build default credentials
-        let source_credentials = credentials::Builder::default()
-            .build()
-            .map_err(|e| VertexAiClientError::SourceCredentials(e.to_string()))?;
-
-        // Check for service account impersonation
-        if let Ok(service_account) = std::env::var("GOOGLE_CLOUD_SERVICE_ACCOUNT") {
-            credentials::impersonated::Builder::from_source_credentials(source_credentials)
-                .with_target_principal(service_account)
-                .build()
-                .map_err(|e| VertexAiClientError::ImpersonatedCredentials(e.to_string()))
-        } else {
-            Ok(source_credentials)
-        }
-    }
+    RuntimeRequired,
+    /// Application Default Credentials could not be resolved.
+    #[error("failed to build source credentials")]
+    SourceCredentials(#[source] Arc<build_errors::Error>),
+    /// `GOOGLE_CLOUD_SERVICE_ACCOUNT` impersonation could not be set up.
+    #[error("failed to build impersonated credentials")]
+    ImpersonatedCredentials(#[source] Arc<build_errors::Error>),
+    /// The SDK prediction service could not be built. Shared through `Arc`
+    /// because every clone of a client reports the same cached failure.
+    #[error("failed to build Vertex AI prediction service")]
+    PredictionService(#[source] Arc<client_builder::Error>),
+    #[error(
+        "a supplied `PredictionService` already carries its own credentials; drop either `VertexAiBuilder::with_credentials()` or `VertexAiBuilder::with_prediction_service()`"
+    )]
+    ConflictingCredentials,
+    /// A Claude request needs Google credentials, which a client built on a
+    /// supplied prediction service does not hold.
+    #[error(
+        "Claude requests need Google credentials; build the client without `VertexAiBuilder::with_prediction_service()`"
+    )]
+    NoCredentials,
+    /// The credentials produced no request headers.
+    #[error("failed to get Google credentials headers")]
+    Credentials(#[source] Arc<google_cloud_auth::errors::CredentialsError>),
 }
 
 #[derive(Clone, Debug)]
-pub struct ClientBuilder {
+pub struct VertexAiBuilder {
     project: Option<String>,
     location: Option<String>,
     credentials: Option<Credentials>,
+    prediction_service: Option<vertexai::client::PredictionService>,
+    http: Option<DynHttpClient>,
 }
 
-impl ClientBuilder {
+impl VertexAiBuilder {
     pub fn new() -> Self {
         Self {
             project: None,
             location: None,
             credentials: None,
+            prediction_service: None,
+            http: None,
         }
     }
 
@@ -103,10 +99,55 @@ impl ClientBuilder {
         self
     }
 
+    /// Use a Vertex AI prediction service the host already built.
+    ///
+    /// The SDK client carries its own endpoint, credentials, transport,
+    /// retry and universe-domain settings: this crate takes it as given and
+    /// never rebuilds it, resolves Application Default Credentials for it, or
+    /// picks an endpoint of its own. `project` and `location` still have to be
+    /// configured here (explicitly or from the environment), because they name
+    /// the model resource in the request rather than the connection.
+    ///
+    /// Combining this with [`Self::with_credentials`] makes [`Self::build`]
+    /// return [`VertexAiClientError::ConflictingCredentials`].
+    ///
+    /// ```no_run
+    /// # use google_cloud_aiplatform_v1::client::PredictionService;
+    /// # async fn example() -> anyhow::Result<()> {
+    /// let service = PredictionService::builder()
+    ///     .with_endpoint("https://us-central1-aiplatform.googleapis.com")
+    ///     .build()
+    ///     .await?;
+    /// let client = rig_vertexai::VertexAi::builder()
+    ///     .with_project("my-project")
+    ///     .with_location("us-central1")
+    ///     .with_prediction_service(service)
+    ///     .build()?;
+    /// # let _ = client;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn with_prediction_service(
+        mut self,
+        prediction_service: vertexai::client::PredictionService,
+    ) -> Self {
+        self.prediction_service = Some(prediction_service);
+        self
+    }
+
+    /// Send Claude requests through `http` instead of the shared reqwest
+    /// client. Gemini requests always go through the prediction service.
+    pub fn with_http_client(mut self, http: impl HttpClientExt + 'static) -> Self {
+        self.http = Some(DynHttpClient::new(http));
+        self
+    }
+
     /// Build the client with the configured values, falling back to environment variables where not set.
     ///
-    /// The Vertex AI client is built lazily on first use via `inner()`.
-    pub fn build(self) -> Result<Client, VertexAiClientError> {
+    /// Without a supplied prediction service this resolves credentials now
+    /// (see [`VertexAi::from_env`] for the runtime that entails) and builds the
+    /// Vertex AI client lazily on first use via [`VertexAi::inner`].
+    pub fn build(self) -> Result<VertexAi, VertexAiClientError> {
         let project = self
             .project
             .or_else(|| std::env::var("GOOGLE_CLOUD_PROJECT").ok())
@@ -117,60 +158,63 @@ impl ClientBuilder {
             .or_else(|| std::env::var("GOOGLE_CLOUD_LOCATION").ok())
             .unwrap_or_else(|| DEFAULT_LOCATION.to_string());
 
-        let credentials = build_credentials(self.credentials)?;
+        let service = match self.prediction_service {
+            Some(prediction_service) => {
+                if self.credentials.is_some() {
+                    return Err(VertexAiClientError::ConflictingCredentials);
+                }
+                PredictionServiceSource::Supplied(prediction_service)
+            }
+            None => PredictionServiceSource::Deferred {
+                credentials: build_credentials(self.credentials)?,
+                client: Arc::new(OnceCell::new()),
+            },
+        };
 
-        Ok(Client {
+        Ok(VertexAi {
             project,
             location,
-            credentials,
-            vertex_client: Arc::new(OnceCell::new()),
+            service,
+            http: self.http.unwrap_or_else(rig_reqwest::shared),
         })
     }
 }
 
-impl Default for ClientBuilder {
+impl Default for VertexAiBuilder {
     fn default() -> Self {
         Self::new()
     }
 }
 
+/// Supplied or lazily initialized prediction service.
+/// Construction does not verify connectivity or authenticate requests.
 #[derive(Clone, Debug)]
-pub struct Client {
-    project: String,
-    location: String,
-    credentials: Credentials,
-    pub(crate) vertex_client:
-        Arc<OnceCell<Result<vertexai::client::PredictionService, VertexAiClientError>>>,
+enum PredictionServiceSource {
+    /// Builds the SDK client on first use and shares the completed result,
+    /// including errors, across clones. Correcting settings requires a new client.
+    Deferred {
+        credentials: Credentials,
+        client: Arc<OnceCell<Result<vertexai::client::PredictionService, VertexAiClientError>>>,
+    },
+    /// The host built the SDK client and owns its lifetime, endpoint and
+    /// credentials. Cancelling one completion never touches it.
+    Supplied(vertexai::client::PredictionService),
 }
 
-impl Client {
-    /// Create a new client builder that uses environment variables as defaults.
-    ///
-    /// You can override any values using the builder methods:
-    /// - `.with_project()` - override project
-    /// - `.with_location()` - override location
-    /// - `.with_credentials()` - override credentials
-    ///
-    /// Example:
-    /// ```no_run
-    /// # use rig_vertexai::Client;
-    /// # fn example() -> Result<(), rig_vertexai::client::VertexAiClientError> {
-    /// // Use all env vars
-    /// let client = Client::builder().build()?;
-    ///
-    /// // Override just the location
-    /// let client = Client::builder().with_location("us-central1").build()?;
-    ///
-    /// // Override project and location
-    /// let client = Client::builder()
-    ///     .with_project("my-project")
-    ///     .with_location("us-central1")
-    ///     .build()?;
-    /// # Ok(())
-    /// # }
-    /// ```
-    pub fn builder() -> ClientBuilder {
-        ClientBuilder::new()
+#[derive(Clone, Debug)]
+pub struct VertexAi {
+    project: String,
+    location: String,
+    service: PredictionServiceSource,
+    /// The HTTP transport Claude requests travel on.
+    http: DynHttpClient,
+}
+
+impl VertexAi {
+    /// Creates a builder using environment values for unset project and location.
+    /// See [`VertexAiBuilder::build`] for credential and runtime requirements.
+    pub fn builder() -> VertexAiBuilder {
+        VertexAiBuilder::new()
     }
 
     /// Create a new client using environment variables for project, location, and credentials.
@@ -181,7 +225,7 @@ impl Client {
     /// - `GOOGLE_CLOUD_SERVICE_ACCOUNT` (optional, for service account impersonation)
     ///
     pub fn new() -> Result<Self, VertexAiClientError> {
-        ClientBuilder::new().build()
+        VertexAiBuilder::new().build()
     }
 
     /// Create a client using environment variables for project, location, and credentials.
@@ -190,15 +234,28 @@ impl Client {
     /// - `GOOGLE_CLOUD_PROJECT` (required)
     /// - `GOOGLE_CLOUD_LOCATION` (optional, defaults to "global")
     /// - `GOOGLE_CLOUD_SERVICE_ACCOUNT` (optional, for service account impersonation)
+    ///
+    /// Requires a Tokio runtime context or returns [`VertexAiClientError::RuntimeRequired`].
+    /// Keep that runtime alive and driven for the client's lifetime: credential
+    /// construction spawns a refresh task on it. A supplied service through
+    /// [`VertexAiBuilder::with_prediction_service`] bypasses credential resolution.
     pub fn from_env() -> Result<Self, VertexAiClientError> {
-        Client::new()
+        VertexAi::new()
     }
 
-    /// Vertex AI exposes no credential-check endpoint: Application Default
-    /// Credentials are validated on first use, so there is nothing to call
-    /// here.
-    pub async fn verify(&self) -> Result<(), VerifyError> {
-        Ok(())
+    /// The `GenerateContent` model for `model`.
+    pub fn completion(&self, model: impl Into<String>) -> Model<GenerateContent, Self> {
+        Model::new(GenerateContent::new(model), self.clone())
+    }
+
+    /// The Claude model `model` (`claude-sonnet-4-6`,
+    /// `claude-haiku-4-5@20251001`), served through the `anthropic`
+    /// publisher. See [`crate::anthropic`].
+    pub fn anthropic(&self, model: impl Into<String>) -> Model<RawPredict, Self> {
+        Model::new(
+            RawPredict::new(&self.project, &self.location, model),
+            self.clone(),
+        )
     }
 
     pub fn project(&self) -> &str {
@@ -209,27 +266,41 @@ impl Client {
         &self.location
     }
 
-    pub async fn inner(&self) -> Result<&vertexai::client::PredictionService, VertexAiClientError> {
-        let credentials = self.credentials.clone();
-        self.vertex_client
-            .get_or_init(|| async {
-                let mut builder = vertexai::client::PredictionService::builder();
-                builder = builder.with_credentials(credentials);
-                builder
-                    .build()
-                    .await
-                    .map_err(|error| VertexAiClientError::PredictionService(error.to_string()))
-            })
-            .await
-            .as_ref()
-            .map_err(Clone::clone)
+    /// The Google credentials this client resolved; `None` for a client
+    /// built on a supplied prediction service.
+    pub fn credentials(&self) -> Option<&Credentials> {
+        match &self.service {
+            PredictionServiceSource::Deferred { credentials, .. } => Some(credentials),
+            PredictionServiceSource::Supplied(_) => None,
+        }
     }
-}
 
-impl CompletionProvider for Client {
-    type Model = CompletionModel;
+    /// The HTTP transport Claude requests travel on.
+    pub(crate) fn http(&self) -> &DynHttpClient {
+        &self.http
+    }
 
-    fn completion(&self, model: impl Into<String>) -> Self::Model {
-        CompletionModel::new(self.clone(), model.into())
+    /// The underlying Vertex AI prediction service, built on first use unless
+    /// the host supplied one. A completed initialization error is cached across
+    /// all clones; correct construction settings by building a new client.
+    /// Request retry policy remains owned by the SDK.
+    pub async fn inner(&self) -> Result<&vertexai::client::PredictionService, VertexAiClientError> {
+        match &self.service {
+            PredictionServiceSource::Supplied(service) => Ok(service),
+            PredictionServiceSource::Deferred {
+                credentials,
+                client,
+            } => client
+                .get_or_init(|| async {
+                    vertexai::client::PredictionService::builder()
+                        .with_credentials(credentials.clone())
+                        .build()
+                        .await
+                        .map_err(|error| VertexAiClientError::PredictionService(Arc::new(error)))
+                })
+                .await
+                .as_ref()
+                .map_err(Clone::clone),
+        }
     }
 }

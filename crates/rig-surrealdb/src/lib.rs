@@ -1,19 +1,18 @@
-//! SurrealDB vector store integration for Rig.
+//! SurrealDB vector store for Rig.
 //!
-//! This crate provides [`SurrealVectorStore`], a Rig vector store backed by
-//! SurrealDB. It supports local in-memory and remote WebSocket connections
-//! through the re-exported SurrealDB engine types.
-//!
-//! The root `rig` facade re-exports this crate as `rig::surrealdb` when the
-//! `surrealdb` feature is enabled.
+//! [`SurrealVectorStore`] searches a SurrealDB table with one of the
+//! [`SurrealDistanceFunction`] measures, reachable through the re-exported
+//! in-memory and WebSocket engines. The `rig` facade re-exports this crate as
+//! `rig::surrealdb` under the `surrealdb` feature.
 
 use std::fmt::Display;
 
 use rig_core::{
     Embed,
-    embeddings::{Embedding, EmbeddingModel},
+    embeddings::Embedding,
     vector_store::{
-        InsertDocuments, VectorStoreError, VectorStoreIndex,
+        InsertDocuments, VectorSearchIdResult, VectorSearchResult, VectorStoreError,
+        VectorStoreIndex,
         request::{DynamicSearchFilter, Filter, FilterError, SearchFilter, VectorSearchRequest},
     },
     wasm_compat::WasmCompatSend,
@@ -27,22 +26,24 @@ use surrealdb::{
 pub use surrealdb::engine::local::Mem;
 pub use surrealdb::engine::remote::ws::{Ws, Wss};
 
-/// A SurrealDB-backed vector store.
+/// Vector store backed by a SurrealDB table.
 ///
-/// The store is generic over its embedding model `M`, which is fixed for the
-/// store's lifetime: an index populated under one model is only meaningful under
-/// that same model.
-pub struct SurrealVectorStore<C, M>
+/// Queries are embedded with the same model that populated the table, so
+/// results are meaningless under another model.
+pub struct SurrealVectorStore<C>
 where
     C: Connection,
 {
-    model: M,
+    model: rig_core::DynModel<rig_core::operation::Embedding>,
     surreal: Surreal<C>,
     documents_table: String,
     distance_function: SurrealDistanceFunction,
 }
 
-/// SurrealDB supported distances
+/// Measure applied to the stored embeddings.
+///
+/// Results are always thresholded and ordered as if larger values rank better,
+/// which holds for the similarity measures but inverts the distance ones.
 pub enum SurrealDistanceFunction {
     Knn,
     Hamming,
@@ -70,6 +71,8 @@ struct SearchResult {
     distance: f64,
 }
 
+/// One row written by [`InsertDocuments`], holding the document serialized as a
+/// JSON string alongside its embedding and source text.
 #[derive(Debug, Serialize, Deserialize, SurrealValue)]
 pub struct CreateRecord {
     document: String,
@@ -84,11 +87,14 @@ pub struct SearchResultOnlyId {
 }
 
 impl SearchResult {
-    pub fn into_result<T: DeserializeOwned>(self) -> Result<(f64, String, T), VectorStoreError> {
-        let document: T =
-            serde_json::from_str(&self.document).map_err(VectorStoreError::JsonError)?;
-
-        Ok((self.distance, record_key_to_string(&self.id.key), document))
+    pub fn into_result<T: DeserializeOwned>(
+        self,
+    ) -> Result<VectorSearchResult<T>, VectorStoreError> {
+        Ok(VectorSearchResult {
+            score: self.distance,
+            id: record_key_to_string(&self.id.key),
+            document: serde_json::from_str(&self.document).map_err(VectorStoreError::JsonError)?,
+        })
     }
 }
 
@@ -101,7 +107,7 @@ fn record_key_to_string(key: &RecordIdKey) -> String {
     }
 }
 
-impl<C, M: EmbeddingModel> InsertDocuments for SurrealVectorStore<C, M>
+impl<C> InsertDocuments for SurrealVectorStore<C>
 where
     C: Connection,
 {
@@ -130,6 +136,11 @@ where
     }
 }
 
+/// SurrealQL predicate over the matched record.
+///
+/// Field names, text queries, and regex patterns are spliced in verbatim, so
+/// they must not carry untrusted input; values are rendered through SurrealDB's
+/// own SQL escaping.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SurrealSearchFilter(String);
 
@@ -139,17 +150,9 @@ impl SurrealSearchFilter {
     }
 }
 
-impl TryFrom<Filter<serde_json::Value>> for SurrealSearchFilter {
-    type Error = FilterError;
-
-    fn try_from(value: Filter<serde_json::Value>) -> Result<Self, Self::Error> {
-        value.try_interpret(|v| Ok(Value::from_t(v)))
-    }
-}
-
 impl DynamicSearchFilter for SurrealSearchFilter {
     fn from_dynamic_filter(filter: Filter<serde_json::Value>) -> Result<Self, FilterError> {
-        Self::try_from(filter)
+        filter.try_interpret(|v| Ok(Value::from_t(v)))
     }
 }
 
@@ -188,81 +191,79 @@ impl SurrealSearchFilter {
         Self(format!("NOT ({self})"))
     }
 
-    /// Test if the value at `key` contains `val`
+    /// Matches records whose value at `key` contains `val`.
     pub fn contains(key: &str, val: &<Self as SearchFilter>::Value) -> Self {
         Self(format!("{key} CONTAINS {}", val.to_sql()))
     }
 
-    /// Test if the value at `key` does *not* contain `val`
+    /// Matches records whose value at `key` does not contain `val`.
     pub fn does_not_contain(key: &str, val: &<Self as SearchFilter>::Value) -> Self {
         Self(format!("{key} CONTAINSNOT {}", val.to_sql()))
     }
 
-    /// Test if the value at `key` contains every element of `vals`
-    /// `vals` should be a SurrealDB collection
+    /// Matches records whose value at `key` contains every element of the
+    /// collection `vals`.
     pub fn all(key: &str, vals: &<Self as SearchFilter>::Value) -> Self {
         Self(format!("{key} CONTAINSALL {}", vals.to_sql()))
     }
 
-    /// Test if the value at `key` contains any elements of `vals`
-    /// `vals` should be a SurrealDB collection
+    /// Matches records whose value at `key` contains any element of the
+    /// collection `vals`.
     pub fn any(key: &str, vals: &<Self as SearchFilter>::Value) -> Self {
         Self(format!("{key} CONTAINSANY {}", vals.to_sql()))
     }
 
-    /// Test if the value at `key` is a member of `vals`
-    /// `vals` should be a SurrealDB collection
+    /// Matches records whose value at `key` is an element of the collection
+    /// `vals`.
     pub fn member(key: &str, vals: &<Self as SearchFilter>::Value) -> Self {
         Self(format!("{key} IN {}", vals.to_sql()))
     }
 
-    /// Test if the value at `key` is *not* a member of `vals`
-    /// `vals` should be a SurrealDB collection
+    /// Matches records whose value at `key` is not an element of the collection
+    /// `vals`.
     pub fn not_member(key: &str, vals: &<Self as SearchFilter>::Value) -> Self {
         Self(format!("{key} NOTIN {}", vals.to_sql()))
     }
 
-    // Geospatial filters
-    /// Test if the value at `key` is inside `geometry`
+    /// Matches records whose geometry at `key` lies inside `geometry`.
     pub fn inside(key: &str, geometry: &<Self as SearchFilter>::Value) -> Self {
         Self(format!("{key} INSIDE {}", geometry.to_sql()))
     }
 
-    /// Test if the value at `key` is outside `geometry`
+    /// Matches records whose geometry at `key` lies outside `geometry`.
     pub fn outside(key: &str, geometry: &<Self as SearchFilter>::Value) -> Self {
         Self(format!("{key} OUTSIDE {}", geometry.to_sql()))
     }
 
-    /// Test if the value at `key` intersects `geometry`
+    /// Matches records whose geometry at `key` intersects `geometry`.
     pub fn intersects(key: &str, geometry: &<Self as SearchFilter>::Value) -> Self {
         Self(format!("{key} INTERSECTS {}", geometry.to_sql()))
     }
 
-    // String ops
-    /// SurrealDB text search
+    /// Full-text search on `key`. `query` is spliced into the predicate verbatim.
     pub fn matches<'a, S: AsRef<&'a str>>(key: &str, query: S) -> Self {
         Self(format!("{key} @@ {}", query.as_ref()))
     }
 
-    /// Check if the value at `key` matches regex `pattern`
-    /// `pattern` should be a valid surrealDB regex
+    /// Matches `key` against the SurrealDB regular expression `pattern`, which is
+    /// spliced between delimiters verbatim.
     pub fn regex<'a, S: AsRef<&'a str>>(key: &str, pattern: S) -> Self {
         Self(format!("{key} = /{}/", pattern.as_ref()))
     }
 }
 
-impl<C, M: EmbeddingModel> SurrealVectorStore<C, M>
+impl<C> SurrealVectorStore<C>
 where
     C: Connection,
 {
     pub fn new(
-        model: M,
+        model: impl Into<rig_core::DynModel<rig_core::operation::Embedding>>,
         surreal: Surreal<C>,
         documents_table: Option<String>,
         distance_function: SurrealDistanceFunction,
     ) -> Self {
         Self {
-            model,
+            model: model.into(),
             surreal,
             documents_table: documents_table.unwrap_or_else(|| String::from("documents")),
             distance_function,
@@ -273,11 +274,16 @@ where
         &self.surreal
     }
 
-    pub fn with_defaults(model: M, surreal: Surreal<C>) -> Self {
+    pub fn with_defaults(
+        model: impl Into<rig_core::DynModel<rig_core::operation::Embedding>>,
+        surreal: Surreal<C>,
+    ) -> Self {
         Self::new(model, surreal, None, SurrealDistanceFunction::Cosine)
     }
 
-    /// Embeds the query and runs the similarity-search query, returning the raw response.
+    /// Embeds the query and runs the search. The request filter is bound as a
+    /// query parameter, defaulting to `true` when absent, and an absent threshold
+    /// binds zero.
     async fn run_search_query(
         &self,
         req: &VectorSearchRequest<SurrealSearchFilter>,
@@ -294,7 +300,7 @@ where
             .bind((
                 "filter",
                 req.filter()
-                    .clone()
+                    .cloned()
                     .map_or("true".into(), SurrealSearchFilter::inner),
             ))
             .await
@@ -320,23 +326,23 @@ where
     }
 }
 
-impl<C, M: EmbeddingModel> VectorStoreIndex for SurrealVectorStore<C, M>
+impl<C> VectorStoreIndex for SurrealVectorStore<C>
 where
     C: Connection,
 {
     type Filter = SurrealSearchFilter;
 
-    /// Get the top n documents based on the distance to the given query.
-    /// The result is a list of tuples of the form (score, id, document)
+    /// Returns matches scored by distance and keyed by record id, ordered by descending
+    /// distance value. Errors when a stored document does not deserialize into `T`.
     async fn top_n<T: DeserializeOwned + WasmCompatSend>(
         &self,
         req: VectorSearchRequest<SurrealSearchFilter>,
-    ) -> Result<Vec<(f64, String, T)>, VectorStoreError> {
+    ) -> Result<Vec<VectorSearchResult<T>>, VectorStoreError> {
         let mut response = self.run_search_query(&req, true).await?;
 
         let rows: Vec<SearchResult> = response.take(0).map_err(VectorStoreError::datastore)?;
 
-        let rows: Vec<(f64, String, T)> = rows
+        let rows: Vec<VectorSearchResult<T>> = rows
             .into_iter()
             .map(SearchResult::into_result)
             .collect::<Result<Vec<_>, _>>()?;
@@ -344,23 +350,24 @@ where
         Ok(rows)
     }
 
-    /// Same as `top_n` but returns the document ids only.
+    /// Like `top_n` but returns only scores and record ids, without
+    /// deserializing documents.
     async fn top_n_ids(
         &self,
         req: VectorSearchRequest<SurrealSearchFilter>,
-    ) -> Result<Vec<(f64, String)>, VectorStoreError> {
-        // NOTE: this previously bound the query vector as `Vec<f32>` while
-        // `top_n` bound `Vec<f64>`; both now bind `Vec<f64>`, matching the
-        // stored `embedding: Vec<f64>` schema.
+    ) -> Result<Vec<VectorSearchIdResult>, VectorStoreError> {
         let mut response = self.run_search_query(&req, false).await?;
 
         let rows: Vec<SearchResultOnlyId> = response
             .take::<Vec<SearchResultOnlyId>>(0)
             .map_err(VectorStoreError::datastore)?;
 
-        let rows: Vec<(f64, String)> = rows
+        let rows: Vec<VectorSearchIdResult> = rows
             .into_iter()
-            .map(|row| (row.distance, record_key_to_string(&row.id.key)))
+            .map(|row| VectorSearchIdResult {
+                score: row.distance,
+                id: record_key_to_string(&row.id.key),
+            })
             .collect();
 
         Ok(rows)

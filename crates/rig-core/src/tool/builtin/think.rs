@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-use crate::tool::PortableTool;
+use crate::tool::{Tool, ToolContext};
 
 /// Arguments for the Think tool
 #[derive(Deserialize)]
@@ -15,19 +15,11 @@ pub struct ThinkArgs {
 #[error("Think tool error: {0}")]
 pub struct ThinkError(String);
 
-/// The Think tool allows agents to stop and think in complex tool use situations.
-///
-/// This tool provides a dedicated space for structured thinking during complex tasks,
-/// particularly when processing external information (e.g., tool call results).
-/// It doesn't actually perform any actions or retrieve any information - it just
-/// provides a space for the model to reason through complex problems.
-///
-/// This tool is original derived from the
-///  [Think tool](https://anthropic.com/engineering/claude-think-tool) blog post from Anthropic.
+/// Returns the supplied thought unchanged, without I/O or state mutation.
 #[derive(Deserialize, Serialize)]
 pub struct ThinkTool;
 
-impl PortableTool for ThinkTool {
+impl Tool for ThinkTool {
     const NAME: &'static str = "think";
     type Error = ThinkError;
     type Args = ThinkArgs;
@@ -53,9 +45,11 @@ impl PortableTool for ThinkTool {
         })
     }
 
-    async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
-        // The think tool doesn't actually do anything except echo back the thought
-        // This is intentional - it's just a space for the model to reason through problems
+    async fn call(
+        &self,
+        _: &mut ToolContext,
+        args: Self::Args,
+    ) -> Result<Self::Output, Self::Error> {
         Ok(args.thought)
     }
 }

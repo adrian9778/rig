@@ -1,110 +1,63 @@
-//! Shared provider infrastructure: the decode-then-validate classify layer
-//! and the assembly helpers every completion decoder shares.
+//! Shared frame classification and tool-call id spelling. Companion providers
+//! use these helpers from their [`Decoder`](crate::wire::Decoder)s and
+//! encoders.
 //!
-//! [`wire`], [`tool_call_bridge`], and [`chunk_lifecycle`] are public so
-//! out-of-tree providers implement [`Decoder`](crate::wire::Decoder) and
-//! inherit the shared fold ([`WireDriver`](crate::driver::WireDriver)),
-//! frame-triage policy, index→identity tool-call bridging, and the
-//! boundary-less reasoning lifecycle derivation instead of hand-rolling
-//! per-provider assemblers; the remaining helpers are crate-private. The
-//! output buffer those decoders write through is the completion operation's
-//! own ([`AdapterOutput`](crate::operation::AdapterOutput)).
+//! ```
+//! use rig_core::providers::internal::wire::classify_untyped_line;
+//! use rig_core::wire::WireEvent;
+//!
+//! let event: WireEvent<serde_json::Value> = classify_untyped_line(br#"{"done":true}"#);
+//! assert!(matches!(event, WireEvent::Known(_)));
+//! ```
 
 pub(crate) mod auth;
-pub mod chunk_lifecycle;
-#[cfg(not(target_family = "wasm"))]
-pub(crate) mod device_auth;
-pub(crate) mod openai_chat_completions_compatible;
 pub(crate) mod schema;
-/// The debug-mode sequence-law validator. Public only because it is the
-/// completion sink's `Laws` type; its checks run under `debug_assertions`.
-#[doc(hidden)]
-pub mod sequence_law;
-pub mod tool_call_bridge;
-pub mod tool_call_ids;
+/// The frame classifiers every JSON wire's decoder delegates to.
 pub mod wire;
+pub mod wire_ids;
 
-/// Fill empty [`ToolResult::name`](crate::message::ToolResult::name)s from
-/// the calls they answer, for wires that key the replay on the tool name
-/// (Gemini `functionResponse.name`, Ollama tool messages, Vertex AI,
-/// gemini-grpc, Interactions).
-///
-/// `ToolResult::name` is required data, but rig's own inbound converters
-/// cannot supply it: Anthropic, OpenAI-chat, Cohere, and Bedrock tool
-/// messages carry no name on their wires, so a cross-provider ingested
-/// transcript arrives with `name: ""`. The name lives on the paired
-/// assistant call in the same history — match by rig's correlation handle
-/// first, then by provider identifiers. A result matching no call keeps
-/// its empty name: the transcript genuinely lacks the data, and the wire's
-/// own rejection is the honest failure.
-///
-/// `pub` (not `pub(crate)`) because sibling serializer crates that speak a
-/// name-keyed tool-result wire (rig-vertexai, rig-gemini-grpc) carry the
-/// same contract; it is not part of rig-core's stable public API.
-pub fn resolve_empty_tool_result_names(history: &mut [crate::message::Message]) {
-    use crate::message::{AssistantContent, Message, ToolCall, UserContent};
+/// A JSON object written as `json!` writes one, with each value moved in
+/// through `Value::from`: `json!` copies every value it interpolates, so a
+/// request body built around owned values is built with this instead.
+macro_rules! object {
+    ($($key:literal: $value:expr),* $(,)?) => {
+        serde_json::Value::Object(serde_json::Map::from_iter([
+            $(($key.to_owned(), serde_json::Value::from($value))),*
+        ]))
+    };
+}
+pub(crate) use object;
 
-    // IDs are completion-local. Resolve only against preceding outstanding
-    // calls, never a future turn that happens to reuse the same generated key.
-    let mut pending: Vec<ToolCall> = Vec::new();
-    for message in history {
-        match message {
-            Message::Assistant { content, .. } => {
-                pending.extend(content.iter().filter_map(|item| match item {
-                    AssistantContent::ToolCall(call) => Some(call.clone()),
-                    _ => None,
-                }));
-            }
-            Message::User { content } => {
-                for item in content {
-                    let UserContent::ToolResult(result) = item else {
-                        continue;
-                    };
-                    let local: Vec<_> = pending
-                        .iter()
-                        .enumerate()
-                        .filter(|(_, call)| call.id == result.call)
-                        .map(|(index, _)| index)
-                        .collect();
-                    let mut candidates = if local.is_empty() {
-                        // Provider aliases are their own namespace, not strings
-                        // inserted alongside generated correlation keys.
-                        pending
-                            .iter()
-                            .enumerate()
-                            .filter(|(_, call)| match (&call.provider, &result.provider) {
-                                (Some(call), Some(result)) => {
-                                    call.call_id == result.call_id
-                                        || call.item_id.as_ref().is_some_and(|id| {
-                                            id == &result.call_id
-                                                || result.item_id.as_ref() == Some(id)
-                                        })
-                                        || result.item_id.as_ref() == Some(&call.call_id)
-                                }
-                                _ => false,
-                            })
-                            .map(|(index, _)| index)
-                            .collect()
-                    } else {
-                        local
-                    };
-                    if candidates.len() > 1 && !result.name.is_empty() {
-                        candidates.retain(|index| {
-                            pending
-                                .get(*index)
-                                .is_some_and(|call| call.function.name == result.name)
-                        });
-                    }
-                    if let [index] = candidates.as_slice() {
-                        let call = pending.remove(*index);
-                        if result.name.is_empty() {
-                            result.name = call.function.name;
-                        }
-                    }
-                }
-            }
-            Message::System { .. } => {}
-        }
+/// An object of the `fields` that are present, in order.
+pub(crate) fn set_fields<const N: usize>(
+    fields: [(&str, Option<serde_json::Value>); N],
+) -> serde_json::Map<String, serde_json::Value> {
+    fields
+        .into_iter()
+        .filter_map(|(key, value)| Some((key.to_owned(), value?)))
+        .collect()
+}
+
+/// Every option refused for `reason`.
+pub(crate) fn refuse_all(
+    fields: crate::completion::options::OptionFields<'_>,
+    reason: &str,
+) -> crate::completion::options::OptionMap {
+    use crate::completion::options::{Mapping, OptionMap};
+    let refuse = |set: bool| match set {
+        true => Mapping::unsupported(reason),
+        false => Mapping::Nothing,
+    };
+    OptionMap {
+        reasoning: refuse(fields.reasoning.is_some()),
+        cache: refuse(fields.cache.is_some()),
+        service_tier: refuse(fields.service_tier.is_some()),
+        verbosity: refuse(fields.verbosity.is_some()),
+        parallel_tool_calls: refuse(fields.parallel_tool_calls.is_some()),
+        top_p: refuse(fields.top_p.is_some()),
+        seed: refuse(fields.seed.is_some()),
+        stop: refuse(!fields.stop.is_empty()),
+        cache_key: Mapping::unrouted(fields.cache_key),
     }
 }
 
@@ -138,34 +91,47 @@ pub fn trace_json(target: LogTarget, label: &str, value: &impl serde::Serialize)
     }
 }
 
-#[cfg(test)]
-mod tests;
+/// Serde for a dialect that is a registered `const`: the name is the whole
+/// wire format, so a host storing a wire cannot reconstitute a dialect
+/// with somebody else's base URL, and an unknown name is an error rather
+/// than a silent default.
+pub(crate) mod named_dialect {
+    /// Write the dialect's name, refusing a value that is not the registered
+    /// constant of that name: writing only its name would silently lose
+    /// its payload.
+    pub(crate) fn serialize<S: serde::Serializer>(
+        serializer: S,
+        family: &str,
+        name: &str,
+        registered: bool,
+    ) -> Result<S::Ok, S::Error> {
+        if !registered {
+            return Err(serde::ser::Error::custom(format!(
+                "an unregistered or modified {family} dialect cannot be persisted by name; \
+                 use configuration overrides"
+            )));
+        }
+        serializer.serialize_str(name)
+    }
 
-#[cfg(test)]
-mod tool_call_id_tests;
-
-/// Reads the provider's transport request id off a response's headers, when
-/// the provider names such a header and the response carries a non-empty
-/// value. `None` is the documented "not reported" outcome.
-pub(crate) fn request_id_from_headers(
-    headers: &http::HeaderMap,
-    request_id_header: Option<&str>,
-) -> Option<String> {
-    request_id_header.and_then(|header| {
-        headers
-            .get(header)
-            .and_then(|value| value.to_str().ok())
-            .filter(|value| !value.is_empty())
-            .map(str::to_string)
-    })
+    /// Read a name and look the dialect up among the family's constants.
+    pub(crate) fn deserialize<'de, D, T>(
+        deserializer: D,
+        family: &str,
+        by_name: impl FnOnce(&str) -> Option<T>,
+    ) -> Result<T, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let name = <String as serde::Deserialize>::deserialize(deserializer)?;
+        by_name(&name).ok_or_else(|| {
+            serde::de::Error::custom(format!("`{name}` is not a registered {family} dialect"))
+        })
+    }
 }
 
-/// `path` with `pairs` appended as a percent-encoded query string.
-///
-/// Shared by the wires that put a provider-reported cursor or page size in a
-/// URI (Anthropic's `Models`, Gemini's `models` and `cachedContents`):
-/// concatenating a cursor raw would let a `+`, `&`, `=` or `/` inside it
-/// truncate the cursor or inject a query parameter, silently dropping pages.
+/// Append `pairs` to `path` as a percent-encoded query string.
+/// Encoding preserves cursor delimiters and prevents query-parameter injection.
 pub(crate) fn with_query_pairs(path: &str, pairs: &[(&str, &str)]) -> String {
     let mut serializer = url::form_urlencoded::Serializer::new(String::new());
     for (name, value) in pairs {

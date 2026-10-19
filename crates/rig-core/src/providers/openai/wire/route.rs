@@ -1,42 +1,30 @@
-//! The completion wire a configuration builds when asked for "a
-//! completion": whichever of its two endpoints it is routed to.
+//! Dispatches completion requests to Chat Completions or Responses wires.
+//! Explicit configuration routes override model-specific hooks and dialect defaults.
 //!
-//! OpenAI, xAI and ChatGPT serve `/responses` as their primary completion
-//! API and keep `/chat/completions` beside it; every OpenAI-*compatible*
-//! gateway serves only the latter. So a [`Dialect`](super::Dialect) names
-//! its flagship [`Route`], a configuration may pick the other one once with
-//! [`OpenAI::with_route`](super::OpenAI::with_route), and [`OpenAiWire`] is
-//! that route's wire — a wire choosing a wire, with every [`Wire`] and
-//! [`Decoder`] method dispatching on the variant. There is no second
-//! request conversion, no second decoder and no second observation
-//! projection: the two arms are the two wires that already exist. Naming a
-//! route for one model is [`OpenAI::chat`](super::OpenAI::chat) or
-//! [`OpenAI::responses`](super::OpenAI::responses).
+//! ```
+//! use rig_core::providers::openai::{OpenAI, OpenAIConfig, Route};
+//! let provider: OpenAI = OpenAIConfig::new("key").with_route(Route::Chat).client();
+//! let model = provider.completion("gpt-5.2");
+//! ```
 
 use serde::{Deserialize, Serialize};
 
-use crate::completion::{CompletionError, CompletionRequest, ProviderCapabilities};
+use crate::catalog::ModelFacts;
+use crate::completion::CompletionRequest;
+use crate::error::{EncodeError, ProviderError};
 use crate::operation::Completion;
 use crate::providers::openai::responses_api::streaming::{ResponsesDecoder, ResponsesEvent};
 use crate::providers::openai::responses_api::wire::Responses;
 use crate::providers::openai::responses_api::{
     ResponsesToolDefinition, SystemInstructionsPlacement,
 };
-use crate::telemetry::CompletionOperation;
-use crate::wire::{
-    Body, Decoder, Encoded, Mode, ObservationSink, Output, Wire, WireEvent, WireFrame,
-};
+use crate::wire::document::Reassemble;
+use crate::wire::{Decoder, Descriptor, Encoded, Flow, Mode, Out, Wire, WireEvent, WireFrame};
 
-use super::OpenAI;
+use super::OpenAIConfig;
 use super::chat::{Chat, ChatDecoder, ChatEvent};
 
-/// Ask whichever route this is.
-///
-/// Every [`Wire`] and [`Decoder`] method below is the same two-arm match on
-/// the variant — the enum chooses a wire, and the method asks that wire — so
-/// the match is written once here instead of fourteen times. The two methods
-/// whose arms genuinely differ, `decoder` and `classify`, wrap their result
-/// in the matching variant and are written out.
+/// Dispatch a shared expression to the selected route.
 macro_rules! on_route {
     ($chosen:expr, $wire:ident => $ask:expr) => {
         match $chosen {
@@ -55,14 +43,8 @@ pub enum Route {
     Responses,
 }
 
-/// The dialect's default completion wire: its [`Route`]'s wire.
-///
-/// Both variants are the shared wire types on the same configuration, so
-/// this is what [`Bound<OpenAI>::completion`](crate::driver::Bound) — and
-/// the agent sugar on top of it — builds. A caller who wants a specific
-/// endpoint names it and gets the concrete wire back; every option either
-/// route takes is also forwarded here, and is a no-op on the route that
-/// has no such option, so `map_wire` reaches all of them.
+/// A completion wire selected by configuration, model hook, or dialect default.
+/// Route-specific options are no-ops on the other route.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum OpenAiWire {
     /// The chat-completions wire.
@@ -73,16 +55,25 @@ pub enum OpenAiWire {
 
 impl OpenAiWire {
     /// The wire for `model` on `provider`'s
-    /// [`completion_route`](OpenAI::completion_route).
-    pub fn new(provider: OpenAI, model: impl Into<String>) -> Self {
-        match provider.completion_route() {
+    /// [`completion_route`](OpenAIConfig::completion_route).
+    pub fn new(provider: OpenAIConfig, model: impl Into<String>) -> Self {
+        let model = model.into();
+        let route = provider.route.unwrap_or_else(|| {
+            provider
+                .dialect
+                .quirks
+                .hooks
+                .and_then(|hooks| hooks.model_route)
+                .map_or_else(|| provider.completion_route(), |route| route(&model))
+        });
+        match route {
             Route::Chat => Self::Chat(Chat::new(provider, model)),
             Route::Responses => Self::Responses(Responses::new(provider, model)),
         }
     }
 
     /// The configuration this wire speaks to.
-    pub fn provider(&self) -> &OpenAI {
+    pub fn provider(&self) -> &OpenAIConfig {
         on_route!(self, wire => &wire.provider)
     }
 
@@ -98,12 +89,6 @@ impl OpenAiWire {
     /// encoding.
     pub fn with_tool_result_array_content(self) -> Self {
         self.on_chat(Chat::with_tool_result_array_content)
-    }
-
-    /// Ask the provider to cache the prompt: an OpenRouter `cache_control`
-    /// on the chat body, so a no-op on the Responses route.
-    pub fn with_prompt_caching(self) -> Self {
-        self.on_chat(Chat::with_prompt_caching)
     }
 
     /// Add a provider-side tool to every request: a Responses shape, so a
@@ -138,6 +123,15 @@ impl OpenAiWire {
         self.on_responses(Responses::with_system_instructions_as_messages)
     }
 
+    /// The same wire, encoding with `facts` and pricing its replies by
+    /// them, on whichever route this is.
+    pub fn with_facts(self, facts: ModelFacts) -> Self {
+        match self {
+            Self::Chat(wire) => Self::Chat(wire.with_facts(facts)),
+            Self::Responses(wire) => Self::Responses(wire.with_facts(facts)),
+        }
+    }
+
     /// Apply a chat-route option; the Responses route is left as it is.
     fn on_chat(self, option: impl FnOnce(Chat) -> Chat) -> Self {
         match self {
@@ -169,37 +163,64 @@ impl From<Responses> for OpenAiWire {
 
 impl Wire for OpenAiWire {
     type Op = Completion;
-    type Decoder = OpenAiDecoder;
+    type Payload = crate::wire::Encoded;
+    type Frame = crate::wire::WireFrame;
+    type Event = OpenAiEvent;
+    type Decoder<'id> = OpenAiDecoder;
+    type Reassembler = OpenAiReassembler;
 
-    fn name(&self) -> &str {
-        on_route!(self, wire => wire.name())
+    fn describe(&self) -> Descriptor<'_> {
+        on_route!(self, wire => wire.describe())
     }
 
-    fn model(&self) -> Option<&str> {
-        on_route!(self, wire => wire.model())
-    }
-
-    fn route(&self) -> Option<&str> {
-        on_route!(self, wire => wire.route())
-    }
-
-    fn encode(&self, request: CompletionRequest, mode: Mode) -> Result<Encoded, CompletionError> {
+    fn encode(&self, request: CompletionRequest, mode: Mode) -> Result<Encoded, EncodeError> {
         on_route!(self, wire => wire.encode(request, mode))
     }
 
-    fn decoder(&self, mode: Mode) -> OpenAiDecoder {
+    fn decoder<'id>(&self) -> Self::Decoder<'id> {
         match self {
-            Self::Chat(wire) => OpenAiDecoder::Chat(wire.decoder(mode)),
-            Self::Responses(wire) => OpenAiDecoder::Responses(wire.decoder(mode)),
+            Self::Chat(wire) => OpenAiDecoder::Chat(wire.decoder()),
+            Self::Responses(wire) => OpenAiDecoder::Responses(wire.decoder()),
         }
     }
 
-    fn capabilities(&self) -> ProviderCapabilities {
-        on_route!(self, wire => wire.capabilities())
+    fn reassembler(&self) -> Self::Reassembler {
+        match self {
+            Self::Chat(wire) => OpenAiReassembler::Chat(wire.reassembler()),
+            Self::Responses(wire) => OpenAiReassembler::Responses(wire.reassembler()),
+        }
+    }
+}
+
+/// The chosen route's reassembler.
+pub enum OpenAiReassembler {
+    /// The chat-completions reply document.
+    Chat(<Chat as Wire>::Reassembler),
+    /// The Responses reply document.
+    Responses(<Responses as Wire>::Reassembler),
+}
+
+/// The chat route's, as [`OpenAiWire`]'s default route is.
+impl Default for OpenAiReassembler {
+    fn default() -> Self {
+        Self::Chat(Default::default())
+    }
+}
+
+impl crate::wire::document::Serves<crate::operation::Completion> for OpenAiReassembler {}
+
+impl Reassemble<OpenAiEvent> for OpenAiReassembler {
+    fn absorb(&mut self, event: &OpenAiEvent) {
+        match (self, event) {
+            (Self::Chat(document), OpenAiEvent::Chat(event)) => document.absorb(event),
+            (Self::Responses(document), OpenAiEvent::Responses(event)) => document.absorb(event),
+            // The route's decoder classifies only its own events.
+            _ => {}
+        }
     }
 
-    fn telemetry(&self, streaming: bool) -> CompletionOperation {
-        on_route!(self, wire => wire.telemetry(streaming))
+    fn finish(self) -> serde_json::Value {
+        on_route!(self, document => document.finish())
     }
 }
 
@@ -219,7 +240,7 @@ pub enum OpenAiDecoder {
     Responses(ResponsesDecoder),
 }
 
-impl Decoder<Completion> for OpenAiDecoder {
+impl<'id> Decoder<'id, Completion> for OpenAiDecoder {
     type Event = OpenAiEvent;
 
     fn classify(&self, frame: WireFrame) -> WireEvent<OpenAiEvent> {
@@ -229,47 +250,23 @@ impl Decoder<Completion> for OpenAiDecoder {
         }
     }
 
-    fn interpret(&mut self, event: OpenAiEvent, out: &mut Output<Completion>) {
+    fn decode(
+        &mut self,
+        event: OpenAiEvent,
+        out: Out<'id, Completion>,
+    ) -> Result<Flow, ProviderError> {
         match (self, event) {
-            (Self::Chat(decoder), OpenAiEvent::Chat(event)) => decoder.interpret(event, out),
-            (Self::Responses(decoder), OpenAiEvent::Responses(event)) => {
-                decoder.interpret(event, out);
-            }
-            // A decoder is built fresh per reply and only ever sees the
-            // events its own `classify` produced, so the routes cannot
-            // cross; there is nothing for the other route's state machine to
-            // do with a frame it never decoded.
+            (Self::Chat(decoder), OpenAiEvent::Chat(event)) => decoder.decode(event, out),
+            (Self::Responses(decoder), OpenAiEvent::Responses(event)) => decoder.decode(event, out),
+            // The driver feeds each decoder only events from its own
+            // classifier.
             (Self::Chat(_), OpenAiEvent::Responses(_))
-            | (Self::Responses(_), OpenAiEvent::Chat(_)) => {}
+            | (Self::Responses(_), OpenAiEvent::Chat(_)) => Ok(Flow::More),
         }
     }
 
-    fn finish(&mut self, out: &mut Output<Completion>) {
-        on_route!(self, decoder => decoder.finish(out))
-    }
-
-    fn flush_before_terminal_error(&mut self, out: &mut Output<Completion>) {
-        on_route!(self, decoder => decoder.flush_before_terminal_error(out))
-    }
-
-    fn project(&self, payload: &[u8], sink: &mut dyn ObservationSink) {
-        on_route!(self, decoder => decoder.project(payload, sink))
-    }
-
-    fn document(&self) -> Option<serde_json::Value> {
-        on_route!(self, decoder => decoder.document())
-    }
-
-    fn continuation(&self) -> Option<http::Request<Body>> {
-        on_route!(self, decoder => decoder.continuation())
-    }
-
-    fn is_analysis_only(&self, frame: &WireFrame) -> bool {
-        on_route!(self, decoder => decoder.is_analysis_only(frame))
-    }
-
-    fn is_finished(&self) -> bool {
-        on_route!(self, decoder => decoder.is_finished())
+    fn eof(&mut self, out: Out<'id, Completion>) -> Result<Flow, ProviderError> {
+        on_route!(self, decoder => decoder.eof(out))
     }
 }
 

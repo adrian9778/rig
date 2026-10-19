@@ -1,29 +1,30 @@
-use serde::{Deserialize, Serialize};
+//! The decoder of Interactions replies: a whole interaction resource, or a
+//! stream of `event_type`-tagged step events, read as JSON.
+//!
+//! ```
+//! use rig_core::providers::gemini::interactions_api::streaming::InteractionsDecoder;
+//!
+//! let decoder = InteractionsDecoder::default();
+//! # let _ = decoder;
+//! ```
 
-use super::PROVIDER_NAME;
-use super::interactions_api_types::{
-    Content, ContentDelta, FunctionCallContent, Interaction, InteractionSseEvent, InteractionUsage,
-    Step, TextDelta, ThoughtContent, ThoughtSignatureDelta, ThoughtSummaryContent,
-    ThoughtSummaryDelta, map_interaction_status,
+use std::borrow::Cow;
+use std::collections::BTreeMap;
+
+use serde_json::{Map, Value, json};
+
+use crate::completion::{FinishReason, Usage};
+use crate::error::ProviderError;
+use crate::json_utils::Lenient;
+use crate::message::{
+    DocumentRange, DocumentSourceKind, Image, ImageMediaType, MimeType, Source, SourceLocation,
 };
-use crate::providers::gemini::streaming::shared_parts;
-use crate::providers::internal::chunk_lifecycle::ChunkParts;
-use crate::providers::internal::tool_call_bridge::ToolCallBridge;
+use crate::operation::completion::merge;
+use crate::operation::{Block, CallFragment, Completion, Finish};
+use crate::providers::internal::wire;
+use crate::wire::{Decoder, Flow, Out, SpanUnit, WireCitation, WireEvent, WireFrame, WireSpan};
 
-use crate::operation::Completion;
-use crate::providers::internal::wire::{self, WireEvent};
-use crate::streaming;
-use crate::wire::WireFrame;
-use crate::wire::{Decoder, Output};
-use serde_json::{Map, Value};
-
-/// The `event_type` values this client models on the Interactions SSE wire.
-///
-/// [`wire::classify_tagged_frame`] dispatches on this list: a frame whose
-/// `event_type` is outside it classifies `Unknown` (driver policy: warn +
-/// skip), while a listed value must pass the full [`InteractionSseEvent`]
-/// decode or classify `Corrupt`. There is no untagged serde fallback — policy
-/// lives in the classify layer, never in serde.
+/// Recognized Interactions SSE tags; unlisted tags classify as unknown.
 const KNOWN_EVENT_TYPES: &[&str] = &[
     "interaction.created",
     "interaction.completed",
@@ -34,565 +35,618 @@ const KNOWN_EVENT_TYPES: &[&str] = &[
     "error",
 ];
 
-/// Classify one Interactions SSE frame: the tagged half of this wire.
-/// [`classify_interactions_frame`] composes it with the whole-resource
-/// classifier, so the `event_type` table is read in exactly one place.
-fn classify_interaction_frame(data: &str) -> WireEvent<InteractionSseEvent> {
-    wire::classify_tagged_frame(data, "event_type", |event_type| {
-        KNOWN_EVENT_TYPES.contains(&event_type)
-    })
-}
-
-/// The top-level keys only a whole [`Interaction`] resource carries.
-///
-/// Every field of `Interaction` is optional or defaulted, so a marker key is
-/// what separates the unary document from a stream frame that happens to be
-/// a JSON object: without one, a defective `step.delta` frame would decode
-/// as a default `Interaction` and a data defect would read as a completed
-/// turn.
+/// Top-level keys that mark an untagged frame as a whole interaction
+/// resource.
 const INTERACTION_MARKER_KEYS: &[&str] = &["steps", "status", "usage", "object", "id"];
 
-/// One decoded frame of the Interactions wire, in either mode.
-///
-/// Unlike GenerateContent, this family's unary reply is a genuinely
-/// different document from its stream events — a whole `Interaction`
-/// resource rather than an `event_type`-tagged event — so it is named here
-/// as one more event of the wire, and `interpret` synthesizes the step
-/// events a stream would have sent for it.
+/// The tag of the unknown payload a [`StreamCursor`] travels in.
+const CURSOR_TYPE: &str = "gemini.stream_cursor";
+
+/// Where a resumable stream picks up: the interaction, and the last
+/// `event_id` the API marked as a resume point. A stream carries one after
+/// `interaction.created`, with no event yet, and one after each event with
+/// an `event_id`, as an [`Item::Unknown`](crate::streaming::Item::Unknown)
+/// that [`Self::of`] reads. A stream resumed with
+/// [`Gemini::interaction_resumed`](crate::providers::gemini::Gemini::interaction_resumed)
+/// continues after the event, or from the start without one, so a step
+/// that was open arrives without its start.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct StreamCursor {
+    /// The interaction's id, when the stream named it.
+    pub interaction_id: Option<String>,
+    /// The `event_id` to resume after; `None` resumes from the start.
+    pub event_id: Option<String>,
+}
+
+impl StreamCursor {
+    /// The cursor `item` carries, if it is one.
+    pub fn of<E>(item: &crate::streaming::Item<E>) -> Option<Self> {
+        let crate::streaming::Item::Unknown(payload) = item else {
+            return None;
+        };
+        let payload = payload.value();
+        let field = |key: &str| payload.str(key).map(str::to_owned);
+        (payload.str("type") == Some(CURSOR_TYPE)).then(|| Self {
+            interaction_id: field("interaction_id"),
+            event_id: field("event_id"),
+        })
+    }
+
+    /// The unknown payload that carries this cursor.
+    fn payload(&self) -> crate::streaming::UnknownPayload {
+        crate::streaming::UnknownPayload::new(json!({
+            "type": CURSOR_TYPE,
+            "interaction_id": self.interaction_id,
+            "event_id": self.event_id,
+        }))
+    }
+}
+
+/// A decoded frame, verbatim: the decoder reads the fields it needs.
 pub enum InteractionsEvent {
     /// One `event_type`-tagged streaming event.
-    Sse(InteractionSseEvent),
+    Sse(SseEvent),
     /// The whole interaction resource, as the unary reply delivers it.
-    Whole(Interaction),
+    Whole(Map<String, Value>),
 }
 
-/// Classify one frame of either mode.
-///
-/// The tagged classifier runs first: it is the hot path, and it is the one
-/// that knows which `event_type` values are modeled (an unlisted one is a
-/// skippable `Unknown`, not a defect). An untagged document makes it report
-/// `Corrupt` — no modeled event omits `event_type` — which is exactly when
-/// the unary resource is worth trying. The composition and its
-/// which-error-wins rule are [`wire::classify_or`]'s, so no verdict is read
-/// here.
-fn classify_interactions_frame(data: &str) -> WireEvent<InteractionsEvent> {
-    wire::classify_or(
-        data,
-        |data| classify_interaction_frame(data).map(InteractionsEvent::Sse),
-        |data| {
-            wire::classify_marker_keyed_frame::<Interaction>(data, INTERACTION_MARKER_KEYS)
-                .map(InteractionsEvent::Whole)
-        },
-    )
+/// A streaming event: its tag, and its other fields verbatim.
+#[derive(Debug)]
+pub struct SseEvent {
+    /// The event's `event_type`.
+    pub event_type: String,
+    /// Every other field.
+    pub fields: Map<String, Value>,
 }
 
-/// Final metadata yielded by an Interactions streaming response.
-#[derive(Debug, Serialize, Deserialize, Default, Clone)]
-pub struct StreamingCompletionResponse {
-    pub usage: Option<InteractionUsage>,
-    pub interaction: Option<Interaction>,
-    /// Resolved model identifier (e.g. `gemini-2.5-pro-preview-05-06`), extracted from
-    /// `Interaction.model`. The Interactions API has no `FinishReason` field; use
-    /// `interaction.status` for lifecycle state.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub model_version: Option<String>,
-}
-
-impl From<&StreamingCompletionResponse> for crate::completion::Usage {
-    fn from(value: &StreamingCompletionResponse) -> crate::completion::Usage {
-        value
-            .usage
-            .as_ref()
-            .map(crate::completion::Usage::from)
-            .unwrap_or_default()
+/// Read as one object whose `event_type` is taken out, rather than through
+/// `#[serde(flatten)]`, which buffers every field before building the map.
+impl<'de> serde::Deserialize<'de> for SseEvent {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let mut fields = Map::deserialize(deserializer)?;
+        match fields.shift_remove("event_type") {
+            Some(Value::String(event_type)) => Ok(Self { event_type, fields }),
+            Some(_) => Err(serde::de::Error::custom("`event_type` is not a string")),
+            None => Err(serde::de::Error::missing_field("event_type")),
+        }
     }
 }
 
-impl From<StreamingCompletionResponse> for crate::completion::Usage {
-    fn from(value: StreamingCompletionResponse) -> crate::completion::Usage {
-        (&value).into()
-    }
-}
-
-/// The Gemini Interactions wire's decoder, for both of its modes.
-///
-/// Holds the per-reply state (thought lifecycle, open function-call step
-/// assemblies); frame-triage policy is the driver's, not this decoder's.
+/// The Gemini Interactions wire's decoder. Steps decode in step order: a
+/// thought, a call and any other step is one block, and a model output is
+/// one block per content item, whose provider item is the model output step
+/// holding that item alone. A step opens on `step.start`, grows with its
+/// `step.delta`s, and becomes its blocks' provider item on `step.stop`, where
+/// the API states it complete. A whole interaction states each step
+/// complete. A step still open when the reply ends keeps no provider item.
+/// A text item's annotations, stated with it or streamed after it, cite its
+/// block when the step stops.
+#[derive(Default)]
 pub struct InteractionsDecoder {
-    /// Owns the constant-key thought lifecycle — the ends this wire never
-    /// announces are derived by the shared lifecycle, not hand-rolled here.
-    /// All accumulation lives in the shared accumulator.
-    reasoning: crate::providers::internal::chunk_lifecycle::MintedReasoningLifecycle,
-    /// A provider `error` event ended the turn; later frames are dead — the
-    /// provider aborted, and interpreting more output (or a terminal) would
-    /// dress the failure up as a completed turn.
-    failed: bool,
-    /// Function-call steps whose arguments may still stream as
-    /// `arguments_delta` fragments: the shared index → grammar-identity
-    /// bridge, keyed by the wire's step index. The wire announces the call
-    /// in `step.start` (usually with `"arguments": {}`, kept as the slot's
-    /// replace-if-no-deltas fallback), fragments the real payload across
-    /// `step.delta` `arguments_delta` events, and closes it with
-    /// `step.stop` — a genuine start/delta/end lifecycle. Recorded live in
-    /// `streaming_grammar/interactions_same_tool_twice`; the pre-fix code
-    /// emitted the empty-args call at `step.start` and dropped every
-    /// fragment.
-    ///
-    /// The bridge's minter is also the whole-call minter
-    /// ([`ToolCallBridge::minted_ids`]): both id-less paths draw from ONE
-    /// counter, so a step assembly and a whole call can never collide on
-    /// one minted key (the step-0 assembly used to share
-    /// `Minted(Tool, 0)` with every id-less whole call, and the whole call
-    /// silently swallowed the open assembly).
-    open_function_steps: ToolCallBridge<u32>,
+    /// The open steps, by wire index.
+    steps: BTreeMap<usize, Open>,
+    /// The model `interaction.created` named, for a completion that does
+    /// not.
+    model: Option<String>,
+    /// The last status a stream reported.
+    status: Option<String>,
+    /// The interaction the stream reads, for its cursors.
+    interaction_id: Option<String>,
 }
 
-impl Default for InteractionsDecoder {
-    fn default() -> Self {
-        Self {
-            reasoning: crate::providers::internal::chunk_lifecycle::MintedReasoningLifecycle::new(
-                crate::streaming::MintKind::Reasoning,
-            ),
-            failed: false,
-            open_function_steps: ToolCallBridge::new(),
-        }
-    }
+/// What an open step decodes to.
+enum Open {
+    Thought,
+    /// A model output: the step's other fields, and each content item with
+    /// its block's writer index.
+    Output(Value, Vec<(usize, Value)>),
+    /// A function call, with the argument JSON streamed so far.
+    Call(String),
+    Opaque,
 }
 
-impl Decoder<Completion> for InteractionsDecoder {
-    type Event = InteractionsEvent;
-
-    fn classify(&self, frame: WireFrame) -> WireEvent<InteractionsEvent> {
-        classify_interactions_frame(&frame.as_str())
-    }
-
-    fn interpret(&mut self, event: InteractionsEvent, out: &mut Output<Completion>) {
-        if self.failed {
-            return;
-        }
-
-        let event = match event {
-            InteractionsEvent::Sse(event) => event,
-            // The unary reply: replay the interaction's own output as the
-            // step events a stream would have sent, then let its completion
-            // event push the terminal. One mapping from content to blocks,
-            // and it is the streamed one.
-            InteractionsEvent::Whole(interaction) => {
-                for content in interaction.output_contents() {
-                    if let Some(parts) =
-                        content_to_parts(content, self.open_function_steps.minted_ids())
-                    {
-                        self.reasoning.emit_chunk(parts, out);
-                    }
-                }
-                InteractionSseEvent::InteractionCompleted {
-                    interaction,
-                    event_id: None,
-                }
-            }
-        };
-
-        match event {
-            InteractionSseEvent::StepDelta { index, delta, .. } => match delta {
-                ContentDelta::ArgumentsDelta(arguments_delta) => {
-                    if let (Some(slot), Some(fragment)) = (
-                        self.open_function_steps.get_mut(index),
-                        arguments_delta.arguments,
-                    ) {
-                        slot.saw_arguments_delta = true;
-                        let key = slot.key().clone();
-                        out.tool_arguments(&key, fragment);
-                    } else {
-                        tracing::warn!(
-                            step_index = index,
-                            "arguments_delta with no open function-call step; dropping fragment"
-                        );
-                    }
-                }
-                ContentDelta::ThoughtSummary(ThoughtSummaryDelta { content }) => {
-                    if let ThoughtSummaryContent::Text(text) = content {
-                        self.reasoning.emit_chunk(
-                            ChunkParts {
-                                reasoning: Some(text.text),
-                                reasoning_signature: None,
-                                text: None,
-                                tool_events: Vec::new(),
-                            },
-                            out,
-                        );
-                    }
-                }
-                ContentDelta::ThoughtSignature(ThoughtSignatureDelta { signature }) => {
-                    // One lifecycle end covers every shape (open block,
-                    // already-closed block, signature-only stream); the
-                    // shared accumulator signs the right part — the missing
-                    // empty-buffer branch class (84a43e9e #2) cannot recur
-                    // because there is no branch.
-                    self.reasoning.emit_chunk(
-                        ChunkParts {
-                            reasoning: None,
-                            reasoning_signature: Some(signature),
-                            text: None,
-                            tool_events: Vec::new(),
-                        },
-                        out,
-                    );
-                }
-                delta => {
-                    if let Some(parts) =
-                        content_delta_to_parts(delta, self.open_function_steps.minted_ids())
-                    {
-                        // Interleaving content ends an open thought block —
-                        // the shared lifecycle synthesizes the boundary end.
-                        self.reasoning.emit_chunk(parts, out);
-                    }
-                }
-            },
-            InteractionSseEvent::StepStart { index, step, .. } => {
-                if let Step::FunctionCall(FunctionCallContent {
-                    name: Some(name),
-                    arguments,
-                    id,
-                }) = step
-                {
-                    // A function-call step opens an ASSEMBLY: the wire may
-                    // fragment the arguments as later `arguments_delta`
-                    // events at this index, so emitting a whole call here
-                    // would freeze the (usually empty) start-event payload
-                    // and drop every fragment. The bridge keys by the
-                    // wire's own id when present (never the tool name),
-                    // minting from the shared counter otherwise.
-                    let slot = self
-                        .open_function_steps
-                        .open(index, id.as_deref(), Some(&name));
-                    // The announce payload is NOT a fragment: fragments
-                    // append, and an announce that carries a partial (or
-                    // full) payload alongside later `arguments_delta`
-                    // events would concatenate into `{..}{..}`. It is kept
-                    // as the slot's fallback, used only when no fragment
-                    // ever arrives (replace-if-no-deltas).
-                    slot.announce_arguments = arguments.filter(|arguments| {
-                        arguments
-                            .as_object()
-                            .is_none_or(|object| !object.is_empty())
-                    });
-                    let key = slot.key().clone();
-                    let tool_events = vec![
-                        streaming::StreamEvent::BlockStart {
-                            id: key.clone(),
-                            kind: streaming::BlockKind::ToolCall,
-                        },
-                        streaming::StreamEvent::BlockDelta {
-                            id: key,
-                            delta: streaming::Delta::ToolName { name },
-                        },
-                    ];
-                    // Tool content interleaving an open thought block: the
-                    // shared lifecycle synthesizes the boundary end.
-                    self.reasoning.emit_chunk(
-                        ChunkParts {
-                            reasoning: None,
-                            reasoning_signature: None,
-                            text: None,
-                            tool_events,
-                        },
-                        out,
-                    );
-                } else {
-                    // Every convertible item in wire order, each declared as
-                    // its own chunk: the first one interleaving an open
-                    // thought block ends it (the shared lifecycle synthesizes
-                    // the boundary end once), and text lands in the active
-                    // text block between the calls exactly where the wire
-                    // put it.
-                    for parts in step_start_to_parts(step, self.open_function_steps.minted_ids()) {
-                        self.reasoning.emit_chunk(parts, out);
-                    }
-                }
-            }
-            InteractionSseEvent::StepStop { index, .. } => {
-                // The wire promised a complete function-call step: close its
-                // assembly. Malformed accumulated input surfaces in-band
-                // (`Error` policy), matching the other complete-block wires.
-                if let Some(slot) = self.open_function_steps.remove(index) {
-                    out.push(Ok(function_step_end(&slot)));
-                }
-            }
-            InteractionSseEvent::InteractionCompleted { interaction, .. } => {
-                let span = tracing::Span::current();
-                span.record("gen_ai.response.id", &interaction.id);
-                if let Some(model) = interaction.model.clone() {
-                    span.record("gen_ai.response.model", model);
-                }
-                // A function-call step still open here was announced by
-                // `step.start` and — per this very event — belongs to a turn
-                // the provider COMPLETED: its `step.stop` was lost or
-                // reordered, not truncated away. Close each assembly with a
-                // synthesized end so the announced call finalizes from its
-                // accumulated fragments instead of vanishing in the
-                // accumulator's end-of-stream clear (which is reserved for
-                // genuine truncation, where the turn never finished). Wire
-                // (announcement) order keeps parallel calls deterministic.
-                for (index, slot) in self.open_function_steps.drain_ordered_indexed() {
-                    tracing::debug!(
-                        index,
-                        "closing a function-call step left open at interaction.completed"
-                    );
-                    out.push(Ok(function_step_end(&slot)));
-                }
-
-                // Only a genuine `interaction.completed` event counts as the
-                // provider completing the turn; the driver stops consuming
-                // after the terminal record. EOF without one is truncation and
-                // synthesizes nothing (see `finish`).
-                //
-                // The finish reason comes from the completed interaction's
-                // lifecycle status — the API has no `finishReason` field —
-                // and is absent when the interaction carries none.
-                let model_version = interaction.model.clone();
-                let native = StreamingCompletionResponse {
-                    usage: interaction.usage,
-                    interaction: Some(interaction),
-                    model_version,
-                };
-                let raw = match serde_json::to_value(&native) {
-                    Ok(raw) => raw,
-                    Err(err) => {
-                        out.error(err.into());
-                        return;
-                    }
-                };
-                let usage = (&native).into();
-                let interaction = native.interaction.as_ref();
-                let finish_reason = interaction
-                    .and_then(|interaction| interaction.status.as_ref())
-                    .map(map_interaction_status);
-                let message_id = interaction
-                    .map(|interaction| interaction.id.as_str())
-                    .filter(|id| !id.is_empty());
-                out.final_record(
-                    streaming::StreamFinal::new(PROVIDER_NAME, usage)
-                        .with_optional_finish_reason(finish_reason)
-                        .with_optional_response_id(message_id)
-                        .with_optional_model(native.model_version.as_deref())
-                        .with_raw(raw),
-                );
-            }
-            event @ InteractionSseEvent::Error { .. } => {
-                // Preserve the provider error payload (code + message) as the
-                // error body, matching the blocking path's
-                // `completion_error_from_body`. The event is re-serialized
-                // from its decoded form — the modeled fields survive. The
-                // error arrives over an established stream, so there is no
-                // HTTP status to attach (status: None).
-                self.failed = true;
-                let body = serde_json::to_string(&event).unwrap_or_default();
-                out.push(Err(crate::provider_response::completion_error_from_body(
-                    body,
-                )));
-            }
-            InteractionSseEvent::InteractionCreated { .. }
-            | InteractionSseEvent::InteractionStatusUpdate { .. } => {}
-        }
-    }
-
-    fn finish(&mut self, _out: &mut Output<Completion>) {
-        // EOF without `interaction.completed` is truncation: no terminal
-        // record may be synthesized — it would report a successful completion
-        // for a turn the provider aborted.
-    }
-
-    fn is_finished(&self) -> bool {
-        // A provider `error` event is the wire's own in-band terminal:
-        // `interpret` already pushed the `Err` and gates itself on `failed`,
-        // so the driver must stop reading rather than drain the rest of the
-        // transport (and pass through post-error unknown frames).
-        self.failed
+/// Rig's usage for an interaction's `usage`, read leniently: input is
+/// `total_input_tokens` plus the tool-use tokens, output
+/// `total_output_tokens` plus the thought tokens, and the total their sum;
+/// without a base count, that side and the total stay absent.
+pub fn usage_of(usage: &Value) -> Usage {
+    let tool_use = usage.u64("total_tool_use_tokens");
+    let thoughts = usage.u64("total_thought_tokens");
+    let add = |key: &str, more: Option<u64>| usage.u64(key).map(|count| count + more.unwrap_or(0));
+    let (input_tokens, output_tokens) = (
+        add("total_input_tokens", tool_use),
+        add("total_output_tokens", thoughts),
+    );
+    Usage {
+        input_tokens,
+        output_tokens,
+        cached_input_tokens: usage.u64("total_cached_tokens"),
+        reasoning_tokens: thoughts,
+        tool_use_prompt_tokens: tool_use,
+        total_tokens: input_tokens
+            .zip(output_tokens)
+            .map(|(input, output)| input + output),
+        cache_creation_input_tokens: None,
+        cost: None,
     }
 }
 
-/// Close an announced function-call step. The shared accumulator finalizes
-/// the call from its accumulated fragments; a step that fragmented nothing
-/// falls back to the payload it announced at `step.start` (and to a
-/// parameterless `{}` when it announced none) — the slot's
-/// replace-if-no-deltas fallback.
-///
-/// Interactions is a single-identifier wire: its id travels as `tool_id`
-/// only (`ToolCallSlot::end_event`'s shape). Filling `call_id` too made
-/// the accumulator take the dual-wire arm and store
-/// ProviderCallId{item_id: Some(fc_…)} — a fabricated Responses-shaped
-/// identity that slips past the foreign-id guard on cross-provider replay.
-/// Malformed accumulated input surfaces in-band (`Error` policy), matching
-/// the other complete-block wires.
-fn function_step_end(
-    slot: &crate::providers::internal::tool_call_bridge::ToolCallSlot,
-) -> streaming::StreamEvent {
-    slot.end_event(streaming::UnparseableToolInput::Error)
-}
-
-/// A whole function call as one declared chunk (its start and end in the
-/// tool-event slot).
-fn function_call_parts(
-    name: String,
-    arguments: Option<Value>,
-    id: Option<String>,
-    tool_ids: &mut streaming::SyntheticIds,
-) -> ChunkParts {
-    // The wire's id when present; never the tool name — a name-as-id
-    // fallback collides two same-tool calls in one turn.
-    ChunkParts {
-        reasoning: None,
-        reasoning_signature: None,
-        text: None,
-        tool_events: shared_parts::function_call(
-            name,
-            arguments.unwrap_or(Value::Object(Map::new())),
-            id,
-            None,
-            tool_ids,
-        ),
-    }
-}
-
-/// Visible text as one declared chunk.
-fn text_parts(text: String) -> ChunkParts {
-    ChunkParts {
-        reasoning: None,
-        reasoning_signature: None,
-        text: Some(text),
-        tool_events: Vec::new(),
-    }
-}
-
-fn step_start_to_parts(step: Step, tool_ids: &mut streaming::SyntheticIds) -> Vec<ChunkParts> {
-    match step {
-        // Every convertible item, in wire order: a `model_output` step can
-        // interleave text and function calls in one `content` list, and
-        // keeping only the first silently dropped the rest.
-        Step::ModelOutput { content } => content
-            .into_iter()
-            .filter_map(|content| content_to_parts(content, tool_ids))
-            .collect(),
-        Step::FunctionCall(FunctionCallContent {
-            name,
-            arguments,
-            id,
-        }) => {
-            let Some(name) = name else {
-                return Vec::new();
-            };
-            vec![function_call_parts(name, arguments, id, tool_ids)]
-        }
-        _ => Vec::new(),
-    }
-}
-
-/// One output content as one declared chunk.
-///
-/// The wire's single content → block mapping, used by the streamed
-/// `step.start` path and by the unary reply's replay of its own steps, so
-/// the two cannot disagree about what a content item becomes.
-fn content_to_parts(
-    content: Content,
-    tool_ids: &mut streaming::SyntheticIds,
-) -> Option<ChunkParts> {
-    match content {
-        Content::Text(text) if !text.text.is_empty() => Some(text_parts(text.text)),
-        Content::FunctionCall(content) => {
-            step_start_to_parts(Step::FunctionCall(content), tool_ids)
-                .into_iter()
-                .next()
-        }
-        // A thought the reply states whole: the summary's text is the
-        // block's content and the signature closes it, which is the same
-        // pair the streamed `thought_summary`/`thought_signature` deltas
-        // deliver piecewise.
-        Content::Thought(ThoughtContent {
-            summary, signature, ..
-        }) => {
-            let reasoning: String = summary
-                .unwrap_or_default()
-                .into_iter()
-                .filter_map(|content| match content {
-                    ThoughtSummaryContent::Text(text) => Some(text.text),
-                    _ => None,
-                })
-                .collect();
-            if reasoning.is_empty() && signature.is_none() {
-                return None;
-            }
-            Some(ChunkParts {
-                reasoning: (!reasoning.is_empty()).then_some(reasoning),
-                reasoning_signature: signature,
-                text: None,
-                tool_events: Vec::new(),
-            })
-        }
-        // An image the stream vocabulary cannot express rides a text
-        // block's metadata verbatim rather than being dropped — the same
-        // treatment, and the same reason, as GenerateContent's `inlineData`
-        // (`GEMINI_RAW_CONTENT_KEY`).
-        image @ Content::Image(_) => raw_content_parts(image, tool_ids),
-        _ => None,
-    }
-}
-
-/// A content item the stream vocabulary has no block kind for, preserved as
-/// a text block carrying the part verbatim under
-/// [`GEMINI_RAW_CONTENT_KEY`](crate::providers::gemini::GEMINI_RAW_CONTENT_KEY).
-fn raw_content_parts(
-    content: Content,
-    tool_ids: &mut streaming::SyntheticIds,
-) -> Option<ChunkParts> {
-    let params = crate::message::AdditionalParams::from_entries([(
-        crate::providers::gemini::GEMINI_RAW_CONTENT_KEY,
-        serde_json::json!(content),
-    )])?;
-    // Keyed from the same counter every id-less block on this wire draws
-    // from, so a raw block can never collide with a minted tool-call key.
-    let id = tool_ids.mint();
-    Some(ChunkParts {
-        reasoning: None,
-        reasoning_signature: None,
-        text: None,
-        tool_events: vec![
-            streaming::StreamEvent::BlockStart {
-                id: id.clone(),
-                kind: streaming::BlockKind::Text {
-                    additional_params: Some(params),
-                },
-            },
-            streaming::StreamEvent::BlockEnd {
-                id,
-                end: streaming::BlockClose::Text,
-                block: None,
-            },
-        ],
+/// The image a content item states, when it has data or a URI.
+fn image_of(content: &Value) -> Option<Image> {
+    let data = match (content.str("data"), content.str("uri")) {
+        (Some(data), _) => DocumentSourceKind::Base64(data.to_owned()),
+        (None, Some(uri)) => DocumentSourceKind::Url(uri.to_owned()),
+        (None, None) => return None,
+    };
+    Some(Image {
+        data,
+        media_type: content
+            .str("mime_type")
+            .and_then(ImageMediaType::from_mime_type),
+        detail: None,
+        native: None,
     })
 }
 
-fn content_delta_to_parts(
-    delta: ContentDelta,
-    tool_ids: &mut streaming::SyntheticIds,
-) -> Option<ChunkParts> {
-    match delta {
-        ContentDelta::Text(TextDelta {
-            text: Some(text), ..
-        }) => Some(text_parts(text)),
-        ContentDelta::FunctionCall(FunctionCallContent {
-            name,
-            arguments,
-            id,
-        }) => {
-            let name = name?;
-            Some(function_call_parts(name, arguments, id, tool_ids))
+/// Open the block for `content`, a model output's newest content item.
+fn open_content(
+    content: Value,
+    out: &mut Out<'_, Completion>,
+) -> Result<(usize, Value), ProviderError> {
+    let index = out.fresh_index();
+    let block = match content.str("type") {
+        Some("text") => Block::Text,
+        Some("image") => image_of(&content).map_or(Block::Opaque { replay: true }, Block::Image),
+        _ => Block::Opaque { replay: true },
+    };
+    let text = matches!(block, Block::Text);
+    out.open(index, block, Value::Null)?;
+    if let Some(fragment) = content.str("text").filter(|_| text) {
+        out.push(index, fragment)?;
+    }
+    Ok((index, content))
+}
+
+impl InteractionsDecoder {
+    /// The decoder of a stream that reads the interaction `interaction_id`.
+    pub fn resuming(interaction_id: impl Into<String>) -> Self {
+        Self {
+            interaction_id: Some(interaction_id.into()),
+            ..Self::default()
         }
-        // Thought deltas (`thought_summary`, `thought_signature`) are
-        // stateful — the adapter accumulates and restates them in
-        // `interpret`, so they never reach this stateless mapping.
-        _ => None,
+    }
+
+    /// Open the step at `index` as it starts, writing the content it
+    /// already states.
+    fn start(
+        &mut self,
+        index: usize,
+        step: Value,
+        out: &mut Out<'_, Completion>,
+    ) -> Result<(), ProviderError> {
+        let open = match step.str("type") {
+            Some("thought") => {
+                let summary: Vec<String> = step
+                    .arr("summary")
+                    .iter()
+                    .filter(|summary| summary.str("type") == Some("text"))
+                    .filter_map(|summary| summary.str("text").map(str::to_owned))
+                    .collect();
+                out.open(index, Block::Reasoning { redacted: false }, step)?;
+                for text in summary {
+                    out.push(index, &text)?;
+                }
+                Open::Thought
+            }
+            Some("model_output") => {
+                let mut step = step;
+                let content = step
+                    .as_object_mut()
+                    .and_then(|step| step.insert("content".to_owned(), Value::Array(Vec::new())));
+                let items = match content {
+                    Some(Value::Array(items)) => items,
+                    _ => Vec::new(),
+                };
+                let items = items.into_iter().map(|content| open_content(content, out));
+                Open::Output(step, items.collect::<Result<_, _>>()?)
+            }
+            Some("function_call") => {
+                call_fields(index, &step, out)?;
+                out.edit(index, |slot| *slot = step)?;
+                Open::Call(String::new())
+            }
+            // Input a reply restates is kept and never sent back; a
+            // hosted-tool step, or one rig does not know, replays.
+            kind => {
+                let replay = !matches!(kind, Some("user_input" | "function_result"));
+                out.open(index, Block::Opaque { replay }, step)?;
+                Open::Opaque
+            }
+        };
+        self.steps.insert(index, open);
+        Ok(())
+    }
+
+    /// Apply one delta to the step at `index`. A delta for a step that
+    /// never started opens the step it implies: a resumed stream can join
+    /// a step after its start.
+    fn delta(
+        &mut self,
+        index: usize,
+        mut delta: Map<String, Value>,
+        out: &mut Out<'_, Completion>,
+    ) -> Result<(), ProviderError> {
+        let kind = delta
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if !self.steps.contains_key(&index) {
+            let step = match kind {
+                "text" | "text_annotation_delta" | "image" | "audio" | "document" | "video" => {
+                    "model_output"
+                }
+                "thought_summary" | "thought_signature" => "thought",
+                "arguments_delta" => "function_call",
+                other => other,
+            };
+            self.start(index, json!({ "type": step }), out)?;
+        }
+        let Some(open) = self.steps.get_mut(&index) else {
+            return Ok(());
+        };
+        match (open, kind) {
+            // Text and its annotations extend the last text item and its
+            // block; any other delta is a content item of its own.
+            (Open::Output(_, items), _) => match items.last_mut() {
+                Some((block, item))
+                    if matches!(kind, "text" | "text_annotation_delta")
+                        && item.str("type") == Some("text") =>
+                {
+                    if let Some(fragment) = delta.get("text").and_then(Value::as_str)
+                        && kind == "text"
+                    {
+                        out.push(*block, fragment)?;
+                    }
+                    merge(item, &delta);
+                    Ok(())
+                }
+                _ => {
+                    items.push(open_content(Value::Object(delta), out)?);
+                    Ok(())
+                }
+            },
+            (Open::Thought, "thought_summary") => {
+                let content = delta.shift_remove("content").unwrap_or_default();
+                if let Some(text) = content
+                    .str("text")
+                    .filter(|_| content.str("type") == Some("text"))
+                {
+                    out.push(index, text)?;
+                }
+                let summary = Value::Array(vec![content]);
+                out.edit(index, |item| {
+                    merge(item, &Map::from_iter([("summary".to_owned(), summary)]))
+                })
+            }
+            (Open::Call(arguments), "arguments_delta") => {
+                let fragment = match delta.get("arguments") {
+                    Some(Value::String(fragment)) => Cow::Borrowed(fragment.as_str()),
+                    Some(Value::Null) | None => Cow::Borrowed(""),
+                    Some(other) => Cow::Owned(other.to_string()),
+                };
+                arguments.push_str(&fragment);
+                let fragment = CallFragment {
+                    arguments: Some(&fragment),
+                    ..CallFragment::default()
+                };
+                out.fragment(Some(index), fragment)
+            }
+            (open, _) => {
+                if matches!(open, Open::Call(_)) && kind == "function_call" {
+                    call_fields(index, &Value::Object(delta.clone()), out)?;
+                }
+                // A delta that restates its step (it carries the step's own
+                // `type`) replaces the fields it names; any other merges.
+                out.edit(index, |item| {
+                    if item.get("type") != delta.get("type") {
+                        merge(item, &delta);
+                    } else if let Some(item) = item.as_object_mut() {
+                        item.extend(delta);
+                    }
+                })
+            }
+        }
+    }
+
+    /// Finish the step at `index`: the API states it complete.
+    fn stop(&mut self, index: usize, out: &mut Out<'_, Completion>) -> Result<(), ProviderError> {
+        match self.steps.remove(&index) {
+            None => Ok(()),
+            Some(Open::Call(arguments)) => {
+                // Streamed fragments supersede the arguments the start
+                // announced.
+                if !arguments.is_empty()
+                    && let Ok(arguments) = crate::json_utils::parse_tool_arguments(&arguments)
+                {
+                    out.edit(index, |item| {
+                        if let Some(item) = item.as_object_mut() {
+                            item.insert("arguments".to_owned(), arguments);
+                        }
+                    })?;
+                }
+                out.finish(index)
+            }
+            // An output with no content is one empty text block holding it.
+            Some(Open::Output(step, items)) if items.is_empty() => {
+                let block = out.fresh_index();
+                out.open(block, Block::Text, step)?;
+                out.finish(block)
+            }
+            Some(Open::Output(step, items)) => {
+                for (block, item) in items {
+                    for annotation in item.arr("annotations") {
+                        if let Some(citation) = annotation_citation(annotation) {
+                            out.cite(block, citation);
+                        }
+                    }
+                    let mut step = step.clone();
+                    if let Some(step) = step.as_object_mut() {
+                        step.insert("content".to_owned(), Value::Array(vec![item]));
+                    }
+                    out.edit(block, |slot| *slot = step)?;
+                    out.finish(block)?;
+                }
+                Ok(())
+            }
+            Some(Open::Thought | Open::Opaque) => out.finish(index),
+        }
+    }
+
+    /// End the reply with the interaction resource it completed with.
+    fn complete(&mut self, interaction: Map<String, Value>, out: Out<'_, Completion>) -> Flow {
+        let interaction = Value::Object(interaction);
+        let field = |key: &str| interaction.str(key).map(str::to_owned);
+        // An agent interaction names its agent in place of a model.
+        let model = field("model")
+            .or_else(|| field("agent"))
+            .or_else(|| self.model.take());
+        let status = field("status").or_else(|| self.status.take());
+        let (reason, error) = ending(status.as_deref(), interaction.arr("errors"));
+        let finish = Finish {
+            usage: usage_of(interaction.get("usage").unwrap_or(&Value::Null)),
+            reason,
+            response_id: field("id"),
+            model,
+            error,
+        };
+        out.end(finish)
     }
 }
+
+/// The finish an interaction's `status` states, and the failure it reports.
+/// `completed` and `requires_action` (calls wait for results) are
+/// successes; `incomplete` is the token or execution budget running out,
+/// and `budget_exceeded` its deprecated spelling. `failed` and `cancelled`
+/// are failures carrying the interaction's `errors`; `in_progress` and
+/// `queued` are an interaction read before it ended. An unknown status, or
+/// none, is a failure.
+fn ending(status: Option<&str>, errors: &[Value]) -> (Option<FinishReason>, Option<String>) {
+    let messages: Vec<&str> = errors
+        .iter()
+        .filter_map(|error| error.str("message"))
+        .collect();
+    let detail = (!messages.is_empty()).then(|| format!(": {}", messages.join("; ")));
+    let detail = detail.unwrap_or_default();
+    let other = |status: &str| Some(FinishReason::Other(status.to_owned()));
+    match status {
+        Some("completed") => (Some(FinishReason::Stop), None),
+        Some("requires_action") => (Some(FinishReason::ToolCalls), None),
+        Some("incomplete" | "budget_exceeded") => (Some(FinishReason::Length), None),
+        Some(status @ ("failed" | "cancelled")) => (
+            other(status),
+            Some(format!("The interaction {status}{detail}")),
+        ),
+        Some(status @ ("in_progress" | "queued")) => (
+            other(status),
+            Some(format!("The interaction was read while {status}")),
+        ),
+        Some(status) => (other(status), None),
+        None => (None, Some("The interaction states no status".to_owned())),
+    }
+}
+
+/// The citation a text item's annotation states: a `url_citation` cites a
+/// web page, a `file_citation` a document and its page, a `place_citation`
+/// a place by its URL or id. Offsets count bytes of the item's text.
+/// Other annotations cite nothing.
+fn annotation_citation(annotation: &Value) -> Option<WireCitation> {
+    let field = |key: &str| annotation.str(key).map(str::to_owned);
+    let (location, title) = match annotation.str("type")? {
+        "url_citation" => (SourceLocation::Url { url: field("url")? }, field("title")),
+        "file_citation" => {
+            let page = annotation
+                .u64("page_number")
+                .and_then(|page| u32::try_from(page).ok());
+            let within = page.map(|page| DocumentRange::Pages(page..page.saturating_add(1)));
+            let id = field("document_uri");
+            (
+                SourceLocation::Document {
+                    index: None,
+                    id,
+                    within,
+                },
+                field("file_name"),
+            )
+        }
+        "place_citation" => {
+            let location = match (field("url"), field("place_id")) {
+                (Some(url), _) => SourceLocation::Url { url },
+                (None, Some(id)) => SourceLocation::Document {
+                    index: None,
+                    id: Some(id),
+                    within: None,
+                },
+                (None, None) => return None,
+            };
+            (location, field("name"))
+        }
+        _ => return None,
+    };
+    let mut source = Source::new(location);
+    if let Some(title) = title {
+        source = source.title(title);
+    }
+    // Proto3 JSON leaves out a zero start.
+    let span = annotation.u64("end_index").map(|end| {
+        WireSpan::new(
+            annotation.u64("start_index").unwrap_or(0),
+            end,
+            SpanUnit::Bytes,
+        )
+    });
+    Some(WireCitation::new(span, vec![source]))
+}
+
+/// Write the id, name and announced arguments a call step states.
+fn call_fields(
+    index: usize,
+    step: &Value,
+    out: &mut Out<'_, Completion>,
+) -> Result<(), ProviderError> {
+    let (id, name) = (step.str("id"), step.str("name"));
+    out.fragment(
+        Some(index),
+        CallFragment {
+            id,
+            name,
+            arguments: None,
+        },
+    )?;
+    step.get("arguments")
+        .map_or(Ok(()), |arguments| out.announce(index, arguments.clone()))
+}
+
+/// EOF without `interaction.completed` is truncation, not successful
+/// completion, so the decoder has nothing to add at the end of the reply.
+impl<'id> Decoder<'id, Completion> for InteractionsDecoder {
+    type Event = InteractionsEvent;
+
+    /// Classify a frame by its `event_type` tag, or as a whole resource by
+    /// its marker keys when it carries no tag. A tagged frame never passes
+    /// for a whole resource.
+    fn classify(&self, frame: WireFrame) -> WireEvent<InteractionsEvent> {
+        wire::classify_or_untagged(
+            &frame.as_str(),
+            "event_type",
+            |tag| KNOWN_EVENT_TYPES.contains(&tag),
+            InteractionsEvent::Sse,
+            |data| {
+                wire::classify_marker_keyed_frame(data, INTERACTION_MARKER_KEYS)
+                    .map(InteractionsEvent::Whole)
+            },
+        )
+    }
+
+    fn decode(
+        &mut self,
+        event: InteractionsEvent,
+        mut out: Out<'id, Completion>,
+    ) -> Result<Flow, ProviderError> {
+        let SseEvent {
+            event_type,
+            fields: event,
+        } = match event {
+            InteractionsEvent::Sse(event) => event,
+            InteractionsEvent::Whole(mut interaction) => {
+                let steps = match interaction.shift_remove("steps") {
+                    Some(Value::Array(steps)) => steps,
+                    _ => Vec::new(),
+                };
+                for (index, step) in steps.into_iter().enumerate() {
+                    self.start(index, step, &mut out)?;
+                    self.stop(index, &mut out)?;
+                }
+                return Ok(self.complete(interaction, out));
+            }
+        };
+        let mut event = Value::Object(event);
+        let index = |event: &Value| {
+            event
+                .u64("index")
+                .and_then(|index| usize::try_from(index).ok())
+                .ok_or_else(|| {
+                    ProviderError::Response(format!(
+                        "an Interactions `{event_type}` event names no step index"
+                    ))
+                })
+        };
+        let malformed = |field: &str| {
+            ProviderError::Response(format!(
+                "an Interactions `{event_type}` event carries no `{field}` object"
+            ))
+        };
+        let event_id = event.str("event_id").map(str::to_owned);
+        let resumable = event_id.is_some() || event_type == "interaction.created";
+        match event_type.as_str() {
+            "step.start" => match event.get_mut("step").map(Value::take) {
+                // A start that states no step leaves its deltas to open it.
+                None => {}
+                Some(step @ Value::Object(_)) => self.start(index(&event)?, step, &mut out)?,
+                Some(_) => return Err(malformed("step")),
+            },
+            "step.delta" => match event.get_mut("delta").map(Value::take) {
+                Some(Value::Object(delta)) => self.delta(index(&event)?, delta, &mut out)?,
+                _ => return Err(malformed("delta")),
+            },
+            "step.stop" => self.stop(index(&event)?, &mut out)?,
+            "interaction.created" => {
+                let field = |key: &str| {
+                    event
+                        .at(&format!("/interaction/{key}"))
+                        .and_then(Value::as_str)
+                        .map(str::to_owned)
+                };
+                self.model = field("model").or_else(|| field("agent"));
+                self.status = field("status");
+                if let Some(id) = field("id") {
+                    self.interaction_id = Some(id);
+                }
+            }
+            "interaction.status_update" => {
+                if let Some(status) = event.str("status") {
+                    self.status = Some(status.to_owned());
+                }
+            }
+            "interaction.completed" => {
+                let interaction = match event.get_mut("interaction").map(Value::take) {
+                    Some(Value::Object(interaction)) => interaction,
+                    _ => Map::new(),
+                };
+                return Ok(self.complete(interaction, out));
+            }
+            "error" => {
+                let Value::Object(mut body) = event else {
+                    return Err(ProviderError::from_provider_body(event_type));
+                };
+                body.insert("event_type".to_owned(), Value::from(event_type));
+                return Err(ProviderError::from_provider_body(
+                    Value::Object(body).to_string(),
+                ));
+            }
+            _ => {}
+        }
+        if resumable {
+            let cursor = StreamCursor {
+                interaction_id: self.interaction_id.clone(),
+                event_id,
+            };
+            out.unknown(cursor.payload());
+        }
+        Ok(Flow::More)
+    }
+}
+
+pub mod document;
 
 #[cfg(test)]
 mod tests;

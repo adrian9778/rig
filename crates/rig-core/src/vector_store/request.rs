@@ -1,12 +1,18 @@
-//! Types for constructing vector search queries.
+//! Vector-search requests and composable metadata filters.
 //!
-//! - [`VectorSearchRequest`]: Query parameters (text, result count, threshold, filters).
-//! - [`SearchFilter`]: Trait for backend-agnostic filter expressions.
-//! - [`Filter`]: Canonical, serializable filter representation.
+//! ```
+//! use rig_core::vector_store::request::{VectorSearchRequest, Filter, SearchFilter};
+//!
+//! let request: VectorSearchRequest = VectorSearchRequest::builder()
+//!     .query("guide").samples(5)
+//!     .filter(Filter::eq("category", serde_json::json!("manual"))).build();
+//! assert_eq!(request.samples(), 5);
+//! ```
+
+use std::ops::Range;
 
 use serde::{Deserialize, Serialize};
 
-use super::VectorStoreError;
 use crate::markers::{Missing, Provided};
 
 /// A vector search request for querying a [`super::VectorStoreIndex`].
@@ -21,8 +27,6 @@ pub struct VectorSearchRequest<F = Filter<serde_json::Value>> {
     samples: u64,
     /// Minimum similarity score for results.
     threshold: Option<f64>,
-    /// Backend-specific parameters as a JSON object.
-    additional_params: Option<serde_json::Value>,
     /// Filter expression to narrow results by metadata.
     filter: Option<F>,
 }
@@ -49,8 +53,8 @@ impl<Filter> VectorSearchRequest<Filter> {
     }
 
     /// Returns a reference to the optional filter expression.
-    pub fn filter(&self) -> &Option<Filter> {
-        &self.filter
+    pub fn filter(&self) -> Option<&Filter> {
+        self.filter.as_ref()
     }
 
     /// Transforms the filter type using the provided function.
@@ -65,7 +69,6 @@ impl<Filter> VectorSearchRequest<Filter> {
             query: self.query,
             samples: self.samples,
             threshold: self.threshold,
-            additional_params: self.additional_params,
             filter: self.filter.map(f),
         }
     }
@@ -83,7 +86,6 @@ impl<Filter> VectorSearchRequest<Filter> {
             query: self.query,
             samples: self.samples,
             threshold: self.threshold,
-            additional_params: self.additional_params,
             filter,
         })
     }
@@ -126,27 +128,25 @@ pub trait SearchFilter {
 
 /// A rendered SQL-style condition together with its positional bind parameters.
 ///
-/// Shared by the SQL-flavoured vector stores, whose filter algebra differs only
-/// in the parameter type `P` and in the placeholder token their driver expects
-/// (`$` for Postgres, `?` for CQL). The placeholder is therefore supplied by the
-/// caller on every leaf constructor rather than baked into this type.
-///
-/// Parameters are collected left to right in the order their placeholders appear
-/// in [`SqlCondition::condition`], which is the order drivers bind them in.
+/// Parameters retain left-to-right placeholder order. Keys, operators, and
+/// placeholders are interpolated verbatim; callers must validate or quote them
+/// for the target backend. Only values are separated as bind parameters. The
+/// condition records where each placeholder token sits, so
+/// [`SqlCondition::render_placeholders`] rewrites placeholders without touching
+/// spliced text that happens to contain the same characters.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SqlCondition<P> {
     condition: String,
     params: Vec<P>,
+    #[serde(default)]
+    placeholders: Vec<Range<usize>>,
 }
 
 /// Hand-written so that `P` needs no [`Default`] of its own: a parameterless
 /// empty condition is meaningful for every parameter type.
 impl<P> Default for SqlCondition<P> {
     fn default() -> Self {
-        Self {
-            condition: String::new(),
-            params: Vec::new(),
-        }
+        Self::raw(String::new())
     }
 }
 
@@ -154,28 +154,57 @@ impl<P> SqlCondition<P> {
     /// Renders `<key> <op> <placeholder>` bound to a single parameter, e.g.
     /// `price >= $`.
     pub fn binary(key: impl AsRef<str>, op: &str, placeholder: &str, value: P) -> Self {
-        Self {
-            condition: format!("{} {op} {placeholder}", key.as_ref()),
-            params: vec![value],
-        }
+        let mut this = Self::raw(format!("{} {op} ", key.as_ref()));
+        this.push_placeholder(placeholder);
+        this.params.push(value);
+        this
     }
 
     /// Renders `<key> <op> (<placeholder>, ...)` with one placeholder per value,
     /// e.g. `id IN (?, ?)`.
     pub fn list(key: impl AsRef<str>, op: &str, placeholder: &str, values: Vec<P>) -> Self {
-        let placeholders = vec![placeholder; values.len()].join(", ");
-
-        Self {
-            condition: format!("{} {op} ({placeholders})", key.as_ref()),
-            params: values,
+        let mut this = Self::raw(format!("{} {op} (", key.as_ref()));
+        for i in 0..values.len() {
+            if i > 0 {
+                this.condition.push_str(", ");
+            }
+            this.push_placeholder(placeholder);
         }
+        this.condition.push(')');
+        this.params = values;
+        this
+    }
+
+    /// Renders `<key> >= <placeholder> AND <key> <= <placeholder>` bound to
+    /// `lo` then `hi`, e.g. `price >= ? AND price <= ?`.
+    pub fn range(key: impl AsRef<str>, placeholder: &str, lo: P, hi: P) -> Self {
+        let key = key.as_ref();
+        let mut this = Self::raw(format!("{key} >= "));
+        this.push_placeholder(placeholder);
+        this.condition.push_str(&format!(" AND {key} <= "));
+        this.push_placeholder(placeholder);
+        this.params = vec![lo, hi];
+        this
+    }
+
+    /// Renders `<key> between <placeholder> and <placeholder>` bound to `lo`
+    /// then `hi`, e.g. `price between ? and ?`.
+    pub fn between(key: impl AsRef<str>, placeholder: &str, lo: P, hi: P) -> Self {
+        let mut this = Self::raw(format!("{} between ", key.as_ref()));
+        this.push_placeholder(placeholder);
+        this.condition.push_str(" and ");
+        this.push_placeholder(placeholder);
+        this.params = vec![lo, hi];
+        this
     }
 
     /// Wraps an already-rendered, parameterless condition such as `id is null`.
+    /// The text holds no placeholders, whatever characters it contains.
     pub fn raw(condition: impl Into<String>) -> Self {
         Self {
             condition: condition.into(),
             params: Vec::new(),
+            placeholders: Vec::new(),
         }
     }
 
@@ -191,17 +220,37 @@ impl<P> SqlCondition<P> {
 
     /// Negates the condition as `NOT (condition)`, keeping its parameters.
     pub fn not(self) -> Self {
-        Self {
-            condition: format!("NOT ({})", self.condition),
-            ..self
-        }
+        let mut this = Self::raw("NOT (");
+        this.append(self);
+        this.condition.push(')');
+        this
     }
 
     fn combine(self, joiner: &str, rhs: Self) -> Self {
-        Self {
-            condition: format!("({}) {joiner} ({})", self.condition, rhs.condition),
-            params: self.params.into_iter().chain(rhs.params).collect(),
-        }
+        let mut this = Self::raw("(");
+        this.append(self);
+        this.condition.push_str(&format!(") {joiner} ("));
+        this.append(rhs);
+        this.condition.push(')');
+        this
+    }
+
+    fn push_placeholder(&mut self, placeholder: &str) {
+        let start = self.condition.len();
+        self.condition.push_str(placeholder);
+        self.placeholders.push(start..self.condition.len());
+    }
+
+    fn append(&mut self, other: Self) {
+        let offset = self.condition.len();
+        self.condition.push_str(&other.condition);
+        self.params.extend(other.params);
+        self.placeholders.extend(
+            other
+                .placeholders
+                .into_iter()
+                .map(|range| range.start + offset..range.end + offset),
+        );
     }
 
     /// The rendered condition, with placeholders as the caller supplied them.
@@ -212,6 +261,36 @@ impl<P> SqlCondition<P> {
     /// The bind parameters, in placeholder order.
     pub fn params(&self) -> &[P] {
         &self.params
+    }
+
+    /// Returns the condition with the placeholder for parameter `i` (zero-based,
+    /// in [`SqlCondition::params`] order) replaced by `placeholder(i)`, e.g.
+    /// `|i| format!("${}", i + 1)` for Postgres. Only tokens emitted by the
+    /// constructors are replaced; keys and [`SqlCondition::raw`] text are
+    /// copied verbatim.
+    pub fn render_placeholders<D: std::fmt::Display>(
+        &self,
+        mut placeholder: impl FnMut(usize) -> D,
+    ) -> String {
+        use std::fmt::Write as _;
+
+        let mut out = String::with_capacity(self.condition.len() + 2 * self.placeholders.len());
+        let mut copied = 0;
+        for (i, range) in self.placeholders.iter().enumerate() {
+            // Ranges only come from the constructors or deserialization; skip
+            // any that do not fit the text rather than panic.
+            let (Some(before), Some(_)) = (
+                self.condition.get(copied..range.start),
+                self.condition.get(range.clone()),
+            ) else {
+                continue;
+            };
+            out.push_str(before);
+            let _ = write!(out, "{}", placeholder(i));
+            copied = range.end;
+        }
+        out.push_str(self.condition.get(copied..).unwrap_or_default());
+        out
     }
 
     /// Consumes the condition, returning the rendered text and its parameters.
@@ -225,7 +304,7 @@ impl<P> SqlCondition<P> {
 ///
 /// JSON-valued [`SearchFilter`] implementations receive this automatically.
 /// Backends with native value types implement the conversion once here rather
-/// than hand-writing both the bus's `RetrieveAdapter`
+/// than hand-writing both the `RetrieveAdapter`
 /// methods.
 pub trait DynamicSearchFilter: SearchFilter + Sized {
     /// Converts a canonical dynamic filter into this backend's filter type.
@@ -233,9 +312,9 @@ pub trait DynamicSearchFilter: SearchFilter + Sized {
 
     /// Normalizes a document returned through the type-erased search surface.
     ///
-    /// Native backend filters retain their documents exactly. JSON-valued
-    /// filters override this to preserve the dynamic surface's historical
-    /// payload pruning.
+    /// The default retains documents unchanged. The JSON-valued blanket
+    /// implementation recursively removes arrays longer than 400 elements;
+    /// a removed root array becomes null.
     fn normalize_dynamic_document(document: serde_json::Value) -> serde_json::Value {
         document
     }
@@ -366,10 +445,10 @@ where
 impl Filter<serde_json::Value> {
     /// Tests whether a JSON document satisfies this filter.
     ///
-    /// Leaf filters (`Eq`/`Gt`/`Lt`) look their key up in `value` (expected to be
-    /// a JSON object) and compare the resulting field against the filter operand.
-    /// A missing field, or an operand that is not order-comparable with the field,
-    /// never satisfies the leaf. `And`/`Or` combine leaf results.
+    /// Looks up top-level object fields. Missing fields fail all leaves.
+    /// Equality accepts numeric comparison or structural JSON equality; ordering
+    /// compares only number, string, boolean, or null pairs of the same kind.
+    /// `And` and `Or` short-circuit.
     pub fn satisfies(&self, value: &serde_json::Value) -> bool {
         use Filter::*;
         use serde_json::{Value, Value::*};
@@ -377,9 +456,8 @@ impl Filter<serde_json::Value> {
 
         fn compare_pair(l: &Value, r: &Value) -> Option<Ordering> {
             match (l, r) {
-                // Compare integers exactly; fall back to f64 only for floats or
-                // mixed int/float operands. Trying `as_f64` first (as the old
-                // code did) would lose precision for integers beyond 2^53.
+                // Prefer shared integer representations to avoid losing precision
+                // beyond 2^53; other numeric pairs fall back to f64.
                 (Number(l), Number(r)) => {
                     if let (Some(l), Some(r)) = (l.as_i64(), r.as_i64()) {
                         Some(l.cmp(&r))
@@ -425,7 +503,6 @@ pub struct VectorSearchRequestBuilder<F = Filter<serde_json::Value>, Q = Missing
     query: Q,
     samples: S,
     threshold: Option<f64>,
-    additional_params: Option<serde_json::Value>,
     filter: Option<F>,
 }
 
@@ -435,7 +512,6 @@ impl<F> Default for VectorSearchRequestBuilder<F, Missing, Missing> {
             query: Missing,
             samples: Missing,
             threshold: None,
-            additional_params: None,
             filter: None,
         }
     }
@@ -454,7 +530,6 @@ where
             query: Provided(query.into()),
             samples: self.samples,
             threshold: self.threshold,
-            additional_params: self.additional_params,
             filter: self.filter,
         }
     }
@@ -465,7 +540,6 @@ where
             query: self.query,
             samples: Provided(samples),
             threshold: self.threshold,
-            additional_params: self.additional_params,
             filter: self.filter,
         }
     }
@@ -476,15 +550,6 @@ where
         self
     }
 
-    /// Sets backend-specific parameters.
-    pub fn additional_params(
-        mut self,
-        params: serde_json::Value,
-    ) -> Result<Self, VectorStoreError> {
-        self.additional_params = Some(params);
-        Ok(self)
-    }
-
     /// Sets a filter expression.
     pub fn filter(mut self, filter: F) -> Self {
         self.filter = Some(filter);
@@ -492,15 +557,13 @@ where
     }
 }
 
-/// Only implement `build()` when both `query` and `samples` have been provided.
 impl<F> VectorSearchRequestBuilder<F, Provided<String>, Provided<u64>> {
-    /// Builds the request
+    /// Builds without validating query emptiness, sample count, or threshold.
     pub fn build(self) -> VectorSearchRequest<F> {
         VectorSearchRequest {
             query: self.query.0,
             samples: self.samples.0,
             threshold: self.threshold,
-            additional_params: self.additional_params,
             filter: self.filter,
         }
     }
