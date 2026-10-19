@@ -91,7 +91,7 @@ run 作用域：`run_id`、`turn`（AtomicUsize）、`is_streaming`、`agent_nam
 
 ## 🧬 rig-ecs：运行即图（替代运行时）
 
-`crates/rig-ecs/`（未发布，`publish=false`，依赖 `bevy_ecs` + `bevy_tasks`，feature：`replay`(默认)/`reflect`/`assets`）。**不依赖 rig-agent**，直接消费 rig-core 的 effect/serve 契约。
+`crates/rig-ecs/`（已发布，依赖 `bevy_app` + `bevy_ecs` + `bevy_tasks` + `bevy_log` 等；feature：`replay`(默认)/`reflect`/`assets`）。**不依赖 rig-agent**，直接消费 rig-core 的 effect/serve 契约；同时也是 rig 编码 Agent 的 kernel（rig-harness 在其上）。
 
 ### bus 即插件（`src/bus/mod.rs`）
 

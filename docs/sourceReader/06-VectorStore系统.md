@@ -76,9 +76,8 @@ index.clear();                          // :141
 | `rig-postgres` | Postgres | `rig-surrealdb` | SurrealDB |
 | `rig-scylladb` | ScyllaDB | `rig-s3vectors` | AWS S3Vectors |
 | `rig-helixdb` | HelixDB | `rig-vectorize` | Cloudflare Vectorize |
-| `rig-fastembed` | 本地 Fastembed 嵌入 + 索引 | | |
 
-经门面 feature 暴露（`rig::qdrant` ← feature `qdrant`，见 `src/lib.rs` 的 `companion_modules!` 表）。
+`rig-fastembed` 是嵌入伴侣 crate（Fastembed 本地嵌入 + 向量检索工具），`rig-candle` 是本地 CPU 推理 crate（Llama/SmolLM2/Qwen3、YOLOv8）——两者与向量库并列但不同 trait。经门面 feature 暴露（`rig::qdrant` ← feature `qdrant`，见 `src/lib.rs` 的 `companion_modules!` 表）。
 
 ### 伴侣 crate 模式（以 rig-qdrant / rig-sqlite 为范本）
 
@@ -151,6 +150,6 @@ graph LR
 
 ## 🧩 总结
 
-- 契约集中：一个 trait + 统一错误 + 请求结构体，13 个后端可插拔切换。
+- 契约集中：一个 trait + 统一错误 + 请求结构体，12 个后端可插拔切换。
 - 检索与记忆都走 effect bus：可被 hook 门控、可录制重放。
 - 内存实现（BruteForce/LSH）零依赖可测试；服务型后端的真实验证在 service-tests。

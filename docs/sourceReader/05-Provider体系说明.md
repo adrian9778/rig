@@ -82,7 +82,7 @@ impl HasCompletion for Example {
 | VoyageAI | `voyageai` | 嵌入请求参数 |
 | 独立 crate | rig-bedrock（AWS）、rig-vertexai、rig-gemini-grpc | 经门面 feature 暴露 |
 
-### `providers/internal/`（36 个文件）
+### `providers/internal/`（适配层集合）
 
 OpenAI-Chat 兼容（`openai_chat_completions_compatible`）、Anthropic 兼容（`anthropic_compatible`）两大适配层 + envelope（响应信封）、auth、device_auth（设备流）、completion_send、chunk_lifecycle、model_listing（分页列表共享循环，#2339）、audio/image generation 共享件。新 provider 若 wire 兼容某家，优先薄包装适配层而不是重写。
 
@@ -107,7 +107,7 @@ graph TD
 1. 读最接近的现有实现（OpenAI 兼容 → `providers/openai/`；Anthropic 兼容 → `providers/anthropic/`；纯薄包装 → 任一 internal 用户）。
 2. 在 `providers/` 建模块：provider 值类型（`Clone + Debug`，凭据打码）→ `Provider` impl → `Has*` impl → `Client`/`ClientBuilder` 别名与重导出 → 模型常量。
 3. 请求/响应转换 + 流式 + 错误保留（`ProviderResponseError` 保 status/body/headers/request-id；遥测 span 与 `ProviderResponseExt` 遵循现有 GenAI 约定）。
-4. cassette 回归测试：`tests/providers/<provider>/cassette/` + `tests/cassettes/<provider>/`（回放不需要 key；录制需 `RIG_PROVIDER_TEST_MODE=record`）。
+4. cassette 回归测试：`tests/providers/<provider>/cassette/` + `crates/rig-cassette/fixtures/cassettes/<provider>/`（回放不需要 key；录制需 `RIG_PROVIDER_TEST_MODE=record`）。
 5. 根 README/crate 文档的 provider 名录若有维护，随 PR 更新。
 
 ---

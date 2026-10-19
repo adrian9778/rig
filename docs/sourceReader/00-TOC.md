@@ -2,8 +2,8 @@
 
 本目录为 **Rig** 项目的源码级技术文档库，旨在帮助开发者深入理解项目架构与核心组件，并可基于此文档进行代码复现或重构。
 
-> 同步基线：工作区版本 **0.42.0** 之后、下一次发布之前的 main 分支（2026-09 核对）。
-> 该区间包含大量破坏性重构（Provider 泛型客户端、传输层拆分、effect bus、rig-ecs 等），对应 `MIGRATING.md` 的 "0.41 → next" 章节。所有类型签名与文件路径均与当前代码逐条核对。
+> 同步基线：workspace 版本 **0.44.0**（pre-0.45 API review 与 "beat Pi" 五轮 harness 重构落地之后的 main，2026-10 核对）。
+> 相对 0.42 之后的主要变化：传输契约独立为 `rig-http`；新增 rig 编码 Agent 体系——`crates/rig-ecs`（Bevy kernel）、`crates/rig-harness`（harness 主体）、`crates/rig-harness-protocol`、`crates/rig-tools`（读写/编辑/搜索/shell 等编码工具）、`plugins/rig-*` 插件 crate（rig-basics/rig-inspect/rig-steel/rig-tui）、`corpus/*`（公开 API 之上塑形的 17 个测试插件包，publish=false）；根 crate 同时是 `rig` 启动器二进制（`src/main.rs` + `src/launcher/`），按 `$RIG_HOME/plugins.toml` 生成并构建插件化的 harness 工程。所有类型签名与文件路径均与当前代码逐条核对。
 
 ---
 
@@ -22,6 +22,8 @@ docs/sourceReader/
 ├── 08-错误与异常处理.md           # ErrorReport 线错误模型、各域错误枚举、可重试语义
 └── 09-构建与运行说明.md           # 工具链、测试布局、cassette、xtask 验证、发布说明
 ```
+
+> 编码 Agent 侧（rig-harness / rig-tools / plugins / corpus / 根 `rig` 启动器）当前在 01、02、09 篇中作为整体引入；其模块级拆解（Bevy 插件清单、tools 足迹模型、launcher 协议）尚待独立篇章，本目录索引中未单列。
 
 ---
 
@@ -64,7 +66,7 @@ docs/sourceReader/
 > **目的**：详解 Provider 的编写模型（一个 `Provider` 值类型 + 若干 `Has*` 能力实现）、内置 Provider 名录、共享适配层与 cassette 回归测试。
 >
 > **内容包括**：
-> - `providers/internal/` 适配层（36 个文件）
+> - `providers/internal/` 适配层（OpenAI-Chat 与 Anthropic 两大兼容族）
 > - 请求/响应转换与错误保留
 > - 新增 Provider 的步骤清单
 
@@ -93,7 +95,7 @@ docs/sourceReader/
 > - 错误跨边界的转换链
 
 ### 🏗️ 09-构建与运行说明.md
-> **目的**：帮助开发者正确编译、测试和验证项目（Rust 1.95.0 工具链、nextest、cassette、xtask）。
+> **目的**：帮助开发者正确编译、测试和验证项目（Rust 1.97.1 工具链、nextest、cassette、xtask）。
 >
 > **内容包括**：
 > - 工作区成员与测试布局规则
