@@ -317,6 +317,15 @@ unfinished, such as one a crash cut short, and prints its answer; with nothing
 to finish it exits 2. A plugin may keep such a run going, sending the agent
 work over time (`KeepRunning`); each answer is then printed as it comes.
 
+**Driving rig from a script or another agent.** Over pipes, with nothing
+else: `rig -p --json "task"` writes the run as JSON lines, ending with an
+`exit` line that carries the final answer, and `rig --json` stays up, one
+request per line on stdin and one event per line on stdout, until stdin
+closes. `rig help-agents` is the whole protocol, with a Python driver.
+The optional `rig_basics::helpers::HelpersPlugin` gives the model the
+`helper` tool, which hands tasks to such one-shot rig children (one, up to
+eight side by side, or a chain) and returns their final answers.
+
 The system prompt is one fixed text, the same on every request of every
 session, so the provider's prompt cache keeps the whole conversation behind
 it: no date, paths, instruction files or tool rules in it. It tells the model

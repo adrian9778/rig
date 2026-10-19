@@ -33,11 +33,12 @@ so each can be turned off alone.
 - `checkpoint`: what each tool call changed on disk (`CheckpointPlugin`);
 - `reload`: `/reload` and the `reload` tool (`ReloadPlugin`), and
   `/plugins` (`plugins::PluginsPlugin`);
-- `print`: `--print`, the front of a run with `-p` or piped stdin
-  (`PrintPlugin`);
-- `subagents`: the `task`, `message` and `wait` tools (`SubagentsPlugin`);
-- `headless`, no plugin: the driver of a run nobody sits at
-  (`AppHeadlessExt`).
+- `print`: `--print` and `--json`, the fronts of a run with `-p`, piped
+  stdin or JSON lines (`PrintPlugin`), and the loop of any run nobody sits
+  at (`AppHeadlessExt`);
+- `helpers`: the `helper` tool, which runs `rig -p --json` children
+  (`HelpersPlugin`);
+- `subagents`: the `task`, `message` and `wait` tools (`SubagentsPlugin`).
 
 An entry names the crate and the plugin's type by the module that defines
 it, the one path the type has, which `/plugins` and inspect show too:
@@ -51,7 +52,7 @@ plugin = "rig_basics::compaction::CompactionPlugin"
 `rig plugin disable rig_basics::compaction::CompactionPlugin` comments an
 entry out, and `rig plugin enable <type>` puts it back; `/plugins` does the
 same from inside the agent. `ApprovalPlugin`, `PreviewPlugin`,
-`CheckpointPlugin`, `SubagentsPlugin`, `EffectLogPlugin` and
+`CheckpointPlugin`, `HelpersPlugin`, `SubagentsPlugin`, `EffectLogPlugin` and
 `DiagnosticsPlugin` are listed disabled by default. A plugin that needs
 another adds it when it is missing, as `SessionsPlugin` adds
 `SessionPickerPlugin` and `SubagentsPlugin` adds `ApprovalPlugin`.
@@ -77,6 +78,12 @@ bench = ["koh", "exec", "bench", "--sh"]
 With hosts configured, the system prompt names them and the path form, and
 the tools' `path` and `cwd` arguments say they take it. Exit status 255 from
 a transport means the transport failed: a file operation fails saying so,
-and a `shell` call ends with that status. Stopping a `shell` call stops the
-local transport; whether the command on the host stops with it is the
-transport's to say. A project's `.rig/settings.toml` cannot add hosts.
+and a `shell` call ends with that status. A `shell` call stopped, at its
+timeout or otherwise, stops the transport on this machine: `SIGTERM`, then
+`SIGKILL` 2 s later if it still runs, and the call's last line says which.
+Whether the command on the host stops with it is the transport's doing. One
+that hangs up the remote command when it is stopped stops it there; `ssh`
+without a terminal (`-tt`) only closes the command's input and output, so the
+command runs on until it next writes or ends. To bound a command on the host
+whatever the transport, run it under `timeout` there. A project's
+`.rig/settings.toml` cannot add hosts.
