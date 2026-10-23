@@ -37,8 +37,16 @@ const SAMPLE: &str = r#"{
       ],
       "tool_call": true,
       "modalities": {"input": ["text", "image", "pdf"], "output": ["text"]},
-      "limit": {"context": 200000, "output": 64000},
-      "cost": {"input": 3, "output": 15, "cache_read": 0.3},
+      "limit": {"context": 200000, "input": 180000, "output": 64000},
+      "cost": {
+        "input": 3, "output": 15, "cache_read": 0.3,
+        "tiers": [{"input": 6, "output": 22.5, "tier": {"type": "context", "size": 200000}}]
+      },
+      "description": "A model for tests",
+      "interleaved": {"field": "reasoning_content"},
+      "release_date": "2026-01-01",
+      "status": "beta",
+      "experimental": {"modes": {"fast": {"cost": {"input": 6, "output": 30}, "provider": {"body": {"service_tier": "priority"}}}}},
       "rig": {"reasoning_default": "high", "cache": ["none", "short", "long"], "adaptive_thinking": true}
     }
   }},
@@ -79,7 +87,33 @@ fn a_models_dev_row_becomes_a_spec() {
     let claude = spec(&catalog, "anthropic", "claude-x");
     assert_eq!(claude.display_name, "Claude X");
     assert_eq!(claude.context_window, Some(200_000));
+    assert_eq!(claude.max_input_tokens, Some(180_000));
+    assert_eq!(claude.input_limit(), Some(180_000));
     assert_eq!(claude.max_output_tokens, Some(64_000));
+    let details = &claude.details;
+    assert_eq!(details.description.as_deref(), Some("A model for tests"));
+    assert_eq!(details.release_date.as_deref(), Some("2026-01-01"));
+    assert_eq!(details.status.as_deref(), Some("beta"));
+    assert_eq!(
+        details.interleaved,
+        Some(Interleaved::Field {
+            field: "reasoning_content".to_owned()
+        })
+    );
+    assert!(
+        details
+            .output
+            .is_some_and(|output| output.text && !output.image)
+    );
+    let tier = details.cost.tiers.first().expect("a tier");
+    assert_eq!((tier.tier.size, tier.rates.input), (200_000, Some(6.0)));
+    let fast = details.modes.get("fast").expect("a fast mode");
+    assert_eq!(fast.cost.and_then(|cost| cost.output), Some(30.0));
+    let body = fast
+        .provider
+        .as_ref()
+        .and_then(|provider| provider.body.clone());
+    assert_eq!(body, Some(serde_json::json!({"service_tier": "priority"})));
     assert!(claude.input.text && claude.input.image && claude.input.pdf);
     assert!(!claude.input.audio && !claude.input.video);
     assert!(claude.tools && !claude.structured_output && !claude.deprecated);
@@ -1209,6 +1243,32 @@ fn an_unlisted_cache_rate_leaves_its_part_unknown() {
     assert!(cost.is_complete());
 }
 
+#[test]
+fn a_response_aware_write_cost_preserves_other_parts_and_incompleteness() {
+    use crate::completion::Usage;
+    let pricing = Pricing::new(4.0, 20.0)
+        .with_cache_read(0.2)
+        .with_cache_write(5.0);
+    let usage = Usage::new()
+        .input_tokens(1_000_004)
+        .output_tokens(8)
+        .cached_input_tokens(400_000)
+        .cache_creation_input_tokens(600_000);
+    for (write, complete, total) in [(Some(4.8), true, 4.880176), (None, false, 0.080176)] {
+        let Some(cost) = pricing.cost_with_cache_write(&usage, write) else {
+            panic!("input and output are reported");
+        };
+        assert_eq!(cost.cache_write, write);
+        assert_eq!(cost.is_complete(), complete);
+        assert!((cost.total - total).abs() < 1e-12, "{cost:?}");
+    }
+    assert!(
+        pricing
+            .cost_with_cache_write(&Usage::new(), Some(0.0))
+            .is_none()
+    );
+}
+
 /// A fetched models.dev copy that contradicts every key the built-in data
 /// pins: rig's facts gone, and each pinned value changed.
 fn contradicting_models_dev() -> String {
@@ -1385,4 +1445,20 @@ fn reasoning_choices_and_default_options_follow_the_spec() {
         ModelSpec::new(provider, "unknown").default_options(None),
         GenerationOptions::default()
     );
+}
+
+#[test]
+fn the_builtin_catalog_lists_gemini_4_argon_and_gpt_6_input_limits() {
+    let catalog = Catalog::builtin();
+    for vendor in ["gcp.gemini", "vertexai"] {
+        let argon = spec(catalog, vendor, "gemini-4-argon");
+        assert_eq!(argon.display_name, "Gemini 4 Argon", "{vendor}");
+        assert!(
+            argon.reasoning.supported() && argon.pricing.is_some(),
+            "{vendor}"
+        );
+    }
+    let astra = spec(catalog, "chatgpt", "gpt-6-astra");
+    assert_eq!(astra.context_window, Some(1_050_000));
+    assert_eq!(astra.input_limit(), Some(922_000));
 }

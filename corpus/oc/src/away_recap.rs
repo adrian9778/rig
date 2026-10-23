@@ -19,13 +19,13 @@
 use bevy_log::warn;
 use rig_harness::prelude::*;
 use rig_harness::rig_memory::recent::{TokenBudget, view};
-use rig_harness::rig_memory::{Summarizer, SummaryLimits, SummaryPrompts};
+use rig_harness::rig_memory::{CompactReason, Summarizer, SummaryLimits, SummaryPrompts};
 use rig_tui::crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers};
 use rig_tui::ratatui::layout::Constraint;
-use rig_tui::ratatui::widgets::{Block, Paragraph};
+use rig_tui::ratatui::widgets::Paragraph;
 use rig_tui::{
     Editor, InputContext, InputSystems, KeyInput, MainEditor, PanelCanvas, PendingInput, Placement,
-    TuiKeys, TuiPanel, TuiSystems,
+    Theme, TuiKeys, TuiPanel, TuiSystems,
 };
 use serde::Deserialize;
 use std::borrow::Cow;
@@ -292,7 +292,7 @@ fn want_recap(
         &TokenBudget::new(config.budget_tokens),
     );
     let request = connection.and_then(|connection| {
-        let request = summarizer().request(newest, "", "", &connection.spec);
+        let request = summarizer().request(newest, "", &CompactReason::Threshold, &connection.spec);
         Ok((request.map_err(|why| why.to_string())?, connection))
     });
     let (request, connection) = match request {
@@ -409,8 +409,8 @@ fn dismiss_card(
 }
 
 /// Draws the recap's card.
-fn draw_card(mut cards: Query<(&RecapCard, &mut PanelCanvas)>) {
+fn draw_card(mut cards: Query<(&RecapCard, &mut PanelCanvas)>, theme: Res<Theme>) {
     for (card, mut canvas) in &mut cards {
-        canvas.render(Paragraph::new(card.0.as_str()).block(Block::bordered().title(TITLE)));
+        canvas.render(Paragraph::new(card.0.as_str()).block(theme.raised(TITLE)));
     }
 }

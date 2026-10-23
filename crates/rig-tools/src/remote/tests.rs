@@ -6,7 +6,9 @@ use rig_core::tool::{FilesChanged, FilesRead, Scope, Tool, ToolContext, Touches}
 use super::{Hosts, Remote};
 use crate::process::Launcher;
 use crate::workspace::{Local, Workspace};
-use crate::{Edit, EditArgs, Read, ReadArgs, Replacement, Search, SearchArgs, Shell, ShellArgs};
+use crate::{
+    Edit, EditArgs, Read, ReadArgs, Replacement, Search, SearchArgs, Shell, ShellArgs, split_status,
+};
 
 /// A fresh directory under the temporary one, with `local` (this
 /// machine's project) and `home` (the remote user's home) in it.
@@ -209,7 +211,8 @@ fn calls(log: &Path) -> usize {
 }
 
 /// A `read` is one transport call, as is a `write`, of a new file or over
-/// an old one, and an `edit` of a file read whole or edited before; an
+/// an old one, and an `edit` of a file read whole, written or edited
+/// before; an
 /// edit of a file that changed since is two (the write that finds it
 /// changed and sends it back, then the write), as is a `search` that finds
 /// files (the listing, then every file in one script).
@@ -233,12 +236,13 @@ fn each_file_operation_is_one_transport_call() {
         workspace: workspace.clone(),
         base: None,
         confine: false,
-        seen,
+        seen: seen.clone(),
     };
     let write = crate::Write {
         workspace: workspace.clone(),
         base: None,
         confine: false,
+        seen,
     };
     let search = Search {
         workspace,
@@ -270,11 +274,18 @@ fn each_file_operation_is_one_transport_call() {
     let new_file = "bench:~/strata/src/new.rs";
     let (created, _) = call(&write, crate::WriteArgs::new(new_file, "fn new() {}\n"));
     let create_calls = calls(&log);
+    let (fresh, _) = call(
+        &edit,
+        EditArgs::new(new_file, [Replacement::new("new", "fresh")]),
+    );
+    let fresh_calls = calls(&log);
+    let fresh_text = std::fs::read_to_string(home.join("strata/src/new.rs")).ok();
     let (found, _) = call(&search, SearchArgs::new("newer").in_path("bench:~/strata"));
     let search_calls = calls(&log);
     std::fs::remove_dir_all(&dir).ok();
     assert!(shown.is_ok() && edited.is_ok() && again.is_ok() && stale.is_ok());
-    assert!(found.is_ok());
+    assert!(found.is_ok() && fresh.is_ok());
+    assert_eq!(fresh_text.as_deref(), Some("fn fresh() {}\n"));
     assert_eq!(edited_text.as_deref(), Some("fn new() {}\nfn other() {}\n"));
     assert_eq!(
         wrote.ok().as_deref(),
@@ -288,7 +299,10 @@ fn each_file_operation_is_one_transport_call() {
         (read_calls, edit_calls, again_calls, stale_calls),
         (1, 1, 1, 2)
     );
-    assert_eq!((write_calls, create_calls, search_calls), (1, 1, 2));
+    assert_eq!(
+        (write_calls, create_calls, fresh_calls, search_calls),
+        (1, 1, 1, 2)
+    );
 }
 
 /// [`transport`], first appending to `log` how many bytes each call sent
@@ -341,6 +355,50 @@ fn a_read_of_some_lines_is_sent_only_those() {
         "{sent:?}"
     );
     assert_eq!(short.ok().as_deref(), Some("two\n"));
+}
+
+/// A `read` of some lines of a file of at most [`crate::MAX_BYTES`] gets
+/// the whole file in its one call, so an `edit` after it is one call too,
+/// while a larger file is still sent only the lines asked.
+#[test]
+fn an_edit_after_a_read_of_some_lines_of_a_small_file_is_one_call() {
+    let dir = scratch("slice-edit");
+    let home = dir.join("home");
+    let log = dir.join("calls.log");
+    let small: String = (1..=400).map(|n| format!("let x{n} = {n};\n")).collect();
+    std::fs::write(home.join("strata/src/lib.rs"), &small).ok();
+    let bench = Remote::new("bench", counted(&home, &log), Launcher::default());
+    let workspace: Arc<dyn Workspace> = Arc::new(Hosts::new(Arc::new(Local), bench));
+    let seen = crate::Seen::default();
+    let read = Read {
+        workspace: workspace.clone(),
+        base: None,
+        confine: false,
+        seen: seen.clone(),
+    };
+    let edit = Edit {
+        workspace,
+        base: None,
+        confine: false,
+        seen,
+    };
+    let file = "bench:~/strata/src/lib.rs";
+    let (shown, _) = call(&read, ReadArgs::new(file).lines(200, 2));
+    let read_calls = calls(&log);
+    let (edited, _) = call(
+        &edit,
+        EditArgs::new(file, [Replacement::new("x200 = 200", "x200 = 0")]),
+    );
+    let edit_calls = calls(&log);
+    let on_disk = std::fs::read_to_string(home.join("strata/src/lib.rs")).unwrap_or_default();
+    std::fs::remove_dir_all(&dir).ok();
+    assert_eq!(
+        shown.ok().as_deref(),
+        Some("let x200 = 200;\nlet x201 = 201;\n[199 more lines; read on with offset 202]\n")
+    );
+    assert!(edited.is_ok(), "{edited:?}");
+    assert!(on_disk.contains("let x200 = 0;\nlet x201"), "{on_disk}");
+    assert_eq!((read_calls, edit_calls), (1, 1));
 }
 
 /// Reads sent all at once run at most [`super::CALLS_PER_HOST`] at a time
@@ -403,8 +461,11 @@ fn a_host_runs_a_few_file_operations_at_once() {
     );
 }
 
-/// A read whose transport failed (exit 255) is sent once more; a write
-/// never is, and its error says the change may have been made.
+/// A read whose transport failed (exit 255) or was killed, as a dropped
+/// connection's is, is sent once more; a write never is: the file is
+/// checked again instead, and when that fails too, its error says the
+/// write may have happened.
+#[cfg(unix)]
 #[test]
 fn a_failed_transport_is_tried_again_for_a_read_only() {
     let dir = scratch("again");
@@ -412,27 +473,33 @@ fn a_failed_transport_is_tried_again_for_a_read_only() {
     let log = dir.join("calls.log");
     let failed = dir.join("failed");
     std::fs::write(home.join("strata/src/lib.rs"), "fn old() {}\n").ok();
-    // The first call fails, as a connection the server dropped does.
-    let flaky = vec![
-        "sh".to_owned(),
-        "-c".to_owned(),
-        "echo call >> \"$1\"; if [ ! -e \"$2\" ]; then touch \"$2\"; \
-         echo 'closed by peer' >&2; exit 255; fi; \
-         cd \"$0\" && HOME=\"$0\" exec sh -c \"$3\""
-            .to_owned(),
-        home.display().to_string(),
-        log.display().to_string(),
-        failed.display().to_string(),
-    ];
-    let bench = Remote::new("bench", flaky, Launcher::default());
-    let workspace: Arc<dyn Workspace> = Arc::new(Hosts::new(Arc::new(Local), bench));
-    let read = Read {
-        workspace,
-        base: None,
-        confine: false,
-        seen: crate::Seen::default(),
-    };
-    let (shown, _) = call(&read, ReadArgs::new("bench:~/strata/src/lib.rs"));
+    let mut shown = Vec::new();
+    // The first call of each fails, as a connection the server dropped
+    // does, and as one cut on this machine does.
+    for fails in ["echo 'closed by peer' >&2; exit 255", "kill -9 $$"] {
+        std::fs::remove_file(&failed).ok();
+        let flaky = vec![
+            "sh".to_owned(),
+            "-c".to_owned(),
+            format!(
+                "echo call >> \"$1\"; if [ ! -e \"$2\" ]; then touch \"$2\"; {fails}; fi; \
+                 cd \"$0\" && HOME=\"$0\" exec sh -c \"$3\""
+            ),
+            home.display().to_string(),
+            log.display().to_string(),
+            failed.display().to_string(),
+        ];
+        let bench = Remote::new("bench", flaky, Launcher::default());
+        let workspace: Arc<dyn Workspace> = Arc::new(Hosts::new(Arc::new(Local), bench));
+        let read = Read {
+            workspace,
+            base: None,
+            confine: false,
+            seen: crate::Seen::default(),
+        };
+        let (read, _) = call(&read, ReadArgs::new("bench:~/strata/src/lib.rs"));
+        shown.push(read.ok());
+    }
     let read_calls = calls(&log);
     let down = vec![
         "sh".to_owned(),
@@ -445,84 +512,185 @@ fn a_failed_transport_is_tried_again_for_a_read_only() {
     let write_calls = calls(&log);
     let on_disk = std::fs::read_to_string(home.join("strata/src/lib.rs"));
     std::fs::remove_dir_all(&dir).ok();
-    assert_eq!(shown.ok().as_deref(), Some("fn old() {}\n"));
-    assert_eq!((read_calls, write_calls), (2, 1));
+    let old = Some("fn old() {}\n".to_owned());
+    assert_eq!(shown, [old.clone(), old]);
+    assert_eq!((read_calls, write_calls), (4, 3));
     let refused = wrote
         .err()
         .map(|error| error.to_string())
         .unwrap_or_default();
-    assert!(refused.contains("may have been made or not"), "{refused}");
+    assert!(
+        refused.contains(
+            "The file was checked again: that failed too (the transport to bench failed (exit \
+             status 255): closed by peer (tried twice)), so the write may or may not have \
+             happened; read the file before going on"
+        ),
+        "{refused}"
+    );
     assert_eq!(on_disk.ok().as_deref(), Some("fn old() {}\n"));
 }
 
-/// A command there that runs past its timeout is asked to stop first: its
-/// local transport gets `SIGTERM`, the signal a transport may hang up the
-/// remote command on, and `SIGKILL` only when it is still running after a
-/// grace period. The call says which, and that the command there may run
-/// on.
+/// A write whose transport dies mid-write, as a dropped link does, fails
+/// naming the file and saying whether the write happened, from the file's
+/// hash read there again: a write that was lost, and one that landed
+/// before the transport was killed. The edit forgets the text it kept of
+/// the file, so the next edit starts from the file itself (a read, then the
+/// write).
 #[cfg(unix)]
 #[test]
-fn a_timed_out_command_asks_its_transport_to_stop_first() {
+fn a_write_cut_off_mid_way_says_whether_it_happened() {
+    let mut said = Vec::new();
+    let mut texts = Vec::new();
+    let mut next_calls = Vec::new();
+    for (name, dies) in [
+        ("lost", "head -c 3 > /dev/null; exit 1"),
+        (
+            "landed",
+            "cd \"$0\" && HOME=\"$0\" sh -c \"$3\"; kill -9 $$",
+        ),
+    ] {
+        let dir = scratch(name);
+        let home = dir.join("home");
+        let log = dir.join("calls.log");
+        let armed = dir.join("armed");
+        std::fs::write(home.join("strata/src/lib.rs"), "fn old() {}\n").ok();
+        let transport = vec![
+            "sh".to_owned(),
+            "-c".to_owned(),
+            format!(
+                "echo call >> \"$1\"; if [ -e \"$2\" ]; then rm -f \"$2\"; {dies}; fi; \
+                 cd \"$0\" && HOME=\"$0\" exec sh -c \"$3\""
+            ),
+            home.display().to_string(),
+            log.display().to_string(),
+            armed.display().to_string(),
+        ];
+        let bench = Remote::new("bench", transport, Launcher::default());
+        let workspace: Arc<dyn Workspace> = Arc::new(Hosts::new(Arc::new(Local), bench));
+        let seen = crate::Seen::default();
+        let read = Read {
+            workspace: workspace.clone(),
+            base: None,
+            confine: false,
+            seen: seen.clone(),
+        };
+        let edit = Edit {
+            workspace,
+            base: None,
+            confine: false,
+            seen,
+        };
+        let file = "bench:~/strata/src/lib.rs";
+        let (shown, _) = call(&read, ReadArgs::new(file));
+        std::fs::write(&armed, "").ok();
+        let (cut_off, _) = call(&edit, EditArgs::new(file, [Replacement::new("old", "new")]));
+        said.push(
+            cut_off
+                .err()
+                .map(|error| error.to_string())
+                .unwrap_or_default(),
+        );
+        texts.push(std::fs::read_to_string(home.join("strata/src/lib.rs")).unwrap_or_default());
+        calls(&log);
+        let (again, _) = call(
+            &edit,
+            EditArgs::new(file, [Replacement::new("fn", "pub fn")]),
+        );
+        next_calls.push(again.is_ok().then(|| calls(&log)));
+        std::fs::remove_dir_all(&dir).ok();
+        assert!(shown.is_ok());
+    }
+    let ended = [
+        "the operation on bench ended with exit status 1 and said nothing",
+        "the transport to bench was killed by SIGKILL (signal 9), which rig did not send and \
+         said nothing",
+    ];
+    let found = [
+        "it does not hold what this write sent, so the write did not happen; make the change \
+         again",
+        "it holds what this write sent, so the write happened",
+    ];
+    let wanted: Vec<String> = ended
+        .iter()
+        .zip(found)
+        .map(|(ended, found)| {
+            format!(
+                "bench:~/strata/src/lib.rs: the write failed: {ended}. The file was checked \
+                 again: {found}"
+            )
+        })
+        .collect();
+    assert_eq!(said, wanted);
+    assert_eq!(texts, ["fn old() {}\n", "fn new() {}\n"]);
+    assert_eq!(next_calls, [Some(2), Some(2)]);
+}
+
+/// A command there stops when its call does, however the call ends: when
+/// it times out, and when its transport is cut off from outside, as a
+/// dropped connection's is. Its whole process group goes, not only the
+/// process the transport started, and nothing is left running there.
+#[cfg(unix)]
+#[test]
+fn a_command_there_stops_with_its_call() {
     use std::time::{Duration, Instant};
 
     let dir = scratch("stop");
     let home = dir.join("home");
-    let log = dir.join("signals.log");
-    // The transport runs the command in the background and waits for it,
-    // so a signal reaches its trap at once.
-    let transport = |on_term: &str| {
+    let child = home.join("child");
+    // The other machine's side runs in a session of its own, as it does
+    // behind `ssh`, so a signal to the transport here never reaches it; it
+    // reads the transport's stdin, as `ssh` forwards it.
+    let apart = |then: &str| {
         vec![
             "sh".to_owned(),
             "-c".to_owned(),
-            format!("trap '{on_term}' TERM; cd \"$0\" && HOME=\"$0\" sh -c \"$2\" & wait; wait"),
+            format!("exec 3<&0; cd \"$0\" && HOME=\"$0\" setsid sh -c \"$1\" <&3 3<&- & {then}"),
             home.display().to_string(),
-            log.display().to_string(),
         ]
     };
-    let ended = |transport: Vec<String>| {
+    let mut ended = Vec::new();
+    let mut left = Vec::new();
+    for (transport, timeout) in [
+        (apart("wait"), Some(1)),
+        (apart("sleep 1; kill -9 $$"), None),
+    ] {
+        std::fs::remove_file(&child).ok();
         let bench = Remote::new("bench", transport, Launcher::default());
         let shell = Shell {
             workspace: Arc::new(Hosts::new(Arc::new(Local), bench)),
             ..Shell::default()
         };
-        let started = Instant::now();
-        let args = ShellArgs::new("sleep 30").in_dir("bench:~").timeout_secs(1);
+        let mut args =
+            ShellArgs::new("sleep 300 & echo $! > ~/child; echo started; wait").in_dir("bench:~");
+        args.timeout_secs = timeout;
         let ran = futures::executor::block_on(shell.run(args));
-        (
-            ran.map(|ran| ran.output).unwrap_or_default(),
-            started.elapsed(),
-        )
-    };
-    let (hung_up, quick) = ended(transport("echo TERM >> \"$1\"; exit 143"));
-    let heard = std::fs::read_to_string(&log).unwrap_or_default();
-    // One that will not stop is killed.
-    let deaf = vec![
-        "sh".to_owned(),
-        "-c".to_owned(),
-        "trap 'echo ignored >> \"$0\"' TERM; while :; do sleep 0.1; done".to_owned(),
-        log.display().to_string(),
-    ];
-    let (deaf, slow) = ended(deaf);
-    let heard_again = std::fs::read_to_string(&log).unwrap_or_default();
+        let output = ran.map(|ran| ran.output).unwrap_or_default();
+        ended.push(split_status(&output).1.unwrap_or_default().to_owned());
+        let pid = std::fs::read_to_string(&child).unwrap_or_default();
+        let alive = || {
+            std::process::Command::new("kill")
+                .args(["-0", pid.trim()])
+                .status()
+                .is_ok_and(|status| status.success())
+        };
+        let started = Instant::now();
+        while alive() && started.elapsed() < crate::process::STOP_GRACE * 3 {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        left.push(!pid.trim().is_empty() && alive());
+    }
     std::fs::remove_dir_all(&dir).ok();
-    assert!(
-        hung_up.starts_with(
-            "[timed out after 1s and stopped: it got SIGTERM and ended. That was the transport \
-             on this machine; whether the command on bench stopped too is the transport's \
-             doing, so check there before running it again."
-        ),
-        "{hung_up}"
+    assert_eq!(
+        ended.first().map(String::as_str),
+        Some("[timed out after 1s and stopped, on bench too]")
     );
-    assert_eq!(heard, "TERM\n");
-    assert!(quick < crate::process::STOP_GRACE, "{quick:?}");
     assert!(
-        deaf.contains("[timed out after 1s and stopped: it got SIGTERM, then SIGKILL 2s later"),
-        "{deaf}"
+        ended.get(1).is_some_and(|it| it
+            .starts_with("[killed by SIGKILL (signal 9), which this tool did not send")
+            && it.ends_with(
+                "It was the connection to bench, and the command there was stopped with it]"
+            )),
+        "{ended:?}"
     );
-    assert_eq!(heard_again, "TERM\nignored\n");
-    let most = Duration::from_secs(1) + crate::process::STOP_GRACE * 3;
-    assert!(
-        slow >= crate::process::STOP_GRACE && slow < most,
-        "{slow:?}"
-    );
+    assert_eq!(left, [false, false]);
 }

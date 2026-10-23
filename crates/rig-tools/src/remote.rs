@@ -8,7 +8,10 @@
 //! and ends with 255 when the transport itself failed: `ssh` does, and so
 //! does `koh exec`. Every file operation is one short `sh` script run that
 //! way, at most [`CALLS_PER_HOST`] at once, and every process a local
-//! transport process running the command there.
+//! transport process running the command there. That command is stopped
+//! there when the transport's stdin closes, which this side holds open
+//! until the process ends or is stopped, so a timeout, an interrupt or a
+//! lost connection leaves nothing running on the other machine.
 //!
 //! ```no_run
 //! use std::path::Path;
@@ -41,13 +44,13 @@ use std::thread;
 
 use ignore::overrides::OverrideBuilder;
 
-use rig_core::tool::ContentHash;
+use rig_core::tool::{ContentHash, content_hash};
 
-use crate::MAX_FILE_BYTES;
-use crate::process::{Launcher, Process, Spawn};
+use crate::process::{Launcher, Process, STOP_GRACE, Spawn};
 use crate::workspace::{
     Contents, Excerpt, Listing, Stat, Workspace, excerpt_of, not_text, read_file, too_large,
 };
+use crate::{MAX_BYTES, MAX_FILE_BYTES};
 
 /// The exit status with which a transport says it failed, as `ssh` does.
 pub const TRANSPORT_FAILED: i32 = 255;
@@ -118,8 +121,18 @@ impl Drop for Turn<'_> {
 /// What a remote script printed and how it ended.
 struct Ran {
     code: Option<i32>,
+    /// The signal that ended the transport, when one did.
+    signal: Option<i32>,
     out: Vec<u8>,
     err: String,
+}
+
+impl Ran {
+    /// Whether the transport failed or was killed, so the script may not
+    /// have run there at all.
+    fn dropped(&self) -> bool {
+        self.code.is_none_or(|code| code == TRANSPORT_FAILED)
+    }
 }
 
 impl fmt::Debug for Remote {
@@ -211,23 +224,28 @@ impl Remote {
             }
             child.wait_with_output()
         })?;
+        #[cfg(unix)]
+        let signal = std::os::unix::process::ExitStatusExt::signal(&output.status);
+        #[cfg(not(unix))]
+        let signal = None;
         Ok(Ran {
             code: output.status.code(),
+            signal,
             out: output.stdout,
             err: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
         })
     }
 
-    /// Runs `script` there, failing when the transport failed, after
-    /// trying again once when `again` allows.
+    /// Runs `script` there, failing when the transport failed or was
+    /// killed, after trying again once when `again` allows.
     fn run(&self, script: &str, stdin: Option<&[u8]>, again: Again) -> io::Result<Ran> {
         let mut ran = self.once(script, stdin)?;
-        if ran.code == Some(TRANSPORT_FAILED) && again == Again::Once {
+        if ran.dropped() && again == Again::Once {
             ran = self.once(script, stdin)?;
         }
-        match ran.code {
-            Some(TRANSPORT_FAILED) => Err(self.failed(&ran.err, again)),
-            _ => Ok(ran),
+        match ran.dropped() {
+            true => Err(self.failed(&ran, again)),
+            false => Ok(ran),
         }
     }
 
@@ -235,6 +253,12 @@ impl Remote {
     /// error, another an error with its stderr.
     fn checked(&self, script: &str, stdin: Option<&[u8]>, again: Again) -> io::Result<Vec<u8>> {
         let ran = self.run(script, stdin, again)?;
+        self.outcome(ran, again)
+    }
+
+    /// What `ran` comes to: its output on exit 0, the error an exit code
+    /// the scripts name stands for, or [`failed`](Self::failed).
+    fn outcome(&self, ran: Ran, again: Again) -> io::Result<Vec<u8>> {
         match ran.code {
             Some(0) => Ok(ran.out),
             Some(NOT_FOUND) => Err(ErrorKind::NotFound.into()),
@@ -247,31 +271,103 @@ impl Remote {
                 "the file is read-only; leave it unchanged or ask the user",
             )),
             Some(A_DIRECTORY) => Err(ErrorKind::IsADirectory.into()),
-            _ => Err(io::Error::other(ran.err)),
+            _ => Err(self.failed(&ran, again)),
         }
     }
 
-    /// What a call fails with when the transport ended with
-    /// [`TRANSPORT_FAILED`], having said `err`, after the tries `again`
-    /// allowed: a script that writes may have done its work.
-    fn failed(&self, err: &str, again: Again) -> io::Error {
-        let said = match err {
-            "" => String::new(),
-            err => format!(": {err}"),
-        };
+    /// What a call fails with when its script ended as `ran` did, with no
+    /// exit status the script names: how it ended, what it said, and, for
+    /// a script that writes, that it may have done its work. The transport
+    /// failed when it ended with [`TRANSPORT_FAILED`] or by a signal, after
+    /// the tries
+    /// `again` allowed.
+    fn failed(&self, ran: &Ran, again: Again) -> io::Error {
+        let (kind, ended) = self.ended(ran);
         let after = match again {
-            Again::Once => " (tried twice)",
+            Again::Once if ran.dropped() => " (tried twice)",
+            Again::Once => "",
             Again::Never => {
                 "; the change may have been made or not, so read the file before trying again"
             }
         };
-        io::Error::new(
-            ErrorKind::NotConnected,
-            format!(
-                "the transport to {} failed (exit status {TRANSPORT_FAILED}){said}{after}",
-                self.name
+        io::Error::new(kind, format!("{ended}{after}"))
+    }
+
+    /// How a script that ended as `ran` did ended, and what it said.
+    fn ended(&self, ran: &Ran) -> (ErrorKind, String) {
+        let name = &self.name;
+        let (kind, how) = match ran.code {
+            Some(TRANSPORT_FAILED) => (
+                ErrorKind::NotConnected,
+                format!("the transport to {name} failed (exit status {TRANSPORT_FAILED})"),
             ),
-        )
+            Some(code) => (
+                ErrorKind::Other,
+                format!("the operation on {name} ended with exit status {code}"),
+            ),
+            None => (
+                ErrorKind::ConnectionAborted,
+                match ran.signal {
+                    #[cfg(unix)]
+                    Some(signal) => format!(
+                        "the transport to {name} was killed by {} (signal {signal}), which rig \
+                         did not send",
+                        crate::shell::sent(signal).0
+                    ),
+                    _ => format!("the transport to {name} was killed by a signal rig did not send"),
+                },
+            ),
+        };
+        let said = match ran.err.as_str() {
+            "" => " and said nothing".to_owned(),
+            err => format!(": {err}"),
+        };
+        (kind, format!("{how}{said}"))
+    }
+
+    /// Runs `script`, which writes `bytes` to the file `path`, once. When
+    /// it ends with no exit status it names, such as a transport that
+    /// dropped mid-write, the file is hashed there again (a read, so tried
+    /// twice) and the error says whether it holds `bytes`: whether the
+    /// write happened.
+    fn written(&self, path: &Path, script: &str, bytes: &[u8]) -> io::Result<Vec<u8>> {
+        let ran = self.once(script, Some(bytes))?;
+        if matches!(
+            ran.code,
+            Some(0 | NOT_FOUND | NOT_A_FILE | READ_ONLY | A_DIRECTORY)
+        ) {
+            return self.outcome(ran, Again::Never);
+        }
+        let (kind, ended) = self.ended(&ran);
+        let check = format!(
+            "p={}; [ -f \"$p\" ] || exit {NOT_FOUND}; \
+             h=$({{ sha256sum || shasum -a 256; }} < \"$p\" 2>/dev/null); echo \"${{h%% *}}\"",
+            quote_path(path)
+        );
+        let checked = self.checked(&check, None, Again::Once);
+        let sent = content_hash(bytes).0;
+        let found = match checked.as_deref().map(|out| String::from_utf8_lossy(out)) {
+            Ok(hash) if hash.trim() == sent => {
+                "it holds what this write sent, so the write happened".to_owned()
+            }
+            Ok(hash) if !hash.trim().is_empty() => "it does not hold what this write sent, so \
+                 the write did not happen; make the change again"
+                .to_owned(),
+            Err(error) if error.kind() == ErrorKind::NotFound => {
+                "it is not there, so the write did not happen; make the change again".to_owned()
+            }
+            Ok(_) => "it could not be hashed there, so the write may or may not have \
+                 happened; read the file before going on"
+                .to_owned(),
+            Err(error) => format!(
+                "that failed too ({error}), so the write may or may not have happened; read \
+                 the file before going on"
+            ),
+        };
+        Err(io::Error::new(
+            kind,
+            format!("the write failed: {ended}. The file was checked again: {found}"),
+        ))
     }
 
     /// What a call fails with when its transport could not start.
@@ -329,9 +425,10 @@ impl Workspace for Remote {
     }
 
     /// One script that sends the file's size, its line count, its hash and
-    /// only the lines asked, all of a copy made aside first, so they agree
-    /// when the file changes meanwhile. A machine with neither `sha256sum`
-    /// nor `shasum` sends the whole file in a second call, to hash it here.
+    /// only the lines asked, or the whole file when it is at most
+    /// [`MAX_BYTES`], all of a copy made aside first, so they agree when
+    /// the file changes meanwhile. A machine with neither `sha256sum` nor
+    /// `shasum` sends a larger file whole in a second call, to hash it here.
     fn excerpt(&self, path: &Path, first: usize, count: usize) -> io::Result<Excerpt> {
         let first = first.max(1);
         let last = first.saturating_add(count.max(1) - 1);
@@ -339,9 +436,9 @@ impl Workspace for Remote {
             "p={}; [ -f \"$p\" ] || {{ [ -e \"$p\" ] && exit {NOT_A_FILE}; exit {NOT_FOUND}; }}; \
              s=$(wc -c < \"$p\") || exit 1; [ $s -le {MAX_FILE_BYTES} ] || {{ echo $s; exit 0; }}; \
              t=$(mktemp) || exit 1; trap 'rm -f \"$t\"' EXIT; cat -- \"$p\" > \"$t\" || exit 1; \
-             wc -c < \"$t\" && wc -l < \"$t\" && tail -c 1 \"$t\" | wc -l && \
+             s=$(wc -c < \"$t\") && echo $s && wc -l < \"$t\" && tail -c 1 \"$t\" | wc -l && \
              {{ sha256sum || shasum -a 256 || echo -; }} < \"$t\" 2>/dev/null && \
-             sed -n '{first},{last}p;{last}q' \"$t\"",
+             if [ $s -le {MAX_BYTES} ]; then cat \"$t\"; else sed -n '{first},{last}p;{last}q' \"$t\"; fi",
             quote_path(path)
         );
         let out = self.checked(&script, None, Again::Once)?;
@@ -360,17 +457,21 @@ impl Workspace for Remote {
         let (Some(newlines), Some(ends_in_newline), Some(hash)) = (line(), line(), line()) else {
             return Err(io::Error::other("the remote read stopped short"));
         };
+        let text = String::from_utf8(rest.to_vec()).map_err(|_| not_text());
+        if size <= MAX_BYTES as u64 {
+            return Ok(Excerpt::of(&text?, first, count));
+        }
         let hash = hash.split_whitespace().next().unwrap_or_default();
         if hash.len() != 64 {
             return excerpt_of(self, path, first, count);
         }
         let newlines: usize = newlines.parse().map_err(io::Error::other)?;
         let unended = size > 0 && ends_in_newline == "0";
-        let text = String::from_utf8(rest.to_vec()).map_err(|_| not_text())?;
         Ok(Excerpt {
-            text,
+            text: text?,
             total: newlines + usize::from(unended),
             hash: ContentHash(hash.to_ascii_lowercase()),
+            whole: None,
         })
     }
 
@@ -435,7 +536,7 @@ impl Workspace for Remote {
              cat > \"$t\" && mv -f -- \"$t\" \"$p\" || {{ rm -f -- \"$t\"; exit 1; }}",
             quote_path(path)
         );
-        let out = self.checked(&script, Some(bytes), Again::Never)?;
+        let out = self.written(path, &script, bytes)?;
         Ok(match split_line(&out) {
             None => Err(ErrorKind::NotFound.into()),
             Some((size, bytes)) => size
@@ -471,7 +572,7 @@ impl Workspace for Remote {
             quote_path(path),
             quote(&held.0)
         );
-        let out = self.checked(&script, Some(bytes), Again::Never)?;
+        let out = self.written(path, &script, bytes)?;
         let Some((first, rest)) = split_line(&out) else {
             return Err(io::Error::other("the remote write said nothing"));
         };
@@ -558,7 +659,7 @@ impl Workspace for Remote {
             Some(ROOT_IS_A_FILE) => return Ok(vec![root.to_path_buf()]),
             Some(0) => {}
             Some(NOT_FOUND) => return Err(ErrorKind::NotFound.into()),
-            _ => return Err(io::Error::other(ran.err)),
+            _ => return Err(self.failed(&ran, Again::Once)),
         }
         let mut files: Vec<PathBuf> = String::from_utf8_lossy(&ran.out)
             .split('\0')
@@ -592,20 +693,26 @@ impl Workspace for Remote {
         how: Spawn,
     ) -> io::Result<Process> {
         let dir = dir.unwrap_or(Path::new("~"));
-        let mut script = format!("cd {} && exec env", quote_path(&self.canonical(dir)));
+        let mut run = String::from("env");
         for (name, value) in &launcher.env {
             let set = format!("{}={}", name.to_string_lossy(), value.to_string_lossy());
-            script.push_str(&format!(" {}", quote(&set)));
+            run.push_str(&format!(" {}", quote(&set)));
         }
-        script.push_str(" sh -lc 'exec \"$0\" \"$@\"'");
+        run.push_str(" sh -lc 'exec \"$0\" \"$@\"'");
         for word in std::iter::once(program).chain(args.iter().map(OsString::as_os_str)) {
-            script.push_str(&format!(" {}", quote(&word.to_string_lossy())));
+            run.push_str(&format!(" {}", quote(&word.to_string_lossy())));
         }
+        let cd = format!("cd {} || exit", quote_path(&self.canonical(dir)));
+        let hold = how.stdin.is_none();
+        let script = match hold {
+            true => format!("{cd}; {}", guarded(&run)),
+            false => format!("{cd}; exec {run}"),
+        };
         let (transport, line) = self.command(&script)?;
         let mut launcher = launcher.clone();
         launcher.cwd = None;
         launcher
-            .spawn(&transport, line, how)
+            .spawn_holding(&transport, line, how, hold)
             .map(|process| process.through(&self.name))
             .map_err(|error| self.unstarted(&transport, error))
     }
@@ -819,6 +926,28 @@ fn split_line(bytes: &[u8]) -> Option<(String, &[u8])> {
         String::from_utf8_lossy(line).into_owned(),
         rest.get(1..).unwrap_or_default(),
     ))
+}
+
+/// A script that runs the command line `run` there, with an empty stdin,
+/// in a session of its own where `setsid` is found, and stops it when the
+/// script's own stdin closes: the transport's, which this side holds open
+/// with nothing written, so it closes when the transport goes, as when a
+/// call times out, is interrupted or rig ends, or when the script is
+/// signalled to hang up or stop. The stop asks the command's group (its
+/// process alone without `setsid`) to end, and kills it [`STOP_GRACE`]
+/// later. The script ends as the command does.
+fn guarded(run: &str) -> String {
+    let grace = STOP_GRACE.as_secs().max(1);
+    format!(
+        "exec 3<&0 </dev/null; \
+         command -v setsid >/dev/null 2>&1 || setsid() {{ exec \"$@\"; }}; \
+         setsid {run} 3<&- & c=$!; \
+         stop() {{ kill -TERM -$c || kill -TERM $c; sleep {grace}; \
+         kill -KILL -$c || kill -KILL $c; }} 2>/dev/null; \
+         {{ read -r x <&3; stop; }} >/dev/null 2>&1 & w=$!; \
+         trap 'kill $w; stop; exit 143' HUP INT TERM; \
+         exec 3<&-; wait $c; s=$?; kill $w 2>/dev/null; exit $s"
+    )
 }
 
 /// `text` quoted for `sh`.

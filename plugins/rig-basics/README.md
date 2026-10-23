@@ -8,12 +8,17 @@ so each can be turned off alone.
 - the root: `BasicCommandsPlugin` (`/help`, `/retry`, `/quit`);
 - `prompt`: rig's fixed system prompt for an agent without one
   (`DefaultPromptPlugin`, `DEFAULT_SYSTEM_PROMPT`);
+- `agents_md`: the project's and the user's `AGENTS.md` files in the system
+  prompt (`AgentsMdPlugin`);
+- `skills`: the skills listed in the system prompt, and `/skill:<name>`
+  (`SkillsPlugin`);
 - `models`: `/model`, `/effort` and the model picker (`ModelsPlugin`), and
   the model a new session starts on (`defaults::DefaultsPlugin`);
-- `login_chatgpt`: `/login` and `/logout` for the ChatGPT plan's models
-  (`ChatgptLoginPlugin`);
+- `login`: `/login` and `/logout` for the ChatGPT plan's models and the
+  providers' API keys (`LoginPlugin`);
 - `session_picker`: the session and conversation lists of `/resume`,
-  `/fork` and `/agents` (`SessionPickerPlugin`);
+  `/fork` and `/agents` (`SessionPickerPlugin`, which the plugins of those
+  commands add, so it is not listed on its own);
 - `sessions`: `/new`, `/resume` and `/name` (`SessionsPlugin`), and `/fork`,
   `/agents` and rewind (`agents::AgentsPlugin`);
 - `compaction`: summarizing a conversation near the model's window, and
@@ -39,6 +44,22 @@ so each can be turned off alone.
 - `helpers`: the `helper` tool, which runs `rig -p --json` children
   (`HelpersPlugin`);
 - `subagents`: the `task`, `message` and `wait` tools (`SubagentsPlugin`).
+
+In TUI, print and JSON runs, omitting `--tools` preserves each agent's tool access.
+`--tools=` permits no tools; `--tools=read,write` intersects each agent's
+existing access with those names before its first request and at execution.
+Unknown names grant no access, so an entirely unknown list selects no tools.
+This limit also applies to subagents, including their normally supplied
+`message` and `wait` tools: include those names when children need them.
+Subagents cannot use this flag to broaden their inherited restrictions.
+Access is intersected in Prepare Input and already-built tool advertisements
+are pruned in Prepare Edit, before dispatch and in a defined order with session
+persistence.
+
+`/usage` reports provider-supplied cost when available, otherwise API list-price
+estimates. These are not subscription charges or verified invoices. Missing
+usage details or prices leave a partial estimate; previously saved estimates
+are not retroactively recalculated.
 
 An entry names the crate and the plugin's type by the module that defines
 it, the one path the type has, which `/plugins` and inspect show too:
@@ -78,12 +99,9 @@ bench = ["koh", "exec", "bench", "--sh"]
 With hosts configured, the system prompt names them and the path form, and
 the tools' `path` and `cwd` arguments say they take it. Exit status 255 from
 a transport means the transport failed: a file operation fails saying so,
-and a `shell` call ends with that status. A `shell` call stopped, at its
-timeout or otherwise, stops the transport on this machine: `SIGTERM`, then
-`SIGKILL` 2 s later if it still runs, and the call's last line says which.
-Whether the command on the host stops with it is the transport's doing. One
-that hangs up the remote command when it is stopped stops it there; `ssh`
-without a terminal (`-tt`) only closes the command's input and output, so the
-command runs on until it next writes or ends. To bound a command on the host
-whatever the transport, run it under `timeout` there. A project's
+and a `shell` call ends with that status. A transport must forward its stdin
+and close it there when it ends: a `shell` command on the host stops when
+that stdin closes, so a call stopped at its timeout, interrupted, or cut off
+by a transport killed on this machine leaves nothing running there. `ssh`
+does this; `koh exec` does on a stop or when its stdin closes. A project's
 `.rig/settings.toml` cannot add hosts.

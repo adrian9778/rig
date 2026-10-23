@@ -330,10 +330,11 @@ fn add_defaults(app: &mut App) {
     use rig_basics::*;
     use rig_harness::load;
     load::<prompt::DefaultPromptPlugin>(app, "rig-basics", "");
+    load::<agents_md::AgentsMdPlugin>(app, "rig-basics", "");
+    load::<skills::SkillsPlugin>(app, "rig-basics", "");
     load::<models::ModelsPlugin>(app, "rig-basics", "");
-    load::<login_chatgpt::ChatgptLoginPlugin>(app, "rig-basics", "");
+    load::<login::LoginPlugin>(app, "rig-basics", "");
     load::<models::defaults::DefaultsPlugin>(app, "rig-basics", "");
-    load::<session_picker::SessionPickerPlugin>(app, "rig-basics", "");
     load::<sessions::SessionsPlugin>(app, "rig-basics", "");
     load::<sessions::agents::AgentsPlugin>(app, "rig-basics", "");
     load::<compaction::CompactionPlugin>(app, "rig-basics", "");
@@ -347,6 +348,7 @@ fn add_defaults(app: &mut App) {
     load::<reload::ReloadPlugin>(app, "rig-basics", "");
     load::<reload::plugins::PluginsPlugin>(app, "rig-basics", "");
     load::<BasicCommandsPlugin>(app, "rig-basics", "");
+    load::<welcome::WelcomePlugin>(app, "rig-basics", "");
     load::<print::PrintPlugin>(app, "rig-basics", "");
     #[cfg(feature = "tui")]
     load::<rig_tui::TuiPlugin>(app, "rig-tui", "");

@@ -71,7 +71,7 @@ fn a_read_says_which_lines_it_showed_when_it_published_them() {
     assert!(part.contains("     3  three\n"), "{part}");
     assert!(part.contains("     4  four\n"), "{part}");
     assert!(
-        part.ends_with("    [3 more lines; read on with offset 5]"),
+        part.ends_with("   [3 more lines; read on with offset 5]"),
         "{part}"
     );
     let whole = shown(1, 7);
@@ -118,12 +118,12 @@ fn a_read_file_is_drawn_in_its_languages_colors() {
     );
     assert_eq!(
         lines.get(1).map(ToString::to_string).as_deref(),
-        Some("  ⎿ fn main() {}")
+        Some("   fn main() {}")
     );
 }
 
-/// An edit's reply is one line; the terminal draws the whole change it
-/// published, the lines around it too.
+/// The terminal draws an edit's reply without the file's lines it shows
+/// the model, then the whole change it published, the lines around it too.
 #[test]
 fn an_edit_is_drawn_as_the_diff_it_published() {
     let change = FileChange::modified("/p/a.rs", 1, 1).with_hunks(vec![Hunk {
@@ -139,7 +139,7 @@ fn an_edit_is_drawn_as_the_diff_it_published() {
     context.insert_result(FilesChanged(vec![change])).ok();
     let facts = context.result_context();
     let args = json!({ "path": "a.rs", "edits": [] });
-    let reply = "Edited a.rs: line 2.";
+    let reply = "Edited a.rs: line 2.\n[lines 1-2]\nkept_context();\nnew_call();";
     let drew = drawn_with(edit, "edit", args.clone(), reply, Some(&facts));
     for text in [
         "Edited a.rs: line 2.",
@@ -149,7 +149,8 @@ fn an_edit_is_drawn_as_the_diff_it_published() {
     ] {
         assert!(drew.contains(text), "{text}: {drew}");
     }
-    let without = drawn(edit, "edit", args, reply);
+    assert!(!drew.contains("[lines 1-2]"), "{drew}");
+    let without = drawn(edit, "edit", args, "Edited a.rs: line 2.");
     assert!(!without.contains("new_call"), "{without}");
-    assert!(without.contains(reply), "{without}");
+    assert!(without.contains("Edited a.rs: line 2."), "{without}");
 }

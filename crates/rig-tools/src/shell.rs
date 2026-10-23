@@ -21,7 +21,6 @@ use crate::process::{Ended, KillOnDrop, Launcher, OutputLine, Process, Spawn};
 use crate::workspace::{Local, Workspace};
 use crate::{Live, OutputLimit, Spill, blocking, clip};
 
-const DEFAULT_TIMEOUT: u64 = 120;
 /// Output past which the command is killed. While it runs, only what the
 /// [`OutputLimit`] keeps, and each stream's unfinished line, is held in
 /// memory.
@@ -29,9 +28,10 @@ const OUTPUT_LIMIT: u64 = 10 * 1024 * 1024;
 
 /// Runs a command with `sh -c` in its own session and process group, in its
 /// [`Workspace`], as its [`Launcher`] starts processes. Its stdout and
-/// stderr come back interleaved line by line, as each line ends; output
-/// past the [`OutputLimit`] keeps its first and last lines and the errors
-/// and failures from between. Publishes how the
+/// stderr come back interleaved line by line, as each line ends, without
+/// terminal escape sequences such as colours; output past the
+/// [`OutputLimit`] keeps its first and last lines and the first and last
+/// errors and failures from between. Publishes how the
 /// command ended ([`ExitStatus`]) beside its output, and how the output was
 /// cut ([`OutputCut`]) when it was, and reports the output
 /// as it comes to its [`Live`], if it has one.
@@ -54,20 +54,11 @@ pub struct Shell {
     /// refused. What the command itself does is not confined: it may still
     /// `cd` anywhere.
     pub confine: bool,
-    /// The most seconds a call may ask for in `timeout_secs`; a longer
-    /// timeout is cut to it.
-    pub max_timeout: u64,
-    /// How long a call with the default timeout may print nothing before
-    /// it is stopped, such as a loop that never ends; one that names its
-    /// `timeout_secs` may be quiet as long as that.
-    pub quiet: Duration,
 }
 
 impl Default for Shell {
     /// Started on this machine as this process starts it, nothing spilled
-    /// or reported live, output cut as [`OutputLimit::default`] cuts it, timeouts
-    /// of at most ten minutes, stopped after a minute of printing nothing
-    /// unless the call names its timeout.
+    /// or reported live, output cut as [`OutputLimit::default`] cuts it.
     fn default() -> Self {
         Self {
             workspace: Arc::new(Local),
@@ -76,8 +67,6 @@ impl Default for Shell {
             spill: None,
             cut: Some(OutputLimit::default()),
             confine: false,
-            max_timeout: 600,
-            quiet: Duration::from_secs(60),
         }
     }
 }
@@ -88,7 +77,7 @@ impl Default for Shell {
 pub struct ShellArgs {
     /// The command line.
     pub command: String,
-    /// Seconds before the command is killed.
+    /// Seconds before the command is stopped; none waits until it ends.
     pub timeout_secs: Option<u64>,
     /// The directory to run it in, relative to the working directory;
     /// default the working directory.
@@ -96,7 +85,7 @@ pub struct ShellArgs {
 }
 
 impl ShellArgs {
-    /// Run `command`, with the default timeout, in the working directory.
+    /// Run `command` until it ends, in the working directory.
     pub fn new(command: impl Into<String>) -> Self {
         Self {
             command: command.into(),
@@ -105,7 +94,7 @@ impl ShellArgs {
         }
     }
 
-    /// The same arguments, killing the command after `secs` seconds.
+    /// The same arguments, stopping the command after `secs` seconds.
     pub fn timeout_secs(mut self, secs: u64) -> Self {
         self.timeout_secs = Some(secs);
         self
@@ -143,19 +132,13 @@ impl Shell {
         &self,
         args: ShellArgs,
     ) -> Result<(ShellRun, Option<OutputCut>), ToolExecutionError> {
-        let timeout = Duration::from_secs(
-            args.timeout_secs
-                .unwrap_or(DEFAULT_TIMEOUT.min(self.max_timeout))
-                .clamp(1, self.max_timeout.max(1)),
-        );
-        let quiet = match args.timeout_secs {
-            None => Some(self.quiet).filter(|quiet| *quiet < timeout),
-            Some(_) => None,
-        };
+        let timeout = args
+            .timeout_secs
+            .map(|secs| Duration::from_secs(secs.max(1)));
         let process = self.start(&args)?;
         let _stop = KillOnDrop(process.group());
         let shell = self.clone();
-        blocking(move || shell.finish(process, timeout, quiet)).await
+        blocking(move || shell.finish(process, timeout)).await
     }
 }
 
@@ -176,19 +159,11 @@ impl Tool for Shell {
             None => String::new(),
         };
         format!(
-            "Run a shell command with `sh -c` in the current directory, or in cwd. stdin is \
-             empty. Returns the exit code and stdout and stderr interleaved line by line{kept}. \
-             The command is killed after timeout_secs (default {}, at most {}), or once it \
-             printed more than {} MB; with the default, also once it printed nothing for {}s, \
-             so name timeout_secs for a build or wait that is quiet for long; a quick command \
-             needs none. Use it to build, test, run programs and use git. Each call starts a fresh `sh`: a `cd` or a variable does not \
-             carry over to the next call. Do not start programs that wait for input or never end, such as editors, \
-             pagers or servers in the foreground. Do not assume a git repository: a failed \
-             `git` command ends a `&&` chain. Check formatting only of files you changed.",
-            DEFAULT_TIMEOUT.min(self.max_timeout).max(1),
-            self.max_timeout.max(1),
-            OUTPUT_LIMIT / 1024 / 1024,
-            self.quiet.as_secs()
+            "Run a shell command with `sh -c` in the current directory, or in cwd, and wait \
+             until it ends, however long it takes; set timeout_secs only for a command that may \
+             hang. Returns the exit code and stdout and stderr interleaved line by line{kept}. Each call starts a fresh `sh` with an \
+             empty stdin. Do not run what never ends, such as a server, in the foreground, and \
+             do not assume a git repository."
         )
     }
 
@@ -247,8 +222,7 @@ impl Shell {
     fn finish(
         &self,
         mut process: Process,
-        timeout: Duration,
-        quiet: Option<Duration>,
+        timeout: Option<Duration>,
     ) -> Result<(ShellRun, Option<OutputCut>), ToolExecutionError> {
         let mut kept = Kept {
             spill: self.spill.clone(),
@@ -256,9 +230,9 @@ impl Shell {
             live: self.live.clone(),
             ..Kept::default()
         };
-        let deadline = Instant::now().checked_add(timeout);
+        let deadline = timeout.and_then(|timeout| Instant::now().checked_add(timeout));
         let end = process
-            .run(deadline, quiet, |line| {
+            .run(deadline, |line| {
                 kept.push(&line);
                 kept.written <= OUTPUT_LIMIT
             })
@@ -274,49 +248,27 @@ impl Shell {
                     ExitStatus::Exited(code)
                 }
                 None => {
-                    output.push_str(&killed(status));
+                    output.push_str(&killed(status, process.remote()));
                     ExitStatus::Signaled
                 }
             },
             Ended::TimedOut => {
-                let secs = timeout.as_secs();
+                let secs = timeout.unwrap_or_default().as_secs();
                 output.push_str(&format!(
-                    "[timed out after {secs}s and stopped: {}",
-                    stopped(&process)
+                    "[timed out after {secs}s and stopped{}",
+                    there(&process)
                 ));
                 if silent {
                     output.push_str(SILENT);
-                }
-                if secs < self.max_timeout {
-                    output.push_str(&format!(
-                        ". Pass timeout_secs up to {} to wait longer",
-                        self.max_timeout
-                    ));
                 }
                 output.push(']');
                 ExitStatus::TimedOut
             }
-            Ended::Quiet => {
-                output.push_str(&format!(
-                    "[printed nothing for {}s, so it was stopped: {}",
-                    quiet.unwrap_or_default().as_secs(),
-                    stopped(&process)
-                ));
-                if silent {
-                    output.push_str(SILENT);
-                }
-                output.push_str(
-                    ". A command that is stuck, such as one waiting for input or looping \
-                     forever, needs fixing, not a longer wait; only one known to be quiet for \
-                     long, such as a build, needs timeout_secs]",
-                );
-                ExitStatus::TimedOut
-            }
             Ended::Stopped => {
                 output.push_str(&format!(
-                    "[killed after printing more than {} MB: {}]",
+                    "[stopped after printing more than {} MB{}]",
                     OUTPUT_LIMIT / 1024 / 1024,
-                    stopped(&process)
+                    there(&process)
                 ));
                 ExitStatus::Killed
             }
@@ -330,43 +282,39 @@ const SILENT: &str = ". It printed nothing: a program whose output is not a term
                       it back until it ends, so make it print as it goes (such as \
                       `python3 -u` or `stdbuf -oL`) to see how far it got";
 
-/// What this tool did to stop `process`, which it [stopped](Process::stop),
-/// and, when that was a transport, what it means for the command there.
-fn stopped(process: &Process) -> String {
-    let grace = crate::process::STOP_GRACE.as_secs();
-    let how = if !cfg!(unix) {
-        "it was killed".to_owned()
-    } else if process.forced() {
-        format!("it got SIGTERM, then SIGKILL {grace}s later as it still ran")
-    } else {
-        "it got SIGTERM and ended".to_owned()
-    };
+/// Where `process` was stopped besides this machine: the machine it ran
+/// the command on, whose end of the transport stops the command when this
+/// end is stopped (see [`remote`](crate::remote)).
+fn there(process: &Process) -> String {
     match process.remote() {
-        Some(host) => format!(
-            "{how}. That was the transport on this machine; whether the command on {host} \
-             stopped too is the transport's doing, so check there before running it again"
-        ),
-        None => how,
+        Some(host) => format!(", on {host} too"),
+        None => String::new(),
     }
 }
 
 /// How each line [`Shell`] ends a command's output with begins, one per
 /// way the command can end, as `Shell::finish` writes them.
-const STATUS_STARTS: [&str; 5] = [
+const STATUS_STARTS: [&str; 4] = [
     "[exit code ",
     "[killed by ",
     "[timed out after ",
-    "[printed nothing for ",
-    "[killed after printing more than ",
+    "[stopped after printing more than ",
 ];
 
 /// The status line of a command that ended by a signal this tool did not
-/// send (its timeout, quiet limit and output limit say so themselves):
-/// which signal, what likely sent it, and what to do.
-fn killed(status: std::process::ExitStatus) -> String {
+/// send (its timeout and output limit say so themselves): which signal,
+/// what likely sent it, and what to do. With `remote`, the process was the
+/// transport to that machine, and its end there stopped the command.
+fn killed(status: std::process::ExitStatus, remote: Option<&str>) -> String {
     #[cfg(unix)]
     if let Some(signal) = std::os::unix::process::ExitStatusExt::signal(&status) {
         let (name, why) = sent(signal);
+        if let Some(host) = remote {
+            return format!(
+                "[killed by {name} (signal {signal}), which this tool did not send: {why}. It \
+                 was the connection to {host}, and the command there was stopped with it]"
+            );
+        }
         return format!(
             "[killed by {name} (signal {signal}), which this tool did not send: {why}. It was \
              the process this call started here, `sh` or the last program it ran; when that \
@@ -376,13 +324,13 @@ fn killed(status: std::process::ExitStatus) -> String {
         );
     }
     #[cfg(not(unix))]
-    let _ = status;
+    let _ = (status, remote);
     "[killed by a signal]".to_owned()
 }
 
 /// The name of `signal` and what likely sent it.
 #[cfg(unix)]
-fn sent(signal: i32) -> (&'static str, &'static str) {
+pub(crate) fn sent(signal: i32) -> (&'static str, &'static str) {
     match signal {
         libc::SIGHUP => ("SIGHUP", "its terminal or session went away"),
         libc::SIGINT => ("SIGINT", "something on this machine interrupted it"),
@@ -455,12 +403,49 @@ fn matters(line: &str) -> bool {
         .any(|word| line.contains(word))
 }
 
+/// `line` without the terminal escape sequences in it, such as the colours
+/// a program prints even when its output is no terminal, or a link's or a
+/// window title's markup: the text between them stays.
+fn plain(line: &str) -> Cow<'_, str> {
+    if !line.contains('\x1b') {
+        return Cow::Borrowed(line);
+    }
+    let mut text = String::with_capacity(line.len());
+    let mut chars = line.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '\x1b' {
+            text.push(c);
+            continue;
+        }
+        match chars.next() {
+            // A control sequence: parameters, then one final character.
+            Some('[') => {
+                let _ = chars.by_ref().find(|c| ('\x40'..='\x7e').contains(c));
+            }
+            // A string, such as a link or a title, up to BEL or `ESC \`.
+            Some(']' | 'P' | 'X' | '^' | '_') => {
+                while let Some(c) = chars.next() {
+                    if c == '\x07' || (c == '\x1b' && chars.next_if_eq(&'\\').is_some()) {
+                        break;
+                    }
+                }
+            }
+            // Intermediate characters, then one final character.
+            Some(' '..='/') => {
+                let _ = chars.by_ref().find(|c| !(' '..='/').contains(c));
+            }
+            _ => {}
+        }
+    }
+    Cow::Owned(text)
+}
+
 /// What [`Shell`] keeps of a command's output while it runs, line by line:
 /// all of it while it fits the [`OutputLimit`]; past it, the first lines
 /// (half of the limit), the lines that [`matter`](matters) from the
-/// middle with a few after each (at most a quarter) and the last lines
-/// (the rest). The whole output goes to the spill file from the first cut
-/// on.
+/// middle with a few after each (at most a quarter: the first of them in
+/// one eighth, the last in the other) and the last lines (the rest). The
+/// whole output goes to the spill file from the first cut on.
 #[derive(Default)]
 struct Kept {
     /// Every byte received.
@@ -476,10 +461,18 @@ struct Kept {
     head: Vec<(usize, String)>,
     /// The bytes of `head`.
     head_bytes: usize,
-    /// Lines that matter from the middle, by number.
+    /// The first lines that matter from the middle, by number.
     picked: Vec<(usize, String)>,
     /// The bytes of `picked`.
     picked_bytes: usize,
+    /// The last lines that matter from the middle once `picked` is full,
+    /// by number, each with whether it is one that matters rather than
+    /// one after it.
+    later: VecDeque<(usize, String, bool)>,
+    /// The bytes of `later`.
+    later_bytes: usize,
+    /// Whether some lines that matter, or lines after them, were cut.
+    missed: bool,
     /// How many lines after the last one that matters are kept too.
     context: usize,
     /// The last lines, by number: all of them before the first cut.
@@ -531,10 +524,12 @@ impl Kept {
         }
     }
 
-    /// Takes the next whole `line`, its secrets redacted, reporting it
-    /// live and spilling it, and cuts what no longer fits: no key it
-    /// printed is shown, spilled or returned.
+    /// Takes the next whole `line`, its terminal escape sequences dropped
+    /// ([`plain`]) and its secrets redacted, reporting it live and spilling
+    /// it, and cuts what no longer fits: no key it printed is shown,
+    /// spilled or returned.
     fn line(&mut self, line: String) {
+        let line = plain(&line);
         let mut line = self.redact(&line).into_owned();
         if line.is_empty() {
             return;
@@ -574,31 +569,54 @@ impl Kept {
                 self.head.push((at, line));
             }
         }
-        let (lines, bytes) = (limit.lines / 4, limit.bytes / 4);
         // The last lines take what the first and the picked ones leave.
         while self.tail.len()
             > limit
                 .lines
-                .saturating_sub(self.head.len() + self.picked.len())
+                .saturating_sub(self.head.len() + self.picked.len() + self.later.len())
             || self.tail_bytes
                 > limit
                     .bytes
-                    .saturating_sub(self.head_bytes + self.picked_bytes)
+                    .saturating_sub(self.head_bytes + self.picked_bytes + self.later_bytes)
         {
             let Some((at, line)) = self.tail.pop_front() else {
                 break;
             };
             self.tail_bytes -= line.len();
-            if matters(&line) {
+            let starts = matters(&line);
+            if starts {
                 self.context = CONTEXT + 1;
             }
             if self.context > 0 {
                 self.context -= 1;
                 let mut line = clip(line.trim_end_matches('\n'), MAX_PICKED).to_owned();
                 line.push('\n');
-                if self.picked.len() < lines && self.picked_bytes + line.len() <= bytes {
-                    self.picked_bytes += line.len();
-                    self.picked.push((at, line));
+                self.pick(limit, at, line, starts);
+            }
+        }
+    }
+
+    /// Keeps `line`, number `at`, from the middle: in `picked` while it
+    /// has room, then in `later`, which drops its oldest lines that matter,
+    /// with the lines after them, to make room for new ones.
+    fn pick(&mut self, limit: OutputLimit, at: usize, line: String, starts: bool) {
+        let (lines, bytes) = (limit.lines / 8, limit.bytes / 8);
+        if self.later.is_empty()
+            && self.picked.len() < lines
+            && self.picked_bytes + line.len() <= bytes
+        {
+            self.picked_bytes += line.len();
+            self.picked.push((at, line));
+            return;
+        }
+        self.later_bytes += line.len();
+        self.later.push_back((at, line, starts));
+        while self.later.len() > lines || self.later_bytes > bytes {
+            self.missed = true;
+            while let Some((_, line, _)) = self.later.pop_front() {
+                self.later_bytes -= line.len();
+                if self.later.front().is_none_or(|(_, _, starts)| *starts) {
+                    break;
                 }
             }
         }
@@ -649,7 +667,11 @@ impl Kept {
     /// numbered as in that file; and that cut as a fact.
     fn text(mut self) -> (String, Option<OutputCut>) {
         self.flush();
-        let kept_lines = self.head.len() + self.picked.len() + self.tail.len();
+        let kept_lines = self.head.len() + self.picked.len() + self.later.len() + self.tail.len();
+        let errors = match self.missed {
+            true => "the first and last lines with errors or failures",
+            false => "lines with errors or failures",
+        };
         let cut = self.lines - kept_lines;
         let mut text = String::new();
         let mut fact = None;
@@ -658,22 +680,24 @@ impl Kept {
                 Some((path, _)) => {
                     // The first line cut, from 1, and how many follow it.
                     let first = self.head.len() + 1;
-                    let gap = self
+                    let next = self
                         .picked
                         .first()
-                        .or(self.tail.front())
-                        .map_or(cut, |(at, _)| at + 1 - first);
+                        .map(|(at, _)| *at)
+                        .or(self.later.front().map(|(at, _, _)| *at))
+                        .or(self.tail.front().map(|(at, _)| *at));
+                    let gap = next.map_or(cut, |at| at + 1 - first);
                     text.push_str(&format!(
-                        "[{cut} of {} lines cut, but for lines with errors or failures; all of the \
-                         output is in {}: `read` it there with offset {first} and limit {} for \
-                         the first lines cut, rather than running the command again]\n",
+                        "[{cut} of {} lines cut, but for {errors}; all of the output is in {}: \
+                         `read` it there with offset {first} and limit {} for the first lines \
+                         cut, rather than running the command again]\n",
                         self.lines,
                         path.display(),
                         gap.min(crate::MAX_LINES),
                     ));
                 }
                 None => text.push_str(&format!(
-                    "[{cut} of {} lines cut, but for lines with errors or failures]\n",
+                    "[{cut} of {} lines cut, but for {errors}]\n",
                     self.lines
                 )),
             }
@@ -688,7 +712,11 @@ impl Kept {
             });
         }
         let mut next = 0;
-        for (at, line) in self.head.iter().chain(&self.picked).chain(&self.tail) {
+        let kept = (self.head.iter().chain(&self.picked))
+            .map(|(at, line)| (at, line))
+            .chain(self.later.iter().map(|(at, line, _)| (at, line)))
+            .chain(self.tail.iter().map(|(at, line)| (at, line)));
+        for (at, line) in kept {
             if *at > next {
                 text.push_str(&format!(
                     "[… {} lines cut (lines {}-{at}) …]\n",

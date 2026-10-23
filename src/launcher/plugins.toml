@@ -19,25 +19,33 @@
 crate = "rig-basics"
 plugin = "rig_basics::prompt::DefaultPromptPlugin"
 
+# The AGENTS.md files of the working directory and the directories above it
+# up to the repository root, and RIG_HOME/AGENTS.md, in the system prompt.
+[[plugin]]
+crate = "rig-basics"
+plugin = "rig_basics::agents_md::AgentsMdPlugin"
+
+# Skills: each SKILL.md in .rig/skills and .agents/skills (up to the
+# repository root), RIG_HOME/skills and ~/.agents/skills, listed in the
+# system prompt for the model to read, and /skill:<name>.
+[[plugin]]
+crate = "rig-basics"
+plugin = "rig_basics::skills::SkillsPlugin"
+
 # /model, /effort and the model picker.
 [[plugin]]
 crate = "rig-basics"
 plugin = "rig_basics::models::ModelsPlugin"
 
-# /login and /logout for the ChatGPT plan's models.
+# /login and /logout: the ChatGPT plan, and providers' API keys.
 [[plugin]]
 crate = "rig-basics"
-plugin = "rig_basics::login_chatgpt::ChatgptLoginPlugin"
+plugin = "rig_basics::login::LoginPlugin"
 
 # The model and reasoning a new session starts with: the last ones chosen.
 [[plugin]]
 crate = "rig-basics"
 plugin = "rig_basics::models::defaults::DefaultsPlugin"
-
-# The session and conversation lists that /resume, /fork and /agents open; SessionsPlugin and AgentsPlugin add it themselves when it is missing.
-[[plugin]]
-crate = "rig-basics"
-plugin = "rig_basics::session_picker::SessionPickerPlugin"
 
 # /new, /resume and /name.
 [[plugin]]
@@ -124,6 +132,12 @@ plugin = "rig_basics::reload::plugins::PluginsPlugin"
 [[plugin]]
 crate = "rig-basics"
 plugin = "rig_basics::BasicCommandsPlugin"
+
+# The welcome at the top of the transcript: rig's mark, its version, the
+# model and the project's directory. Never sent to the model.
+[[plugin]]
+crate = "rig-basics"
+plugin = "rig_basics::welcome::WelcomePlugin"
 
 # The inspect tool, with which the agent reads its own running world; it pulls in Bevy Remote, a heavier build, and on Linux the ALSA headers.
 # [[plugin]]

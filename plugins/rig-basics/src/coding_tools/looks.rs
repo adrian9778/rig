@@ -6,10 +6,10 @@
 //! the command, as bash, and its output.
 
 use rig_harness::rig_core::tool::{FileChange, FilesChanged, FilesRead, LinesShown};
-use rig_tui::ToolCallView;
 use rig_tui::highlight::{Language, code_rows, highlight};
 use rig_tui::ratatui::style::Stylize;
 use rig_tui::ratatui::text::{Line, Span};
+use rig_tui::{OUTPUT_INDENT, ToolCallView};
 
 pub(super) fn read(view: &ToolCallView<'_>) -> Vec<Line<'static>> {
     let path = view.argument("path").unwrap_or_default().to_owned();
@@ -43,9 +43,8 @@ fn read_rows(text: &str, path: &str, shown: Option<LinesShown>) -> Vec<Line<'sta
     let (code, notes) = lines.split_at_checked(count).unwrap_or((&lines, &[]));
     let colored = highlight(&code.join("\n"), Language::File(path)).unwrap_or_default();
     let mut colored = colored.into_iter();
-    let prefix = |index: usize| if index == 0 { "  ⎿ " } else { "    " };
     let code = code.iter().enumerate().map(|(index, line)| {
-        let mut spans = vec![Span::from(prefix(index))];
+        let mut spans = vec![Span::from(OUTPUT_INDENT)];
         if let Some(shown) = shown {
             spans.push(Span::from(format!("{:>6}  ", shown.first + index)).dim());
         }
@@ -55,8 +54,7 @@ fn read_rows(text: &str, path: &str, shown: Option<LinesShown>) -> Vec<Line<'sta
     });
     let notes = notes
         .iter()
-        .enumerate()
-        .map(|(index, line)| Line::from(format!("{}{line}", prefix(count + index))).dim());
+        .map(|line| Line::from(format!("{OUTPUT_INDENT}{line}")).dim());
     code.chain(notes).collect()
 }
 
@@ -71,8 +69,8 @@ fn span(shown: LinesShown) -> String {
     }
 }
 
-/// The reply, then the change the call published, as a diff; just the
-/// reply when it published none, as after a resume without its effect log.
+/// The reply without the file's lines it shows, then the change the call
+/// published, as a diff; just the reply when it published none, as after a resume without its effect log.
 pub(super) fn edit(view: &ToolCallView<'_>) -> Vec<Line<'static>> {
     let path = view.argument("path").unwrap_or_default().to_owned();
     let mut lines = vec![view.header(format!("edit {path}"), "")];
@@ -81,8 +79,10 @@ pub(super) fn edit(view: &ToolCallView<'_>) -> Vec<Line<'static>> {
         .and_then(|facts| facts.get::<FilesChanged>().ok().flatten());
     let drawn = match (view.result_text(), changed) {
         (Some(reply), Some(FilesChanged(changes))) if !view.failed() => {
+            // The file's lines the reply shows the model are in the diff.
+            let said = reply.split("\n[lines ").next().unwrap_or_default();
             let diff: String = changes.iter().map(FileChange::unified).collect();
-            rig_tui::diff::unified_lines(&format!("{reply}\n{diff}"), &view.theme)
+            rig_tui::diff::unified_lines(&format!("{said}\n{diff}"), &view.theme)
         }
         _ => None,
     };
@@ -109,15 +109,11 @@ pub(super) fn shell(view: &ToolCallView<'_>) -> Vec<Line<'static>> {
     for (index, line) in command.lines().enumerate() {
         let plain = || vec![Span::from(line.to_owned()).bold()];
         let code = colored.get(index).cloned().unwrap_or_else(plain);
-        let mut row = if index == 0 {
-            view.header("$", "")
+        lines.push(if index == 0 {
+            view.header_spans("$", code)
         } else {
-            Line::default()
-        };
-        row.spans
-            .push(Span::from(if index == 0 { " " } else { "    " }));
-        row.spans.extend(code);
-        lines.push(row);
+            Line::from([vec![Span::from("    ")], code].concat())
+        });
     }
     if lines.is_empty() {
         lines.push(view.header("$", ""));

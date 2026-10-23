@@ -5,7 +5,7 @@ The harness of the rig coding agent: a terminal coding agent that is a
 kernel and [Rig](https://github.com/0xPlaygrounds/rig)'s rig-core. The `rig`
 launcher generates a small Cargo project for it from `RIG_HOME/plugins.toml`,
 builds it and runs it; `/reload` rebuilds it with changed plugins and restarts
-in the same session. The [root README](https://github.com/0xPlaygrounds/rig/blob/main/README.md#the-rig-coding-agent)
+in the same session. The [agent guide](https://github.com/0xPlaygrounds/rig/blob/main/docs/agent.md)
 describes using it.
 
 ## A kernel, a harness and plugins
@@ -36,11 +36,12 @@ The default `plugins.toml`, in order:
 
 | Crate | Plugin | What it adds |
 |---|---|---|
-| `rig-basics` | `prompt::DefaultPromptPlugin` | rig's own system prompt for an agent without one: one fixed text, the same on every request, that has the model read `AGENTS.md`/`CLAUDE.md` itself |
+| `rig-basics` | `prompt::DefaultPromptPlugin` | rig's own system prompt for an agent without one: one fixed text, the same on every request |
+| `rig-basics` | `agents_md::AgentsMdPlugin` | the `AGENTS.md` files from the working directory up to the repository root, and `RIG_HOME/AGENTS.md`, in the system prompt |
+| `rig-basics` | `skills::SkillsPlugin` | the skills (`SKILL.md`) of the project, `RIG_HOME/skills` and `~/.agents/skills`, listed in the system prompt; `/skill:<name>` |
 | `rig-basics` | `models::ModelsPlugin` | `/model`, `/effort` and the model picker |
-| `rig-basics` | `login_chatgpt::ChatgptLoginPlugin` | `/login` and `/logout` for the ChatGPT plan's models |
+| `rig-basics` | `login::LoginPlugin` | `/login` and `/logout`: the ChatGPT plan, and providers' API keys |
 | `rig-basics` | `models::defaults::DefaultsPlugin` | a new session starts on the last model and reasoning chosen |
-| `rig-basics` | `session_picker::SessionPickerPlugin` | the session and conversation lists that `/resume`, `/fork` and `/agents` open; the plugins that use it add it when it is missing |
 | `rig-basics` | `sessions::SessionsPlugin` | `/new`, `/resume`, `/name` |
 | `rig-basics` | `sessions::agents::AgentsPlugin` | `/fork`, `/agents` and rewind (Alt+Up to an earlier message, then Enter): the agents of this session |
 | `rig-basics` | `compaction::CompactionPlugin` | summarizing a conversation near the context window; `/compact` |
