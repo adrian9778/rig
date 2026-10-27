@@ -11,12 +11,13 @@
 //! only the later calls that touch what it writes, as Prepare left them; a
 //! refusal answers in call order and is recorded as one. A model call that gave up is superseded
 //! on another model and the turn goes on; a retry waits on a hold that an
-//! interrupt takes away; a refused model call ends its turn and keeps the
-//! message; a request too big for the context window fails its turn
-//! without a retry and takes the message out; `Retry` sends a kept message
-//! again; a reply that came as a plugin failed its turn is kept, its calls
-//! answered as not run; an image goes to a model that reads none as its
-//! name. A side call is built from its agent like a turn's and leaves
+//! interrupt takes away; a refused model call ends its turn and gives the
+//! message back; a request too big for the context window fails its turn
+//! without a retry and gives the message back; a failed turn gives back
+//! the user's messages no model answered; a reply that came as a plugin
+//! failed its turn is kept, its calls answered as not run; an image goes
+//! to a model that reads none as its name. A side call is built from its
+//! agent like a turn's and leaves
 //! the conversation alone. A tool's annotations give its footprint, and what it publishes
 //! lands on its call. A turn's end is a proposal a reviewer carries on
 //! from, holds or replaces, and a new turn call carries on after a length
@@ -54,7 +55,7 @@ use rig_core::effect::{
     Disposition, EffectKind, EffectRecord, FamilyDescriptor, HandlerDescriptor, HandlerKey,
 };
 use rig_core::error::ErrorKind;
-use rig_core::message::{Message, StopReason, ToolFunction, ToolName};
+use rig_core::message::{CallId, Message, StopReason, ToolFunction, ToolName};
 use rig_core::operation::{Completion, Finish};
 use rig_core::providers::registry::ProviderId;
 use rig_core::serve::adapters::{ModelAdapter, ToolAdapter};
@@ -572,7 +573,8 @@ fn an_open_tool_starts_a_call_only_once_its_arguments_parse() {
         started: true,
     };
     assert_eq!(told.as_slice(), [good_told]);
-    // The call that does not fit was refused before it started.
+    // The call that does not fit was answered before it started, with an
+    // error of its kind, the model's mistake and no refusal.
     assert!(!has::<Started>(&app, bad), "never started");
     let records = records(&app);
     let refused = records
@@ -583,7 +585,8 @@ fn an_open_tool_starts_a_call_only_once_its_arguments_parse() {
             record.disposition == Disposition::AnsweredBeforeStart
                 && record.started_ms.is_none()
                 && matches!(&record.outcome, Err(report)
-                    if report.kind == ErrorKind::Tool(ToolErrorKind::InvalidArgs))
+                    if report.kind == ErrorKind::Tool(ToolErrorKind::InvalidArgs)
+                        && !report.refusal)
         }),
         "{records:?}"
     );
@@ -1118,6 +1121,14 @@ fn answer(text: &str) -> Vec<MockStreamEvent> {
 /// The app's agent on `model`, with `look` and `touch`, asked to go; frames
 /// are counted from 1 in `Frame`.
 fn agent_on(app: &mut App, model: &MockCompletionModel) -> Entity {
+    let agent = connected(app, model);
+    app.world_mut()
+        .trigger(Deliver::new(agent, "go", DeliveryMode::Steer));
+    agent
+}
+
+/// The app's agent on `model`, with `look` and `touch`, asked nothing.
+fn connected(app: &mut App, model: &MockCompletionModel) -> Entity {
     let spec = Catalog::builtin()
         .resolve("deepseek/deepseek-flash")
         .map(|spec| spec.shared());
@@ -1139,7 +1150,6 @@ fn agent_on(app: &mut App, model: &MockCompletionModel) -> Entity {
         let handler = Handler(ErasedHandler::new(handler));
         world.entity_mut(agent).insert(Connection { spec, handler });
     }
-    world.trigger(Deliver::new(agent, "go", DeliveryMode::Steer));
     agent
 }
 
@@ -1879,7 +1889,7 @@ fn each_turn_is_recorded_with_how_it_ended() {
 }
 
 #[test]
-fn a_refused_turn_call_ends_the_turn_keeps_the_message_and_is_not_retried() {
+fn a_refused_turn_call_ends_the_turn_gives_the_message_back_and_is_not_retried() {
     let mut app = app();
     let refuse = |mut calls: Query<&mut Decision, (ReadyToStart, ModelCalls, With<TurnCall>)>| {
         for mut decision in &mut calls {
@@ -1902,7 +1912,7 @@ fn a_refused_turn_call_ends_the_turn_keeps_the_message_and_is_not_retried() {
         ended(&app)
     );
     assert_eq!(model.request_count(), 0);
-    assert_eq!(conversation(&app, agent).len(), 1, "the message is kept");
+    assert!(conversation(&app, agent).is_empty(), "the message is back");
     let models: Vec<_> = model_records(&app)
         .iter()
         .map(|record| (record.disposition, record.started_ms.is_none()))
@@ -1914,8 +1924,7 @@ fn a_refused_turn_call_ends_the_turn_keeps_the_message_and_is_not_retried() {
 
 /// A request that outgrew the model's context window ends its turn at
 /// once: the same request would fail the same way, so it is not retried.
-/// The user's message is taken out, so the next one does not follow a
-/// message no model answered.
+/// The user's message goes back to the input, out of the conversation.
 #[test]
 fn a_request_too_big_for_the_context_window_fails_its_turn_without_a_retry() {
     let mut app = app();
@@ -1938,69 +1947,153 @@ fn a_request_too_big_for_the_context_window_fails_its_turn_without_a_retry() {
     );
     assert_eq!(model.request_count(), 1, "not retried");
     assert_eq!(conversation(&app, agent), Vec::<Message>::new());
-    let told = notices(&app);
-    assert!(
-        told.iter().any(|notice| notice.contains("taken out")),
-        "{told:?}"
-    );
     let world = app.world_mut();
     assert_eq!(world.query::<&Backoff>().iter(world).count(), 0);
 }
 
-/// A model call that gave up keeps the user's message, and `Retry` sends
-/// the conversation again as it stands: the model answers that message,
-/// which is in the conversation once. Once it is answered there is
-/// nothing to retry, and a `Retry` sends nothing.
+/// A model call that failed for good or ran out of retries, or a reply
+/// cut off before it answered or with no message, takes the user's message
+/// out of the conversation, with the failed reply, and gives it back after
+/// an error that says why; sent again, it goes once.
 #[test]
-fn retry_sends_a_kept_message_again_and_then_has_nothing_to_send() {
+fn a_failed_turn_gives_the_message_back_and_sent_again_it_goes_once() {
+    let empty = vec![MockStreamEvent::final_response_with_default_usage()];
+    for (failed, out_of_retries) in [
+        (no_credit(), false),
+        (cut_off(), false),
+        (empty, false),
+        (overloaded(), true),
+    ] {
+        send_again_after(failed, out_of_retries);
+    }
+}
+
+fn send_again_after(failed: Vec<MockStreamEvent>, out_of_retries: bool) {
     let mut app = app();
-    app.init_resource::<Ended>()
-        .add_observer(log_ended)
+    app.init_resource::<Ended>().add_observer(log_ended);
+    collect_recalled(&mut app);
+    if out_of_retries {
         // The retries ran out already: a failure gives up at once.
-        .add_observer(|turn: On<Add<TurnOf>>, mut commands: Commands| {
+        app.add_observer(|turn: On<Add<TurnOf>>, mut commands: Commands| {
             let retries = RETRY_POLICY.max_retries;
             commands.entity(turn.entity).insert(Recovery { retries });
         });
-    let model = MockCompletionModel::from_stream_turns([overloaded(), answer("ok")]);
+    }
+    let model = MockCompletionModel::from_stream_turns([failed, answer("ok")]);
     let agent = agent_on(&mut app, &model);
     let ended_n = |n| move |world: &mut World| world.resource::<Ended>().0.len() == n;
     assert!(run_until(&mut app, ended_n(1)), "{:?}", notices(&app));
+    app.update();
     assert!(matches!(ended(&app).as_slice(), [TurnOutcome::Failed(_)]));
-    assert_eq!(conversation(&app, agent).len(), 1, "the message is kept");
-    app.world_mut().trigger(Retry { entity: agent });
+    assert_eq!(
+        conversation(&app, agent),
+        [],
+        "the message and reply are out"
+    );
+    assert_eq!(app.world().resource::<RecalledTexts>().0, ["go"]);
+    let told = notices(&app);
+    assert!(
+        !told.iter().any(|notice| notice.contains("taken out")),
+        "it came back: {told:?}"
+    );
+    app.world_mut()
+        .trigger(Deliver::new(agent, "go", DeliveryMode::Steer));
     assert!(run_until(&mut app, ended_n(2)), "{:?}", notices(&app));
     let answer = match ended(&app).as_slice() {
         [_, TurnOutcome::Answered(message)] => message.final_answer(),
         _ => None,
     };
     assert_eq!(answer.as_deref(), Some("ok"), "{:?}", ended(&app));
-    let said = conversation(&app, agent);
-    assert!(
-        matches!(
-            said.as_slice(),
-            [Message::User { .. }, Message::Assistant(_)]
-        ),
-        "{said:?}"
-    );
     let sent = model.requests();
-    let last_sent = sent.last().and_then(|request| request.chat_history.last());
-    assert_eq!(
-        last_sent.map(|message| &**message),
-        said.first(),
-        "the kept message went again"
-    );
-    app.world_mut().trigger(Retry { entity: agent });
-    for _ in 0..3 {
-        app.update();
+    let history = sent.last().map(|request| request.chat_history.as_slice());
+    let history: Vec<&Message> = history.into_iter().flatten().map(AsRef::as_ref).collect();
+    assert_eq!(history, [&Message::user("go")], "the message went once");
+}
+
+/// A failed turn gives back, in one recall, the user's messages no model
+/// answered: the steering message its last call carried, then a queued one
+/// it never sent. The message a tool-calling reply answered stays, and so
+/// does a chat bridge user's queued message, which never reaches the local
+/// input.
+#[test]
+fn a_failed_turn_gives_back_its_unanswered_and_unsent_messages_as_one() {
+    let mut app = app();
+    app.init_resource::<Ended>()
+        .init_resource::<Reviewing>()
+        .add_observer(log_ended)
+        .add_systems(AgentPass, hold_results.in_set(Stage::Review));
+    collect_recalled(&mut app);
+    let model = MockCompletionModel::from_stream_turns([reply(&[("look", "1")]), no_credit()]);
+    let agent = agent_on(&mut app, &model);
+    let held = |world: &mut World| !world.resource::<Reviewing>().0.is_empty();
+    assert!(run_until(&mut app, held));
+    let world = app.world_mut();
+    world.trigger(Deliver::new(agent, "then commit", DeliveryMode::Queue));
+    world.trigger(Deliver::new(agent, "use tabs", DeliveryMode::Steer));
+    // A chat bridge's user, queued too, is not the local user.
+    let remote = Incoming::new("ship it", DeliveryMode::Queue);
+    let message = remote.with_author(Author::user().titled("ana"));
+    world.trigger(Deliver {
+        entity: agent,
+        message,
+    });
+    app.update();
+    let world = app.world_mut();
+    for hold in std::mem::take(&mut world.resource_mut::<Reviewing>().0) {
+        world.despawn(hold);
     }
+    let ended_once = |world: &mut World| world.resource::<Ended>().0.len() == 1;
+    assert!(run_until(&mut app, ended_once), "{:?}", notices(&app));
+    app.update();
     assert_eq!(model.request_count(), 2);
-    assert_eq!(ended(&app).len(), 2, "no turn started");
-    let told = notices(&app);
+    let sent = serde_json::to_string(&model.requests()).unwrap_or_default();
     assert!(
-        told.iter()
-            .any(|notice| notice.starts_with("Nothing to retry")),
-        "{told:?}"
+        sent.contains("use tabs") && !sent.contains("then commit"),
+        "{sent}"
     );
+    let recalled = app.world().resource::<RecalledTexts>();
+    assert_eq!(recalled.0, ["use tabs\n\nthen commit"]);
+    let said = conversation(&app, agent);
+    assert_eq!(said.len(), 4, "{said:?}");
+    assert_eq!(said.first(), Some(&Message::user("go")));
+    let last = said.last().map(serde_json::to_string);
+    assert!(
+        matches!(&last, Some(Ok(text)) if text.contains("ship it")),
+        "{last:?}"
+    );
+}
+
+/// A request the user stopped stays with its note when a later message
+/// fails: only the later one comes back.
+#[test]
+fn a_failed_turn_leaves_a_stopped_request_with_its_note() {
+    let mut app = app();
+    app.init_resource::<Ended>().add_observer(log_ended);
+    collect_recalled(&mut app);
+    // The first model call waits in Gate, so the stop always comes first.
+    let hold_first = |calls: Query<Entity, (ReadyToStart, With<TurnCall>)>,
+                      mut held: Local<bool>,
+                      mut commands: Commands| {
+        if let Some(call) = calls.iter().next().filter(|_| !*held) {
+            commands.spawn(HoldOf(call));
+            *held = true;
+        }
+    };
+    app.add_systems(AgentPass, hold_first.in_set(Stage::Gate));
+    let model = MockCompletionModel::from_stream_turns([no_credit(), no_credit()]);
+    let agent = agent_on(&mut app, &model);
+    let running = |world: &mut World| world.get::<ActiveTurn>(agent).is_some();
+    assert!(run_until(&mut app, running));
+    app.world_mut().trigger(StopTurn::new(agent));
+    let ended_n = |n| move |world: &mut World| world.resource::<Ended>().0.len() == n;
+    assert!(run_until(&mut app, ended_n(1)), "{:?}", notices(&app));
+    app.world_mut()
+        .trigger(Deliver::new(agent, "and lint", DeliveryMode::Steer));
+    assert!(run_until(&mut app, ended_n(2)), "{:?}", notices(&app));
+    app.update();
+    assert_eq!(app.world().resource::<RecalledTexts>().0, ["and lint"]);
+    let said = conversation(&app, agent);
+    assert_eq!(said, [Message::user("go"), Message::user(STOPPED)]);
 }
 
 /// A reply that comes in after a plugin failed its turn goes into the
@@ -2042,6 +2135,162 @@ fn a_reply_after_its_turn_failed_is_kept_and_its_calls_are_answered_not_run() {
     let tools = records(&app).into_iter();
     let ran = tools.filter(|record| matches!(record.kind, EffectKind::ToolCall { .. }));
     assert_eq!(ran.count(), 0, "no call started");
+}
+
+/// A failed reply a conversation already holds, such as one restored from
+/// an older session, goes with the messages a failed turn gives back: one
+/// the provider failed, and one cut off at the token limit before it
+/// answered. What comes back is the text typed, not a file attached.
+#[test]
+fn a_failed_turn_takes_a_stored_failed_reply_with_it() {
+    use rig_core::message::{AssistantContent, AssistantMessage};
+    let error = AssistantMessage::new(vec![AssistantContent::text("half an answer")])
+        .with_stop(StopReason::Error("overloaded".to_owned()));
+    let cut = AssistantMessage::new(vec![AssistantContent::reasoning("thinking")])
+        .with_stop(StopReason::Length);
+    for failed in [error, cut] {
+        takes_a_stored_failed_reply(failed);
+    }
+}
+
+fn takes_a_stored_failed_reply(failed: rig_core::message::AssistantMessage) {
+    let mut app = app();
+    app.init_resource::<Ended>().add_observer(log_ended);
+    collect_recalled(&mut app);
+    let world = app.world_mut();
+    let agent = world.query_filtered::<Entity, With<Agent>>().single(world);
+    let agent = agent.unwrap_or(Entity::PLACEHOLDER);
+    if let Some(mut conversation) = world.get_mut::<Conversation>(agent) {
+        conversation.push(Message::user("hi"));
+        conversation.push(Message::assistant("hello"));
+        // A file attached to it does not come back as typed text.
+        let file = UserContent::text("<file path=\"a.rs\">\n1  fn a() {}\n</file>");
+        let content = vec![UserContent::text("and then?"), file];
+        conversation.push(Message::User { content });
+        conversation.push(Message::Assistant(failed));
+    }
+    let model = MockCompletionModel::from_stream_turns([no_credit()]);
+    agent_on(&mut app, &model);
+    let ended = |world: &mut World| !world.resource::<Ended>().0.is_empty();
+    assert!(run_until(&mut app, ended), "{:?}", notices(&app));
+    app.update();
+    let recalled = &app.world().resource::<RecalledTexts>().0;
+    assert_eq!(recalled, &["and then?\n\ngo"]);
+    let said = conversation(&app, agent);
+    assert_eq!(said, [Message::user("hi"), Message::assistant("hello")]);
+}
+
+/// The results the last reply that counts asked for stay with it, though
+/// a system note came between, as a restored session may hold them; only
+/// the user's later message comes back.
+#[test]
+fn a_failed_turn_keeps_the_results_of_the_reply_before_it() {
+    use rig_core::message::{AssistantContent, AssistantMessage, ToolCall};
+    let mut app = app();
+    app.init_resource::<Ended>().add_observer(log_ended);
+    collect_recalled(&mut app);
+    let Ok(name) = ToolName::new("look") else {
+        return;
+    };
+    let call = ToolCall::from_wire("c1", ToolFunction::new(name.clone(), serde_json::json!({})));
+    let asked = Message::Assistant(AssistantMessage::new(vec![AssistantContent::ToolCall(
+        call.clone(),
+    )]));
+    let held = [
+        Message::user("read it"),
+        asked,
+        Message::system("a note"),
+        Message::tool_result(call.id, name, "the file"),
+    ];
+    let world = app.world_mut();
+    let agent = world.query_filtered::<Entity, With<Agent>>().single(world);
+    let agent = agent.unwrap_or(Entity::PLACEHOLDER);
+    if let Some(mut conversation) = world.get_mut::<Conversation>(agent) {
+        for message in held.iter().cloned() {
+            conversation.push(message);
+        }
+        conversation.push(Message::user("now explain it"));
+    }
+    let model = MockCompletionModel::from_stream_turns([no_credit()]);
+    agent_on(&mut app, &model);
+    let ended = |world: &mut World| !world.resource::<Ended>().0.is_empty();
+    assert!(run_until(&mut app, ended), "{:?}", notices(&app));
+    app.update();
+    let recalled = &app.world().resource::<RecalledTexts>().0;
+    assert_eq!(recalled, &["now explain it\n\ngo"]);
+    assert_eq!(conversation(&app, agent), held);
+}
+
+/// A failed reply stored after the results of the last reply that counts
+/// goes when a call that carries on from those results fails, though no
+/// message of the user's comes back.
+#[test]
+fn a_failed_turn_takes_a_stored_failed_reply_after_results() {
+    use rig_core::message::{AssistantContent, AssistantMessage, ToolCall};
+    let mut app = app();
+    app.init_resource::<Ended>().add_observer(log_ended);
+    collect_recalled(&mut app);
+    let Ok(name) = ToolName::new("look") else {
+        return;
+    };
+    let call = ToolCall::from_wire("c1", ToolFunction::new(name.clone(), serde_json::json!({})));
+    let asked = Message::Assistant(AssistantMessage::new(vec![AssistantContent::ToolCall(
+        call.clone(),
+    )]));
+    let held = [
+        Message::user("read it"),
+        asked,
+        Message::tool_result(call.id, name, "the file"),
+    ];
+    let failed = AssistantMessage::new(vec![AssistantContent::text("half")])
+        .with_stop(StopReason::Error("overloaded".to_owned()));
+    let model = MockCompletionModel::from_stream_turns([no_credit()]);
+    let agent = connected(&mut app, &model);
+    let world = app.world_mut();
+    if let Some(mut conversation) = world.get_mut::<Conversation>(agent) {
+        for message in held.iter().cloned() {
+            conversation.push(message);
+        }
+        conversation.push(Message::Assistant(failed));
+    }
+    // A call that carries on from the results, as a restart's does.
+    let turn = world.spawn(TurnOf(agent)).id();
+    world.spawn((TurnCall, CallOf(turn), ForAgent(agent)));
+    let ended = |world: &mut World| !world.resource::<Ended>().0.is_empty();
+    assert!(run_until(&mut app, ended), "{:?}", notices(&app));
+    app.update();
+    assert!(app.world().resource::<RecalledTexts>().0.is_empty());
+    assert_eq!(conversation(&app, agent), held);
+}
+
+/// A titled user's message, such as a chat bridge's or a skill's, is not
+/// the local user's own: a failed turn takes it out of the conversation,
+/// as every user's message no model answered, but hands nothing back to
+/// the local input, and says it was taken out.
+#[test]
+fn a_failed_turn_takes_a_titled_users_message_without_giving_it_back() {
+    let mut app = app();
+    app.init_resource::<Ended>().add_observer(log_ended);
+    collect_recalled(&mut app);
+    let model = MockCompletionModel::from_stream_turns([answer("hi"), no_credit()]);
+    let agent = agent_on(&mut app, &model);
+    let ended_n = |n| move |world: &mut World| world.resource::<Ended>().0.len() == n;
+    assert!(run_until(&mut app, ended_n(1)), "{:?}", notices(&app));
+    let remote =
+        Incoming::new("deploy it", DeliveryMode::Steer).with_author(Author::user().titled("ana"));
+    app.world_mut().trigger(Deliver {
+        entity: agent,
+        message: remote,
+    });
+    assert!(run_until(&mut app, ended_n(2)), "{:?}", notices(&app));
+    app.update();
+    assert!(app.world().resource::<RecalledTexts>().0.is_empty());
+    assert_eq!(conversation(&app, agent).len(), 2, "only go and hi stay");
+    let told = notices(&app);
+    assert!(
+        told.iter().any(|notice| notice.contains("taken out")),
+        "{told:?}"
+    );
 }
 
 /// An image sent to a model that does not read images goes as its name,
@@ -2645,6 +2894,25 @@ struct KeepUnsent(bool);
 #[derive(Resource, Default)]
 struct RecalledTexts(Vec<String>);
 
+/// A model call that fails for good: the account is out of credit.
+fn no_credit() -> Vec<MockStreamEvent> {
+    let refused =
+        ProviderResponseError::without_status("insufficient credit").with_transient(Some(false));
+    vec![MockStreamEvent::Error(MockError::ProviderResponse(refused))]
+}
+
+/// Keeps the text of each [`Recalled`] in [`RecalledTexts`].
+fn collect_recalled(app: &mut App) {
+    app.init_resource::<RecalledTexts>().add_systems(
+        Last,
+        |mut read: MessageReader<Recalled>, mut texts: ResMut<RecalledTexts>| {
+            for recalled in read.read() {
+                texts.0.push(recalled.text.clone());
+            }
+        },
+    );
+}
+
 /// Keeps the messages a turn the user stopped did not send, when
 /// [`KeepUnsent`] says so.
 fn keep_on_stop(
@@ -2801,7 +3069,7 @@ fn a_turn_a_plugin_fails_starts_nothing_more_and_ends_with_its_reason() {
         ended(&app)
     );
     assert_eq!(model.request_count(), 0, "the turn's call never started");
-    assert_eq!(conversation(&app, agent).len(), 1, "the message is kept");
+    assert_eq!(conversation(&app, agent), [], "the message is given back");
     let models: Vec<_> = model_records(&app)
         .iter()
         .map(|record| (record.disposition, record.started_ms.is_none()))
@@ -2893,7 +3161,15 @@ fn an_interrupt_ends_the_turn_at_once_and_settles_its_held_and_streaming_calls()
             .turns()
             .last()
             .and_then(|(_, record)| record.end);
-        assert_eq!(ended, Some(TurnEnd::Stopped { why: None }));
+        // The record ends at the kept text; the held call was no call of
+        // the reply, so the stop answered none.
+        let at = conversation.entries().next_back().map(|entry| entry.id);
+        let stopped = TurnEnd::Stopped {
+            why: None,
+            at,
+            calls: Vec::new(),
+        };
+        assert_eq!(ended, Some(stopped));
         conversation.push(Message::user("never mind"));
         let note = conversation.entries().rev().nth(1);
         assert!(note.is_some_and(|entry| entry.is_stop_marker()));
@@ -3159,7 +3435,8 @@ impl Tool for Peek {
 
 /// A stopped call that may have changed something, a stopped one that
 /// only read, and one that never started each read as rig-core's
-/// `not_finished` says.
+/// `not_finished` says, beside a call that finished first. The turn's
+/// record names the calls the stop answered, not the finished one.
 #[test]
 fn a_stopped_call_says_whether_it_ran_and_whether_it_may_have_changed_something() {
     let mut app = app();
@@ -3167,10 +3444,12 @@ fn a_stopped_call_says_whether_it_ran_and_whether_it_may_have_changed_something(
     let footprint = |touches| ToolOptions {
         footprint: Some(touches),
     };
-    app.add_tool_with(Stall, footprint(Touches::Writes(paths("/work/b"))))
+    app.add_tool_with(Sum, footprint(Touches::Reads(paths("/work/c"))))
+        .add_tool_with(Stall, footprint(Touches::Writes(paths("/work/b"))))
         .add_tool_with(Peek, footprint(Touches::Reads(paths("/work/a"))));
-    // `touch` may change anything, so it waits behind both.
+    // `touch` may change anything, so it waits behind the others.
     let model = MockCompletionModel::from_stream_turns([vec![
+        MockStreamEvent::tool_call("a1", "add", serde_json::json!({"a": 1, "b": 2})),
         MockStreamEvent::tool_call("s1", "stall", serde_json::json!({})),
         MockStreamEvent::tool_call("p1", "peek", serde_json::json!({})),
         MockStreamEvent::tool_call("t1", "touch", serde_json::json!({})),
@@ -3178,9 +3457,12 @@ fn a_stopped_call_says_whether_it_ran_and_whether_it_may_have_changed_something(
     ]]);
     let agent = agent_on(&mut app, &model);
     let running = |world: &mut World| {
-        ["s1", "p1"].iter().all(|id| {
-            call_named(world, id).is_some_and(|call| world.get::<Started>(call).is_some())
-        })
+        let added =
+            call_named(world, "a1").is_some_and(|call| world.get::<Outcome>(call).is_some());
+        added
+            && ["s1", "p1"].iter().all(|id| {
+                call_named(world, id).is_some_and(|call| world.get::<Started>(call).is_some())
+            })
     };
     assert!(run_until(&mut app, running), "{:?}", notices(&app));
     app.world_mut().trigger(StopTurn::new(agent));
@@ -3188,16 +3470,38 @@ fn a_stopped_call_says_whether_it_ran_and_whether_it_may_have_changed_something(
     let said = conversation(&app, agent);
     let results = results_at(&said, said.len().saturating_sub(1));
     let expected = [
-        "Stopped: the user stopped the turn. It may have partly run; check before running it again.",
-        "Stopped: the user stopped the turn. It only read; run it again if you still need it.",
-        "Not run: the user stopped the turn.",
+        (false, "3"),
+        (
+            true,
+            "Stopped: the user stopped the turn. It may have partly run; check before running it again.",
+        ),
+        (
+            true,
+            "Stopped: the user stopped the turn. It only read; run it again if you still need it.",
+        ),
+        (true, "Not run: the user stopped the turn."),
     ];
     let read: Vec<bool> = results
         .iter()
         .zip(expected)
-        .map(|((error, result), text)| *error && result.contains(text))
+        .map(|((error, result), (failed, text))| *error == failed && result.contains(text))
         .collect();
-    assert_eq!(read, [true, true, true], "{results:?}");
+    assert_eq!(read, [true, true, true, true], "{results:?}");
+    let ended = app
+        .world()
+        .get::<Conversation>(agent)
+        .and_then(|conversation| {
+            let (_, record) = conversation.turns().next_back()?;
+            match record.end? {
+                TurnEnd::Stopped { at, calls, .. } => Some((
+                    at == conversation.entries().next_back().map(|entry| entry.id),
+                    calls,
+                )),
+                _ => None,
+            }
+        });
+    let calls = ["s1", "p1", "t1"].map(CallId::from_wire).to_vec();
+    assert_eq!(ended, Some((true, calls)));
 }
 
 /// Stopping an idle agent's turn stops the running turns of the agents
@@ -3500,22 +3804,13 @@ fn an_adapter_applies_to_the_model_a_call_is_finally_routed_to() {
     // What the adapter was given: whether that model calls tools.
     let given = Arc::new(std::sync::Mutex::new(Vec::new()));
     let (seen, wrap) = (Arc::clone(&given), adapted.clone());
-    let adapt = move |mut calls: Query<&mut Adapters, (Added<Admitted>, With<TurnCall>)>| {
-        for mut adapters in &mut calls {
-            let (seen, wrap) = (Arc::clone(&seen), wrap.clone());
-            adapters
-                .0
-                .push(Adapter::new("wrap", move |connection: Connection| {
-                    if let Ok(mut seen) = seen.lock() {
-                        seen.push(connection.spec.tools);
-                    }
-                    let model =
-                        ModelAdapter::<Completion>::new(connection.spec.reference(), wrap.clone());
-                    Connection {
-                        handler: Handler(ErasedHandler::new(model)),
-                        ..connection
-                    }
-                }));
+    let adapt = move |mut calls: Query<&mut Adapted, (Added<Admitted>, With<TurnCall>)>| {
+        for mut adapted in &mut calls {
+            if let Ok(mut seen) = seen.lock() {
+                seen.push(adapted.0.spec.tools);
+            }
+            let model = ModelAdapter::<Completion>::new(adapted.0.spec.reference(), wrap.clone());
+            adapted.0.handler = Handler(ErasedHandler::new(model));
         }
     };
     let to = connection_with(&routed, true);
@@ -3526,7 +3821,13 @@ fn an_adapter_applies_to_the_model_a_call_is_finally_routed_to() {
     };
     app.init_resource::<Ended>()
         .add_observer(log_ended)
-        .add_systems(AgentPass, (adapt, route).chain().in_set(Stage::Prepare));
+        .add_systems(
+            AgentPass,
+            (
+                adapt.in_set(PrepareSystems::Adapt),
+                route.in_set(PrepareSystems::Edit),
+            ),
+        );
     plain_agent(&mut app, &own);
     let done = |world: &mut World| !world.resource::<Ended>().0.is_empty();
     assert!(run_until(&mut app, done), "{:?}", notices(&app));
@@ -3548,7 +3849,7 @@ fn an_adapter_applies_to_the_model_a_call_is_finally_routed_to() {
 }
 
 #[test]
-fn an_outermost_adapter_pushed_first_wraps_one_pushed_later() {
+fn an_outermost_adapter_added_first_wraps_one_added_later() {
     let mut app = app();
     let own = MockCompletionModel::from_stream_turns([answer("own")]);
     let adapted = MockCompletionModel::from_stream_turns([answer("adapted")]);
@@ -3556,38 +3857,32 @@ fn an_outermost_adapter_pushed_first_wraps_one_pushed_later() {
     // tools.
     let applied = Arc::new(std::sync::Mutex::new(Vec::new()));
     let (seen, wrap) = (Arc::clone(&applied), adapted.clone());
-    let adapt = move |mut calls: Query<&mut Adapters, (Added<Admitted>, With<TurnCall>)>| {
-        for mut adapters in &mut calls {
-            let outer = Arc::clone(&seen);
-            adapters.0.push(
-                Adapter::new("outer", move |connection: Connection| {
-                    if let Ok(mut applied) = outer.lock() {
-                        applied.push(("outer", connection.spec.tools));
-                    }
-                    connection
-                })
-                .outermost(),
-            );
-            let (inner, wrap) = (Arc::clone(&seen), wrap.clone());
-            adapters
-                .0
-                .push(Adapter::new("inner", move |connection: Connection| {
-                    if let Ok(mut applied) = inner.lock() {
-                        applied.push(("inner", connection.spec.tools));
-                    }
-                    let mut spec = (*connection.spec).clone();
-                    spec.tools = false;
-                    let model = ModelAdapter::<Completion>::new(spec.reference(), wrap.clone());
-                    Connection {
-                        spec: Arc::new(spec),
-                        handler: Handler(ErasedHandler::new(model)),
-                    }
-                }));
+    let outer = Arc::clone(&applied);
+    let outermost = move |calls: Query<&Adapted, (Added<Admitted>, With<TurnCall>)>| {
+        for adapted in &calls {
+            if let Ok(mut applied) = outer.lock() {
+                applied.push(("outer", adapted.0.spec.tools));
+            }
+        }
+    };
+    let adapt = move |mut calls: Query<&mut Adapted, (Added<Admitted>, With<TurnCall>)>| {
+        for mut adapted in &mut calls {
+            if let Ok(mut applied) = seen.lock() {
+                applied.push(("inner", adapted.0.spec.tools));
+            }
+            let mut spec = (*adapted.0.spec).clone();
+            spec.tools = false;
+            let model = ModelAdapter::<Completion>::new(spec.reference(), wrap.clone());
+            adapted.0 = Connection {
+                spec: Arc::new(spec),
+                handler: Handler(ErasedHandler::new(model)),
+            };
         }
     };
     app.init_resource::<Ended>()
         .add_observer(log_ended)
-        .add_systems(AgentPass, adapt.in_set(Stage::Prepare));
+        .add_systems(AgentPass, outermost.in_set(PrepareSystems::AdaptOutermost))
+        .add_systems(AgentPass, adapt.in_set(PrepareSystems::Adapt));
     agent_on(&mut app, &own);
     let done = |world: &mut World| !world.resource::<Ended>().0.is_empty();
     assert!(run_until(&mut app, done), "{:?}", notices(&app));
@@ -3600,30 +3895,31 @@ fn an_outermost_adapter_pushed_first_wraps_one_pushed_later() {
     assert_eq!((own.request_count(), adapted.request_count()), (0, 1));
 }
 
-/// The system prompts of the model calls Prepare saw, in parts and as
-/// Start sends them.
+/// The system prompts of the model calls Prepare saw, in parts, and the
+/// system message Fit measured.
 #[derive(Resource, Default)]
-struct Prompts(Vec<Option<rig_core::completion::SystemPrompt>>);
+struct Prompts(Vec<(Option<rig_core::completion::SystemPrompt>, Option<Message>)>);
 
 #[test]
 fn a_model_that_calls_no_tools_is_sent_none() {
     let mut app = app();
     let own = MockCompletionModel::from_stream_turns([answer("plain")]);
     // Each call's prompt in parts, then as Start sends it.
-    let read = |calls: Query<(&ModelRequest, &Adapters, &ForAgent), Added<Admitted>>,
-                starts: ModelStarts,
+    let read = |calls: Query<(&ModelRequest, &Adapted), Added<Admitted>>,
                 mut prompts: ResMut<Prompts>| {
-        for (call, adapters, agent) in &calls {
-            let sent = starts.prompt(call, Some(adapters), Some(agent.0));
-            prompts
-                .0
-                .extend([call.prompt.clone(), sent.ok().and_then(|(_, it)| it)]);
+        for (call, adapted) in &calls {
+            let sent = adapted
+                .sent(call)
+                .chat_history
+                .first()
+                .map(|it| (**it).clone());
+            prompts.0.push((call.prompt.clone(), sent));
         }
     };
     app.init_resource::<Ended>()
         .init_resource::<Prompts>()
         .add_observer(log_ended)
-        .add_systems(AgentPass, read.in_set(PrepareSystems::Edit));
+        .add_systems(AgentPass, read.in_set(PrepareSystems::Fit));
     let agent = plain_agent(&mut app, &own);
     app.world_mut()
         .entity_mut(agent)
@@ -3634,14 +3930,15 @@ fn a_model_that_calls_no_tools_is_sent_none() {
     assert!(run_until(&mut app, done), "{:?}", notices(&app));
     // Prepare sees the parts, and Start sends them as they are.
     let prompts = &app.world().resource::<Prompts>().0;
-    assert!(matches!(prompts.first(), Some(Some(_))), "{prompts:?}");
-    let Some(Some(prompt)) = prompts.first() else {
+    assert!(matches!(prompts.first(), Some((Some(_), _))), "{prompts:?}");
+    let Some((Some(prompt), measured)) = prompts.first() else {
         return;
     };
     assert_eq!(prompt.role, "You add.");
     let tags: Vec<&str> = prompt.sections.iter().map(|s| s.tag.as_str()).collect();
     assert_eq!(tags, ["environment"]);
-    assert_eq!(prompts.get(1), prompts.first());
+    let rendered = Message::system(prompt.text());
+    assert_eq!(measured.as_ref(), Some(&rendered));
     // The model is sent no tools, and one system message.
     let requests = own.requests();
     let tools = offered(requests.first());
@@ -3681,7 +3978,7 @@ impl Serve for NoSeed {
     }
 }
 
-/// What `ModelStarts::sent` said in Prepare, and `DroppedOptions` after Start.
+/// What `Adapted::dropped` said in Prepare, and `DroppedOptions` after Start.
 #[derive(Resource, Default)]
 struct LeftOut(Vec<Vec<String>>);
 
@@ -3693,17 +3990,17 @@ fn options(dropped: &[rig_core::completion::UnsupportedOption]) -> Vec<String> {
 fn a_call_knows_the_options_its_model_left_out() {
     let mut app = app();
     let model = MockCompletionModel::from_stream_turns([answer("ok")]);
-    let ask_top_p =
-        |mut calls: Query<(&mut ModelRequest, &Adapters, &ForAgent), Added<Admitted>>,
-         starts: ModelStarts,
-         mut left: ResMut<LeftOut>| {
-            for (mut call, adapters, agent) in &mut calls {
-                call.request_mut().options.top_p = Some(0.9);
-                if let Ok(dropped) = starts.dropped(&call, Some(adapters), Some(agent.0)) {
-                    left.0.push(options(&dropped));
-                }
-            }
-        };
+    let ask_top_p = |mut calls: Query<&mut ModelRequest, Added<Admitted>>| {
+        for mut call in &mut calls {
+            call.request_mut().options.top_p = Some(0.9);
+        }
+    };
+    let measure = |calls: Query<(&ModelRequest, &Adapted), Added<Admitted>>,
+                   mut left: ResMut<LeftOut>| {
+        for (call, adapted) in &calls {
+            left.0.push(options(&adapted.dropped(call)));
+        }
+    };
     app.init_resource::<Ended>()
         .init_resource::<LeftOut>()
         .add_observer(log_ended)
@@ -3715,7 +4012,13 @@ fn a_call_knows_the_options_its_model_left_out() {
                     .extend(calls.get(fitted.entity).map(|it| options(&it.0)));
             },
         )
-        .add_systems(AgentPass, ask_top_p.in_set(PrepareSystems::Edit));
+        .add_systems(
+            AgentPass,
+            (
+                ask_top_p.in_set(PrepareSystems::Edit),
+                measure.in_set(PrepareSystems::Fit),
+            ),
+        );
     let agent = agent_on(&mut app, &model);
     let spec = Catalog::builtin().resolve("anthropic/claude-fable-5");
     let Ok(spec) = spec.map(|spec| spec.shared()) else {
@@ -3757,26 +4060,27 @@ fn a_call_knows_the_model_it_went_to_and_what_its_adapters_published() {
     let mut app = app();
     let own = MockCompletionModel::from_stream_turns([answer("hi")]);
     // Says the model calls no tools, and tells the call it saw the reply.
-    let adapt = |mut calls: Query<&mut Adapters, (Added<Admitted>, With<TurnCall>)>| {
-        for mut adapters in &mut calls {
-            adapters
+    let adapt = |mut calls: Query<&mut Adapted, (Added<Admitted>, With<TurnCall>)>| {
+        for mut adapted in &mut calls {
+            let mut spec = (*adapted.0.spec).clone();
+            spec.tools = false;
+            let handler = adapted
                 .0
-                .push(Adapter::new("plain", |connection: Connection| {
-                    let mut spec = (*connection.spec).clone();
-                    spec.tools = false;
-                    let handler = connection.handler.0.map_stream("plain", |published| {
-                        move |item: Relayed| {
-                            if let Relayed::Done(_) = &item {
-                                published.insert(Rewritten(true)).ok();
-                            }
-                            vec![item]
+                .handler
+                .0
+                .clone()
+                .map_stream("plain", |published| {
+                    move |item: Relayed| {
+                        if let Relayed::Done(_) = &item {
+                            published.insert(Rewritten(true)).ok();
                         }
-                    });
-                    Connection {
-                        spec: Arc::new(spec),
-                        handler: Handler(handler),
+                        vec![item]
                     }
-                }));
+                });
+            adapted.0 = Connection {
+                spec: Arc::new(spec),
+                handler: Handler(handler),
+            };
         }
     };
     let review = |calls: Query<(&ModelRequest, &SentTo, Option<&Published>), ReadyToSettle>,
@@ -3792,7 +4096,10 @@ fn a_call_knows_the_model_it_went_to_and_what_its_adapters_published() {
         .add_observer(log_ended)
         .add_systems(
             AgentPass,
-            (adapt.in_set(Stage::Prepare), review.in_set(Stage::Review)),
+            (
+                adapt.in_set(PrepareSystems::Adapt),
+                review.in_set(Stage::Review),
+            ),
         );
     agent_on(&mut app, &own);
     let done = |world: &mut World| !world.resource::<Ended>().0.is_empty();
@@ -3938,7 +4245,10 @@ fn a_tool_the_agent_may_not_use_is_refused_and_reads_as_unknown() {
         })
     };
     assert_eq!(refusal("touch"), Some((ErrorKind::Denied, true)));
-    assert!(matches!(refusal("nope"), Some((ErrorKind::Tool(_), false))));
+    assert!(matches!(
+        refusal("nope"),
+        Some((ErrorKind::Tool(ToolErrorKind::NotFound), false))
+    ));
     // The message's record reads back as one.
     let sent = message_record(&app, "go").and_then(|record| MessageRecord::read(&record.kind));
     assert_eq!(
@@ -4178,4 +4488,87 @@ fn a_call_routed_to_another_model_asks_for_that_models_caching() {
         .collect();
     assert_eq!(caching, [Some(CacheRetention::Short); 2]);
     assert_eq!(own.request_count(), 0);
+}
+
+/// The layers of the handler each settled model call went to.
+#[derive(Resource, Default)]
+struct SentLayers(Vec<Vec<String>>);
+
+fn log_sent_layers(
+    settled: On<Add<Settled>>,
+    calls: Query<&SentTo, With<TurnCall>>,
+    mut seen: ResMut<SentLayers>,
+) {
+    if let Ok(SentTo(connection)) = calls.get(settled.entity) {
+        seen.0.push(connection.handler.0.descriptor().layers);
+    }
+}
+
+#[test]
+fn a_retried_call_is_adapted_once() {
+    let mut app = app();
+    app.insert_resource(TimeUpdateStrategy::ManualDuration(Duration::from_secs(30)));
+    let model = MockCompletionModel::from_stream_turns([overloaded(), answer("ok")]);
+    let adapt = |mut calls: Query<&mut Adapted, (Added<Admitted>, With<TurnCall>)>| {
+        for mut adapted in &mut calls {
+            let handler = adapted.0.handler.0.clone();
+            adapted.0.handler = Handler(handler.map_stream("count", |_| |item| vec![item]));
+        }
+    };
+    app.init_resource::<Ended>()
+        .init_resource::<SentLayers>()
+        .add_observer(log_ended)
+        .add_observer(log_sent_layers)
+        .add_systems(AgentPass, adapt.in_set(PrepareSystems::Adapt));
+    agent_on(&mut app, &model);
+    let done = |world: &mut World| !world.resource::<Ended>().0.is_empty();
+    assert!(run_until(&mut app, done), "{:?}", notices(&app));
+    assert_eq!(model.request_count(), 2);
+    // The failed call and its retry each went through the adapter once.
+    let layers = &app.world().resource::<SentLayers>().0;
+    let counted: Vec<usize> = layers
+        .iter()
+        .map(|layers| layers.iter().filter(|it| *it == "count").count())
+        .collect();
+    assert_eq!(counted, [1, 1], "{layers:?}");
+}
+
+/// The hold the gate put on the first turn call it saw.
+#[derive(Resource, Default)]
+struct FirstHold(Option<Entity>);
+
+#[test]
+fn a_held_call_goes_to_the_model_it_was_adapted_for() {
+    let mut app = app();
+    let first = MockCompletionModel::from_stream_turns([answer("first")]);
+    let second = MockCompletionModel::from_stream_turns([answer("second")]);
+    let hold_once = |calls: Query<Entity, (ReadyToStart, With<TurnCall>)>,
+                     mut held: ResMut<FirstHold>,
+                     mut commands: Commands| {
+        for call in &calls {
+            if held.0.is_none() {
+                held.0 = Some(commands.spawn(HoldOf(call)).id());
+            }
+        }
+    };
+    app.init_resource::<Ended>()
+        .init_resource::<FirstHold>()
+        .add_observer(log_ended)
+        .add_systems(AgentPass, hold_once.in_set(Stage::Gate));
+    let agent = agent_on(&mut app, &first);
+    let held = |world: &mut World| world.resource::<FirstHold>().0.is_some();
+    assert!(run_until(&mut app, held), "{:?}", notices(&app));
+    // While the call is held, the agent's model changes.
+    let changed = connection(&second);
+    assert!(changed.is_some(), "the second model connects");
+    if let Some(changed) = changed {
+        app.world_mut().entity_mut(agent).insert(changed);
+    }
+    if let Some(hold) = app.world().resource::<FirstHold>().0 {
+        app.world_mut().despawn(hold);
+    }
+    let done = |world: &mut World| !world.resource::<Ended>().0.is_empty();
+    assert!(run_until(&mut app, done), "{:?}", notices(&app));
+    // It goes where Fit measured it: the model it was adapted for.
+    assert_eq!((first.request_count(), second.request_count()), (1, 0));
 }

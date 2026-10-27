@@ -141,28 +141,24 @@ pub(crate) fn drawn_rows(
     height: usize,
     streaming: Vec<rig_core::message::ToolCall>,
 ) -> Vec<ratatui::text::Line<'static>> {
-    use crate::pane::{PaneState, lay_out_pane};
-
+    use crate::pane::{PaneState, lay_out_panes};
+    assert!(streaming.is_empty());
     let pane = main_pane(app.world());
     let area = ratatui::layout::Rect::new(0, 0, 80, u16::try_from(height).unwrap_or(u16::MAX));
-    let draw = move |layout: TranscriptLayout,
-                     mut panes: Query<(
-        &mut TranscriptView,
-        &mut PaneState,
-        Option<&mut DrawnTranscript>,
-    )>| {
-        let Ok((view, mut state, drawn)) = panes.get_mut(pane) else {
-            return Vec::new();
-        };
-        let Some(mut shown) = layout.agent(agent, true) else {
-            return Vec::new();
-        };
-        shown.streaming = streaming.clone();
-        let state = state.bypass_change_detection();
-        lay_out_pane(&layout, pane, (view, state, drawn), Some(&shown), area);
-        state.rows.clone()
-    };
-    app.world_mut().run_system_once(draw).unwrap_or_default()
+    if let Some(mut canvas) = app.world_mut().get_mut::<crate::PanelCanvas>(pane) {
+        canvas.reset(area);
+    }
+    if let Some(mut shown) = app
+        .world_mut()
+        .get_resource_mut::<rig_harness::main_agent::ShownAgent>()
+    {
+        shown.0 = Some(agent);
+    }
+    app.world_mut().run_system_once(lay_out_panes).ok();
+    app.world()
+        .get::<PaneState>(pane)
+        .map(|state| state.rows.clone())
+        .unwrap_or_default()
 }
 
 /// [`drawn_rows`] as text, a line per row.
@@ -234,8 +230,9 @@ fn a_plugins_test_lays_out_a_transcript_without_a_terminal() {
     let note = Deliver::new(agent, "a note", DeliveryMode::Inform);
     app.world_mut().trigger(note);
     app.update();
-    let lay_out =
-        move |layout: TranscriptLayout| layout.lay_out(&TranscriptView::default(), agent, 40);
+    let lay_out = move |world: &mut World| {
+        TranscriptLayout::lay_out(world, &TranscriptView::default(), agent, 40)
+    };
     let laid_out = app.world_mut().run_system_once(lay_out).ok().flatten();
     assert!(laid_out.is_some());
     let Some(drawn) = laid_out else { return };
@@ -259,8 +256,9 @@ fn typed_keys_edit_the_input_and_enter_sends_it() {
     press(&mut app, "ctrl+a");
     type_text(&mut app, "> ");
     press(&mut app, "enter");
-    assert_eq!(typed(&app), "");
     assert_eq!(app.world().resource::<Delivered>().0, ["> hello"]);
+    // No model answers it, so it comes back to the input.
+    assert_eq!(typed(&app), "> hello");
 }
 
 #[test]
@@ -391,5 +389,7 @@ fn a_screen_built_from_the_public_widgets_draws_and_sends() {
     type_text(&mut app, "hello");
     press(&mut app, "enter");
     assert_eq!(app.world().resource::<Delivered>().0, ["hello"]);
-    assert_eq!(typed(&app), "");
+    // No model answers either, so both come back to the input: the one
+    // put in the conversation by hand as it is there.
+    assert_eq!(typed(&app), "where is the config read?\n\nhello");
 }

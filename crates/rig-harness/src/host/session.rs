@@ -25,10 +25,11 @@ use bevy_reflect::Reflect;
 use crossbeam_channel::{Receiver, Sender};
 use rig_harness_protocol::{Home, SessionDir, SessionId, StartReason};
 
+use rig_core::completion::Message;
 use rig_core::conversation::Author;
 use rig_ecs::WriteLogs;
-use rig_ecs::agent::{Notice, NoticeLevel};
-use rig_ecs::restore::SavedKeys;
+use rig_ecs::agent::{Agent, Conversation, Notice, NoticeLevel};
+use rig_ecs::restore::{SavedKeys, check_saved};
 use rig_ecs::session_log::{SessionLog, SessionStore, open_session};
 use rig_memory::{
     DirFiles, DirStore, Files, Rewrite, Rewritten, Session, SessionError, SessionMeta, Store,
@@ -72,10 +73,11 @@ impl Deref for SessionPaths {
 /// ([`Front::session_store`](super::cli::Front::session_store)), else from
 /// this, and reads it before writing; a run whose session does not open or
 /// read is refused, unchanged. The harness marks the running session saved
-/// once its log first writes, so `/resume` lists it (not a sessionless
-/// run's); a program that saves a new session through this marks it
-/// itself ([`SessionDir::mark_saved`]). [`Self::relist`] keeps the listing
-/// of a session no rig runs current.
+/// once its log wrote and an agent's conversation has a user or assistant
+/// message, so `/resume` lists it (not a sessionless run's); a program
+/// that saves a new session through this marks it itself
+/// ([`SessionDir::mark_saved`]). [`Self::relist`] keeps the listing of a
+/// session no rig runs current.
 #[derive(Resource, Clone)]
 pub struct StoreOpener {
     /// How a store is opened.
@@ -203,9 +205,10 @@ pub struct AppStart(pub StartReason);
 #[derive(Resource)]
 struct Unmarked;
 
-/// Until the session's log first writes, in a run that keeps its session:
-/// the session is marked saved then ([`SessionDir::mark_saved`]), so
-/// `/resume` lists it. A sessionless run never has it.
+/// Until the session's log wrote and an agent's conversation has a user or
+/// assistant message, in a run that keeps its session: the session is
+/// marked saved then ([`SessionDir::mark_saved`]), so `/resume` lists it.
+/// A sessionless run never has it.
 #[derive(Resource)]
 struct Unsaved;
 
@@ -331,8 +334,12 @@ fn insert_plugin_data(world: &mut World) {
 /// Opens the session's store, the one in the world or else the one the
 /// run's front or [`StoreOpener`] opens for [`SessionPaths`], and reads
 /// the session it holds ([`open_session`]), before anything is written to
-/// it. A sessionless run never marks its session saved, so a crash leaves
-/// no session for `/resume` to list.
+/// it. A session whose format is refused is migrated through that store,
+/// the saved values its steps changed checked against the registered
+/// types, and read again;
+/// the launcher's lock on the session holds it meanwhile. A sessionless
+/// run never marks its session saved, so a crash leaves no session for
+/// `/resume` to list.
 fn open_store(world: &mut World) -> Result<(), SessionError> {
     let store = match world.remove_resource::<SessionStore>() {
         Some(SessionStore(store)) => store,
@@ -353,8 +360,21 @@ fn open_store(world: &mut World) -> Result<(), SessionError> {
             store
         }
     };
-    open_session(world, store)
+    match open_session(world, store.clone()) {
+        Err(SessionError::Format { .. }) => {
+            CHAIN.migrate(&*store, &|key, value| check_saved(world, key, value))?;
+            open_session(world, store)
+        }
+        opened => opened,
+    }
 }
+
+/// The steps a session in an earlier format is migrated by; in this
+/// crate's tests, those from the synthetic format too.
+#[cfg(not(test))]
+const CHAIN: rig_memory::migration::Chain = rig_memory::migration::SHIPPED;
+#[cfg(test)]
+const CHAIN: rig_memory::migration::Chain = rig_memory::migration::testing::CHAIN;
 
 /// Keeps a refused run out of its session's directory: what it logged
 /// goes to the launcher's run directory, where the launcher points, or
@@ -367,9 +387,22 @@ pub(crate) fn leave_session(world: &mut World) {
     world.remove_resource::<Unmarked>();
 }
 
-/// Marks the session saved after its log first wrote.
-fn mark_saved(log: Option<Res<SessionLog>>, paths: Res<SessionPaths>, mut commands: Commands) {
-    if !log.is_some_and(|log| log.has_written()) {
+/// Marks the session saved once its log wrote and an agent's conversation
+/// has a user or assistant message: a session that only changed settings
+/// is not worth resuming, and is removed on exit.
+fn mark_saved(
+    log: Option<Res<SessionLog>>,
+    conversations: Query<&Conversation, With<Agent>>,
+    paths: Res<SessionPaths>,
+    mut commands: Commands,
+) {
+    let said = |conversation: &Conversation| {
+        conversation
+            .messages()
+            .iter()
+            .any(|message| matches!(**message, Message::User { .. } | Message::Assistant(_)))
+    };
+    if !log.is_some_and(|log| log.has_written()) || !conversations.iter().any(said) {
         return;
     }
     commands.remove_resource::<Unsaved>();

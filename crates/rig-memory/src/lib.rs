@@ -14,7 +14,8 @@
 //! - [`CompactionPolicy`], [`apply_summary`], [`undo_summary`]: compacting a long conversation.
 //! - [`load`], [`save`], [`Session`], [`Writer`]: saving and resuming, in the one format
 //!   [`FORMAT`]. Reading is strict: a session of another format, or that does not read whole,
-//!   is refused and nothing is written. [`load_async`] and [`save_async`] keep a conversation
+//!   is refused and nothing is written, unless [`migration`] brings it to the format first.
+//!   [`load_async`] and [`save_async`] keep a conversation
 //!   in any [`AsyncStore`], such as a database or IndexedDB.
 //! - [`history`], [`as_of`]: how a conversation got where it is.
 //! - [`rewrite`] (what it promises is on it): rewriting a saved session.
@@ -25,6 +26,8 @@
 //!   [`AsyncStore`], its calls done when made. A log write appends only if the log is as long as
 //!   the writer read it, the store checking and writing in one step, so of two saves that read
 //!   one log the second is refused ([`SessionError::Changed`]) and writes nothing to it.
+//!   `rig-sqlite` and `rig-postgres` keep sessions in a database with their `memory` feature, and
+//!   `conformance` (feature `test-utils`) checks a store against the contract.
 //!
 //! ```
 //! use rig_core::message::Message;
@@ -46,12 +49,15 @@
 
 mod blobs;
 mod compaction;
+#[cfg(any(test, feature = "test-utils"))]
+pub mod conformance;
 #[cfg(feature = "fs")]
 mod dir;
 mod fork;
 mod format;
 mod listing;
 mod meta;
+pub mod migration;
 pub mod recent;
 mod rewrite;
 mod saved;
@@ -63,9 +69,10 @@ mod writer;
 pub use blobs::{BLOBS, load_images, store_images};
 pub use compaction::{
     AFTER_OVERFLOW, COMPACTED, ClearPlan, ClearToolOutputs, Cleared, CompactReason, Compacted,
-    CompactionPolicy, NearWindow, Summarizer, SummaryCut, SummaryError, SummaryLimits, SummaryPlan,
-    SummaryPrompts, SummaryState, TrackArgument, TrackedSet, Uncompacted, UndoError, apply_summary,
-    estimate_tokens, summarized_prefix, summary_author, summary_in, summary_state, undo_summary,
+    CompactionPolicy, NearWindow, Summarized, Summarizer, SummaryCut, SummaryError, SummaryLimits,
+    SummaryPlan, SummaryPrompts, SummaryState, TrackArgument, TrackedSet, Uncompacted, UndoError,
+    apply_summary, estimate_tokens, known_limits, summarized_in_log, summarized_prefix,
+    summary_author, summary_in, summary_state, undo_summary,
 };
 #[cfg(feature = "fs")]
 pub use dir::{DirFiles, DirStore};
@@ -81,10 +88,11 @@ pub use session::{
     LogRecord, SavedAgent, Session, Unreadable, as_of, history, load, load_async, save, save_async,
 };
 pub use store::{
-    AsyncStore, Files, LogWriteError, MemoryStore, PLUGINS, PluginFiles, Store, check_name,
+    AsyncStore, Files, LogWriteError, MemoryStore, PLUGINS, PluginFiles, Store, check_log_name,
+    check_name,
 };
 pub use tokens::{
     ATTACHMENT_TOKENS, Anchor, HeuristicTokenCounter, OUTPUT_MARGIN, Prepared, RequestStart,
-    TokenCounter, next_request_tokens, output_room,
+    TURN_OUTPUT, TokenCounter, next_request_tokens,
 };
 pub use writer::Writer;

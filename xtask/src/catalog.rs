@@ -6,7 +6,8 @@
 //!
 //! 1. Keep the models.dev providers rig serves, renamed to rig's vendor
 //!    names ([`KEYS`]), each model row whole but for its `id`, its keys in
-//!    a fixed order ([`ordered`]).
+//!    a fixed order ([`ordered`]), leaving out a row reached through an API
+//!    rig serves only at another vendor ([`OWN_APIS`]).
 //! 2. Lay each reviewed row over its models.dev row, or add it: objects merge
 //!    key by key, anything else replaces. A reviewed row that names
 //!    `"from": "<vendor>/<id>"` starts from that generated row instead. The
@@ -60,7 +61,7 @@ const REVIEW: &str = "xtask/src/catalog/review.json";
 const MODELS_DEV: &str = "https://models.dev/api.json";
 
 /// The models.dev provider keys rig serves, and the rig vendor each names.
-const KEYS: [(&str, &str); 22] = [
+const KEYS: [(&str, &str); 24] = [
     ("openai", "openai"),
     ("azure", "azure.openai"),
     ("anthropic", "anthropic"),
@@ -83,7 +84,16 @@ const KEYS: [(&str, &str); 22] = [
     ("xiaomi", "xiaomimimo"),
     ("ollama-cloud", "ollama"),
     ("github-copilot", "copilot"),
+    ("opencode", "opencode"),
+    ("opencode-go", "opencode-go"),
 ];
+
+/// The AI SDK packages for an API rig reaches only at its own vendor,
+/// `(package, vendor)`. Another vendor's row that models.dev reaches with
+/// one is left out, since rig would send it to another API. rig-core's
+/// `Catalog::from_models_dev` skips the same rows at run time, by asking
+/// whether the vendor is registered for that API; keep the two in step.
+const OWN_APIS: [(&str, &str); 1] = [("@ai-sdk/google", "gcp.gemini")];
 
 /// The keys of a model row rig-core reads, in the order they are written.
 /// Sync keeps any other key models.dev adds, after these, and says so.
@@ -183,9 +193,11 @@ const PINNABLE: [&str; 31] = [
 /// lists for it. Azure OpenAI and Copilot reach OpenAI's models through
 /// OpenAI's wire, which applies OpenAI's sampling rule, so they take it and
 /// the default effort it depends on.
-const SERVERS: [(&str, &str, &[&str]); 5] = [
+const SERVERS: [(&str, &str, &[&str]); 9] = [
     ("anthropic", "aws_bedrock", &["reasoning_options", "rig"]),
     ("anthropic", "openrouter", &["rig"]),
+    ("anthropic", "opencode", &["rig"]),
+    ("anthropic", "opencode-go", &["rig"]),
     ("anthropic", "vertexai", &["reasoning_options", "rig"]),
     (
         "openai",
@@ -195,6 +207,16 @@ const SERVERS: [(&str, &str, &[&str]); 5] = [
     (
         "openai",
         "copilot",
+        &["rig.sampling", "rig.reasoning_default"],
+    ),
+    (
+        "openai",
+        "opencode",
+        &["rig.sampling", "rig.reasoning_default"],
+    ),
+    (
+        "openai",
+        "opencode-go",
         &["rig.sampling", "rig.reasoning_default"],
     ),
 ];
@@ -383,7 +405,13 @@ pub(crate) fn generate(models_dev: &Value, review: &Value) -> Result<Rows, Strin
         };
         let section = rows.entry(vendor.to_owned()).or_default();
         for (id, row) in models {
-            section.insert(id.clone(), ordered(row));
+            let npm = row.pointer("/provider/npm").and_then(Value::as_str);
+            let elsewhere = OWN_APIS
+                .iter()
+                .any(|(package, owner)| npm == Some(*package) && *owner != vendor);
+            if !elsewhere {
+                section.insert(id.clone(), ordered(row));
+            }
         }
     }
     let review = read_rows(review)?;
@@ -777,14 +805,13 @@ const RATE_KEYS: &[&str] = &[
 /// The fields rig-core reads in a provider override.
 const PROVIDER_KEYS: &[&str] = &["npm", "api", "shape", "body", "headers"];
 
-/// The keys rig-core reads in each object below a row, by its path, `*`
-/// standing for an array index or a mode name. An object not listed, such
-/// as a provider body, is read whole.
-const NESTED_KEYS: &[(&str, &[&str])] = &[
-    ("limit", &["context", "input", "output"]),
-    (
-        "cost",
-        &[
+/// The keys rig-core reads in the object below a row at path `at`, `*`
+/// standing for an array index or a mode name. `None` for an object read
+/// whole, such as a provider body.
+fn nested_keys(at: &str) -> Option<&'static [&'static str]> {
+    match at {
+        "limit" => Some(&["context", "input", "output"]),
+        "cost" => Some(&[
             "input",
             "output",
             "cache_read",
@@ -794,12 +821,9 @@ const NESTED_KEYS: &[(&str, &[&str])] = &[
             "output_audio",
             "tiers",
             "context_over_200k",
-        ],
-    ),
-    ("cost.context_over_200k", RATE_KEYS),
-    (
-        "cost.tiers.*",
-        &[
+        ]),
+        "cost.context_over_200k" | "experimental.modes.*.cost" => Some(RATE_KEYS),
+        "cost.tiers.*" => Some(&[
             "input",
             "output",
             "cache_read",
@@ -808,18 +832,17 @@ const NESTED_KEYS: &[(&str, &[&str])] = &[
             "input_audio",
             "output_audio",
             "tier",
-        ],
-    ),
-    ("cost.tiers.*.tier", &["type", "size"]),
-    ("modalities", &["input", "output"]),
-    ("reasoning_options.*", &["type", "values", "min", "max"]),
-    ("interleaved", &["field"]),
-    ("provider", PROVIDER_KEYS),
-    ("experimental", &["modes"]),
-    ("experimental.modes.*", &["cost", "provider"]),
-    ("experimental.modes.*.cost", RATE_KEYS),
-    ("experimental.modes.*.provider", PROVIDER_KEYS),
-];
+        ]),
+        "cost.tiers.*.tier" => Some(&["type", "size"]),
+        "modalities" => Some(&["input", "output"]),
+        "reasoning_options.*" => Some(&["type", "values", "min", "max"]),
+        "interleaved" => Some(&["field"]),
+        "provider" | "experimental.modes.*.provider" => Some(PROVIDER_KEYS),
+        "experimental" => Some(&["modes"]),
+        "experimental.modes.*" => Some(&["cost", "provider"]),
+        _ => None,
+    }
+}
 
 /// The keys of the rows `rows` holds that rig-core does not read, nested
 /// ones by their path.
@@ -841,10 +864,7 @@ fn unread_keys(rows: &Rows) -> Vec<String> {
 /// Adds to `unread` the keys of `value`, found at `at`, and of the objects
 /// below it, that rig-core does not read.
 fn unread_below(value: &Value, at: &str, unread: &mut Vec<String>) {
-    let known = NESTED_KEYS
-        .iter()
-        .find(|(path, _)| *path == at)
-        .map(|(_, keys)| *keys);
+    let known = nested_keys(at);
     match value {
         Value::Object(fields) => {
             for (key, inner) in fields {

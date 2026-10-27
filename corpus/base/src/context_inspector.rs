@@ -9,7 +9,7 @@
 //! prompt in front of the messages and sends it. The kernel's own prompt
 //! and tools are kept as the call's [`Built`] when the `ModelRequest` is
 //! inserted, before any Prepare system ran. After Prepare, the prompt in
-//! parts as Start will send it ([`ModelStarts::prompt`]), who wrote each
+//! parts as Start will send it ([`ModelRequest::prompt`]), who wrote each
 //! message and the attributed edits of the messages are kept as the
 //! call's [`Prepared`]. When the call is `Started`, the request as sent
 //! goes to the agent's [`LastRequest`] with the model it went to after
@@ -168,15 +168,11 @@ fn keep_built(
 /// After Prepare, keeps what each admitted turn call will send and who
 /// edited its messages, before Start takes its prompt and history.
 fn keep_prepared(
-    calls: Query<(Entity, &ModelRequest, &Adapters, &ForAgent), (Added<Admitted>, With<TurnCall>)>,
-    starts: ModelStarts,
+    calls: Query<(Entity, &ModelRequest), (Added<Admitted>, With<TurnCall>)>,
     mut commands: Commands,
 ) {
-    for (call, model, adapters, &ForAgent(agent)) in &calls {
-        let (Ok((_, Some(prompt))), Some(history)) = (
-            starts.prompt(model, Some(adapters), Some(agent)),
-            &model.history,
-        ) else {
+    for (call, model) in &calls {
+        let (Some(prompt), Some(history)) = (model.prompt.clone(), &model.history) else {
             continue;
         };
         let prepared = Prepared {
@@ -288,7 +284,17 @@ fn alias(
 /// `/why [full] [agent]`.
 fn why(
     In(args): In<CommandArgs>,
-    agents: Query<(Entity, &Name, &AgentId, Option<&LastRequest>, &LastUsage), With<Agent>>,
+    agents: Query<
+        (
+            Entity,
+            &Name,
+            &AgentId,
+            Option<&LastRequest>,
+            &LastUsage,
+            Has<ContextStale>,
+        ),
+        With<Agent>,
+    >,
     tools: Query<(&ToolDef, Option<&ProvidedBy>)>,
     names: Query<&Name>,
     session: Option<Res<SessionPaths>>,
@@ -306,7 +312,7 @@ fn why(
             name.as_str() == wanted || id.0 == wanted
         }
     });
-    let Some((_, name, id, last, usage)) = found else {
+    let Some((_, name, id, last, usage, stale)) = found else {
         notices.write(Notice::error(args.agent, format!("No agent `{wanted}`.")));
         return;
     };
@@ -332,7 +338,12 @@ fn why(
             (def.0.name.as_str().to_owned(), plugin)
         })
         .collect();
-    let text = report(name.as_str(), last, &providers, usage.context());
+    let text = report(
+        name.as_str(),
+        last,
+        &providers,
+        usage.context().filter(|_| !stale),
+    );
     notices.write(Notice::info(args.agent, text));
 }
 
@@ -392,33 +403,67 @@ fn split(request: &CompletionRequest) -> (&str, &[Arc<Message>]) {
 #[derive(Default, Clone, Copy)]
 struct Tally(usize, u64);
 
-/// The kind of a message written by `author`, as `/why` groups them.
-fn kind(message: &Message, author: Option<&Author>) -> usize {
-    match message {
-        _ if author == Some(&summary_author()) => 3,
-        Message::Assistant(_) => 1,
-        Message::System { .. } => 4,
-        Message::User { content } => {
-            if content
-                .iter()
-                .any(|part| matches!(part, UserContent::ToolResult(_)))
-            {
-                2
-            } else {
-                0
+/// A kind of message, as `/why` groups them.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MessageKind {
+    User,
+    Assistant,
+    ToolResults,
+    Summaries,
+    System,
+}
+
+impl MessageKind {
+    /// Every kind, in the order the report lists them.
+    const ALL: [Self; 5] = [
+        Self::User,
+        Self::Assistant,
+        Self::ToolResults,
+        Self::Summaries,
+        Self::System,
+    ];
+
+    /// The kind of `message`, written by `author`.
+    fn of(message: &Message, author: Option<&Author>) -> Self {
+        match message {
+            _ if author == Some(&summary_author()) => Self::Summaries,
+            Message::Assistant(_) => Self::Assistant,
+            Message::System { .. } => Self::System,
+            Message::User { content } => {
+                if content
+                    .iter()
+                    .any(|part| matches!(part, UserContent::ToolResult(_)))
+                {
+                    Self::ToolResults
+                } else {
+                    Self::User
+                }
             }
         }
     }
-}
 
-/// The names of the kinds [`kind`] returns, and their marks in the bar.
-const KINDS: [(&str, char); 5] = [
-    ("user", 'U'),
-    ("assistant", 'A'),
-    ("tool results", 'R'),
-    ("summaries", 'C'),
-    ("system", 'S'),
-];
+    /// Its name in the report.
+    fn label(self) -> &'static str {
+        match self {
+            Self::User => "user",
+            Self::Assistant => "assistant",
+            Self::ToolResults => "tool results",
+            Self::Summaries => "summaries",
+            Self::System => "system",
+        }
+    }
+
+    /// Its mark in the bar.
+    fn mark(self) -> char {
+        match self {
+            Self::User => 'U',
+            Self::Assistant => 'A',
+            Self::ToolResults => 'R',
+            Self::Summaries => 'C',
+            Self::System => 'S',
+        }
+    }
+}
 
 /// The `/why` report of `agent`'s `last` request; `providers` says which
 /// plugin added each tool, `reported` the context the provider counted.
@@ -461,23 +506,25 @@ fn report(
         .iter()
         .flat_map(|prepared| prepared.authors.iter().map(Option::as_ref))
         .chain(std::iter::repeat(None));
-    let mut kinds = [Tally::default(); KINDS.len()];
+    let mut kinds = MessageKind::ALL.map(|kind| (kind, Tally::default()));
     for (message, author) in messages.iter().zip(authors) {
-        if let Some(tally) = kinds.get_mut(kind(message, author)) {
+        let kind = MessageKind::of(message, author);
+        if let Some((_, tally)) = kinds.iter_mut().find(|(each, _)| *each == kind) {
             tally.0 += 1;
             tally.1 += message_tokens(message);
         }
     }
-    let message_total: u64 = kinds.iter().map(|tally| tally.1).sum();
+    let message_total: u64 = kinds.iter().map(|(_, tally)| tally.1).sum();
     lines.push(format!(
         "Messages: {} (~{} tokens)",
         messages.len(),
         tokens_label(message_total)
     ));
-    for ((label, _), tally) in KINDS.iter().zip(kinds) {
+    for (kind, tally) in kinds {
         if tally.0 > 0 {
             lines.push(format!(
-                "  {label}: {} (~{})",
+                "  {}: {} (~{})",
+                kind.label(),
                 tally.0,
                 tokens_label(tally.1)
             ));
@@ -532,12 +579,7 @@ fn report(
     }
     head.push('.');
     let mut parts = vec![('S', system_tokens), ('T', tool_total)];
-    parts.extend(
-        KINDS
-            .iter()
-            .zip(kinds)
-            .map(|((_, mark), tally)| (*mark, tally.1)),
-    );
+    parts.extend(kinds.map(|(kind, tally)| (kind.mark(), tally.1)));
     let scale = last.limit.map_or(total, u64::from).max(total).max(1);
     let legend = "S system, T tools, U user, A assistant, R tool results, C summaries, . free";
     format!(

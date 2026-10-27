@@ -50,6 +50,25 @@ fn a_notice_stays_before_what_an_edit_adds_to_the_message_it_followed() {
     let order = ["first", "Interrupted.", "second"].map(|text| line_of(&lines, text));
     assert!(order.iter().all(Option::is_some), "{lines:#?}");
     assert!(order.is_sorted(), "{lines:#?}");
+
+    // A compaction that takes the message out keeps the notice in it.
+    let world = app.world_mut();
+    if let Some(mut conversation) = world.get_mut::<Conversation>(agent) {
+        let taken: Vec<_> = conversation.entry(0).into_iter().collect();
+        let compaction = Author::plugin("compaction");
+        let summary = rig_core::conversation::Entry::new(Message::user("the summary"));
+        let spliced = conversation.splice(..1, [summary.by(compaction.clone())], compaction);
+        if let Some(summary) = spliced.changed.first() {
+            let replaced = crate::Replaced([(*summary, taken)].into());
+            world.entity_mut(agent).insert(replaced);
+        }
+    }
+    app.update();
+    let lines = transcript(&mut app, agent);
+    let order = ["first", "Interrupted.", "second", "the summary"];
+    let order = order.map(|text| line_of(&lines, text));
+    assert!(order.iter().all(Option::is_some), "{lines:#?}");
+    assert!(order.is_sorted(), "{lines:#?}");
 }
 
 #[test]
@@ -126,13 +145,16 @@ fn what_was_typed_and_not_sent_is_kept_across_a_reload() {
     let (mut app, _) = view_app();
     app.insert_resource(data(&session))
         .insert_resource(ExitReason::Reload);
-    crate::tests::edit(&mut app, |input| input.set("/tools"));
+    // A key in it, as in a message that came back, never reaches the disk.
+    let typed = "/tools OPENAI_API_KEY=sk-proj-abcdefghijklmnop1234";
+    crate::tests::edit(&mut app, |input| input.set(typed));
     assert!(app.world_mut().run_system_once(keep_draft).is_ok());
     drop(app);
     let (mut app, _) = view_app();
     app.insert_resource(data(&session));
     assert!(app.world_mut().run_system_once(load_draft).is_ok());
-    assert_eq!(crate::tests::input(&app).text(), "/tools");
+    let kept = "/tools OPENAI_API_KEY=[REDACTED]";
+    assert_eq!(crate::tests::input(&app).text(), kept);
     // Once: the build after this one starts empty.
     let (mut app, _) = view_app();
     app.insert_resource(data(&session));
@@ -269,8 +291,8 @@ fn laid_out_narrow(said: &[&str]) -> Option<DrawnTranscript> {
         app.world_mut().trigger(note);
         app.update();
     }
-    let lay_out = move |layout: crate::TranscriptLayout| {
-        layout.lay_out(&TranscriptView::default(), agent, 12)
+    let lay_out = move |world: &mut World| {
+        crate::TranscriptLayout::lay_out(world, &TranscriptView::default(), agent, 12)
     };
     app.world_mut().run_system_once(lay_out).ok().flatten()
 }
@@ -334,4 +356,25 @@ fn a_line_says_where_each_of_its_rows_starts_in_it() {
     // The blanks a wrap dropped end the row before.
     let blank = line.text.find("  ").unwrap_or_default();
     assert_eq!(line.row_at(blank + 1), line.row_at(blank));
+}
+
+#[test]
+fn what_comes_back_to_an_agent_not_shown_waits_until_it_is() {
+    let (mut app, _) = view_app();
+    let other = app.world_mut().spawn(Agent).id();
+    for text in ["deploy it", "then tag it"] {
+        let text = text.to_owned();
+        app.world_mut().write_message(Recalled {
+            agent: other,
+            text,
+            why: None,
+        });
+        app.update();
+    }
+    assert_eq!(crate::tests::input(&app).text(), "");
+    crate::tests::edit(&mut app, |input| input.set("draft"));
+    app.world_mut().insert_resource(ShownAgent(Some(other)));
+    app.update();
+    let back = "deploy it\n\nthen tag it\n\ndraft";
+    assert_eq!(crate::tests::input(&app).text(), back);
 }

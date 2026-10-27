@@ -2,28 +2,24 @@
 //! image, any other file as its text, capped the way `read` shows it, so
 //! the model needs no `read` call for it.
 
+use std::fmt;
+use std::io;
 use std::path::{Path, PathBuf};
 
 use base64::Engine;
 use rig_core::completion::Message;
-use rig_core::conversation::Conversation;
+use rig_core::conversation::{Conversation, EntryRef, FILE_CLOSE, FILE_OPEN, attached_file};
 use rig_core::message::{ImageMediaType, UserContent};
 
 use crate::workspace::{Stat, Workspace};
 use crate::{MAX_LINES, show_lines};
 
-/// The largest image attached: providers refuse bigger ones (Anthropic
-/// takes 5 MB per image).
-const MOST_BYTES: u64 = 5 * 1024 * 1024;
+/// The largest image attached: providers refuse one whose base64 is over
+/// 5 MB, which this many bytes make.
+pub(crate) const MOST_BYTES: u64 = 5 * 1024 * 1024 / 4 * 3;
 
 /// The most bytes of a text file attached; the model reads on with `read`.
 const MOST_TEXT_BYTES: usize = 32 * 1024;
-
-/// How an attached text file starts, followed by its label and `">`.
-const FILE_OPEN: &str = "<file path=\"";
-
-/// How an attached text file ends.
-const FILE_CLOSE: &str = "</file>";
 
 /// The file extensions looked at as images.
 const EXTENSIONS: [&str; 5] = ["png", "jpg", "jpeg", "gif", "webp"];
@@ -132,13 +128,6 @@ pub fn is_path_reference(reference: &str) -> bool {
         })
 }
 
-/// The label and the contents of an attached text file, when `text` is
-/// one, so a view can show it without the markup around it.
-pub fn attached_file(text: &str) -> Option<(&str, &str)> {
-    let rest = text.strip_prefix(FILE_OPEN)?.strip_suffix(FILE_CLOSE)?;
-    rest.split_once("\">\n")
-}
-
 /// `path` with a leading `~/` made the home directory.
 fn expand(path: &str) -> PathBuf {
     match (path.strip_prefix("~/"), std::env::home_dir()) {
@@ -148,24 +137,69 @@ fn expand(path: &str) -> PathBuf {
 }
 
 /// The image at `path` in `workspace` as message content, its type told
-/// by its first bytes; why not, for a file that cannot be read, is larger
-/// than a provider takes, or is not a PNG, JPEG, GIF or WebP image.
+/// by its first bytes; why not, for a file that cannot be read, is not a
+/// PNG, JPEG, GIF or WebP image, or is larger than a provider takes.
 pub fn read_image(workspace: &dyn Workspace, path: &Path) -> Result<UserContent, String> {
-    let contents = workspace
-        .read(path, MOST_BYTES)
-        .map_err(|failure| failure.to_string())?;
-    if contents.size > MOST_BYTES {
-        return Err(format!(
-            "it has {} KB, more than the {} KB a provider takes",
-            contents.size / 1024,
-            MOST_BYTES / 1024
-        ));
+    let image = image(workspace, path).map_err(|failure| failure.to_string())?;
+    Ok(UserContent::image_base64(
+        image.base64(),
+        Some(image.media_type),
+        None,
+    ))
+}
+
+/// An image file, read whole.
+pub(crate) struct Image {
+    /// Its bytes.
+    pub bytes: Vec<u8>,
+    /// Its type, told by its first bytes.
+    pub media_type: ImageMediaType,
+}
+
+impl Image {
+    /// Its bytes in base64, as message content carries them.
+    pub fn base64(&self) -> String {
+        base64::engine::general_purpose::STANDARD.encode(&self.bytes)
     }
-    let bytes = contents.bytes;
-    let media_type = ImageMediaType::sniff(&bytes)
-        .ok_or("it is not a PNG, JPEG, GIF or WebP image".to_owned())?;
-    let data = base64::engine::general_purpose::STANDARD.encode(&bytes);
-    Ok(UserContent::image_base64(data, Some(media_type), None))
+}
+
+/// Why [`image`] read no image.
+#[derive(Debug)]
+pub(crate) enum NoImage {
+    /// The file could not be read.
+    Read(io::Error),
+    /// Its first bytes are not a PNG, JPEG, GIF or WebP image's.
+    Other,
+    /// It is an image of this many bytes, more than a provider takes.
+    TooLarge(u64),
+}
+
+impl fmt::Display for NoImage {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Read(failure) => write!(formatter, "{failure}"),
+            Self::Other => write!(formatter, "it is not a PNG, JPEG, GIF or WebP image"),
+            Self::TooLarge(size) => write!(
+                formatter,
+                "it is an image of {} KB, more than the {} KB a provider takes",
+                size.div_ceil(1024),
+                MOST_BYTES / 1024
+            ),
+        }
+    }
+}
+
+/// The image at `path` in `workspace`, whose first bytes tell its type.
+pub(crate) fn image(workspace: &dyn Workspace, path: &Path) -> Result<Image, NoImage> {
+    let contents = workspace.read(path, MOST_BYTES).map_err(NoImage::Read)?;
+    let media_type = ImageMediaType::sniff(&contents.bytes).ok_or(NoImage::Other)?;
+    if contents.size > MOST_BYTES {
+        return Err(NoImage::TooLarge(contents.size));
+    }
+    Ok(Image {
+        bytes: contents.bytes,
+        media_type,
+    })
 }
 
 /// The text file at `path` as message content: its lines the way `read`
@@ -186,12 +220,22 @@ fn read_file(workspace: &dyn Workspace, path: &Path, label: &str) -> Result<User
 
 /// What the user typed in message `at` of `conversation`: the text items
 /// of a message of the user's own
-/// ([`EntryRef::is_users_own`](rig_core::conversation::EntryRef::is_users_own)), never of
+/// ([`EntryRef::is_users_own`]), never of
 /// one an agent or a plugin delivered, such as a note, nor a file
 /// attached, each trimmed, joined by a blank line; `None` when it has
 /// none.
 pub fn typed(conversation: &Conversation, at: usize) -> Option<String> {
-    let entry = conversation.entries().nth(at)?;
+    typed_in(conversation.entries().nth(at)?)
+}
+
+/// What the user typed in each message of `conversation` that has some
+/// ([`typed`]), oldest first.
+pub fn typed_prompts(conversation: &Conversation) -> impl Iterator<Item = String> + '_ {
+    conversation.entries().filter_map(typed_in)
+}
+
+/// What the user typed in `entry` ([`typed`]).
+fn typed_in(entry: EntryRef<'_>) -> Option<String> {
     let Message::User { content } = entry.message else {
         return None;
     };

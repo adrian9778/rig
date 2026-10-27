@@ -11,9 +11,9 @@
 //! words with the user's message, and every pinned one, are added to that
 //! message in each request of the turn, after a cache point of the
 //! request, and never to the saved conversation. `/memory` lists them,
-//! `/memory edit` opens the files in `$EDITOR` in the terminal view, and
-//! `/memory off` and `/memory on` stop and restart the recall for the
-//! session.
+//! `/memory edit` opens the files in `$VISUAL` or `$EDITOR` in the
+//! terminal view, and `/memory off` and `/memory on` stop and restart the
+//! recall for the session.
 
 use std::collections::BTreeSet;
 use std::fs;
@@ -465,7 +465,6 @@ fn memory(
     In(args): In<CommandArgs>,
     memories: Res<Memories>,
     view: Res<TerminalView>,
-    processes: Res<Processes>,
     mut off: ResMut<MemoryOff>,
     mut commands: Commands,
     mut notices: MessageWriter<Notice>,
@@ -494,17 +493,13 @@ fn memory(
             "Memories are recalled again.".to_owned()
         }
         "edit" if view.0 => {
-            let editor = std::env::var("EDITOR").unwrap_or_else(|_| "vi".to_owned());
-            let mut words = editor.split_whitespace();
-            let mut command = processes.launcher().command(words.next().unwrap_or("vi"));
-            command.args(words);
-            for path in [&memories.project, &memories.user] {
-                if let Some(dir) = path.parent() {
-                    fs::create_dir_all(dir).ok();
-                }
-                command.arg(path);
+            let files = [memories.project.as_path(), memories.user.as_path()];
+            for dir in files.iter().filter_map(|path| path.parent()) {
+                fs::create_dir_all(dir).ok();
             }
-            commands.spawn((RunInTerminal(command), Editing));
+            let line = corpus_shared::editor::line();
+            let command = corpus_shared::editor::command(line.as_deref(), &files);
+            commands.spawn((RunInTerminal(command), Editing(agent)));
             return;
         }
         "edit" => format!(
@@ -524,14 +519,14 @@ fn memory(
     notices.write(Notice::info(agent, text));
 }
 
-/// On the `$EDITOR` run of `/memory edit`.
+/// On the editor run of `/memory edit`, for this agent.
 #[derive(Component)]
-struct Editing;
+struct Editing(Entity);
 
-/// Reads the files again once `$EDITOR` closed, at once rather than at
+/// Reads the files again once the editor closed, at once rather than at
 /// the watch's next look.
 fn edited(
-    done: Query<(Entity, &TerminalExit), (Added<TerminalExit>, With<Editing>)>,
+    done: Query<(Entity, &TerminalExit, &Editing), Added<TerminalExit>>,
     memories: Option<ResMut<Memories>>,
     mut commands: Commands,
     mut notices: MessageWriter<Notice>,
@@ -539,9 +534,10 @@ fn edited(
     let Some(mut memories) = memories else {
         return;
     };
-    for (run, exit) in &done {
-        if let Err(why) = &exit.0 {
-            notices.write(Notice::error(None, format!("$EDITOR did not start: {why}")));
+    for (run, exit, &Editing(agent)) in &done {
+        if let Some(why) = exit.failure() {
+            let text = format!("/memory edit: the editor failed ({why}).");
+            notices.write(Notice::error(agent, text));
         }
         memories.read();
         commands.entity(run).despawn();

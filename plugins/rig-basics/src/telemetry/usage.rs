@@ -220,6 +220,7 @@ fn usage(
     agents: Query<(
         &AgentUsage,
         &LastUsage,
+        Has<ContextStale>,
         (Option<&Connection>, Option<&InputLimit>),
         Option<&ActiveTurn>,
     )>,
@@ -230,7 +231,7 @@ fn usage(
     rows: Query<&UsageRow>,
     mut notices: MessageWriter<Notice>,
 ) {
-    let Ok((AgentUsage { total: spent, .. }, last, (connection, limit), turn)) =
+    let Ok((AgentUsage { total: spent, .. }, last, stale, (connection, limit), turn)) =
         agents.get(args.agent)
     else {
         return;
@@ -251,7 +252,14 @@ fn usage(
         lines.push(format!("This turn: {turn}."));
     }
     let limit = InputLimit::of(limit, connection);
-    match last.context().map(|tokens| ContextUse { tokens, limit }) {
+    match last
+        .context()
+        .filter(|_| !stale)
+        .map(|tokens| ContextUse { tokens, limit })
+    {
+        None if stale => {
+            lines.push("Context: unknown until the next reply.".to_owned());
+        }
         Some(context) => lines.push(format!(
             "Context: {context} tokens{}.",
             if context.limit.is_none() {
@@ -282,7 +290,11 @@ fn usage(
         lines.push("Per model:".to_owned());
         lines.extend(split(&session.models));
     }
-    if session.purposes.keys().any(|purpose| purpose != "turn") {
+    if session
+        .purposes
+        .keys()
+        .any(|purpose| purpose != rig_ecs::turn::PURPOSE)
+    {
         lines.push("Per purpose:".to_owned());
         lines.extend(split(&session.purposes));
     }

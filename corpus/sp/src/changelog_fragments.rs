@@ -10,12 +10,11 @@
 //! no turn's: the next prompt starts at once, and nothing of it reaches the
 //! main agent's model. A failed or timed-out call writes nothing, says so
 //! once and is not tried again. `/changelog` lists the session's
-//! fragments, `/changelog edit <n>` opens one in `$EDITOR` and
+//! fragments, `/changelog edit <n>` opens one in `$VISUAL` or `$EDITOR` and
 //! `/changelog drop <n>` deletes it.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use bevy_tasks::{IoTaskPool, TaskPool};
 use glob::{MatchOptions, Pattern};
@@ -195,11 +194,11 @@ struct Job(Entity);
 enum Answer {
     /// Tell the user this.
     Say(String),
-    /// Open this fragment in `$EDITOR`.
+    /// Open this fragment in the editor.
     Edit(PathBuf),
 }
 
-/// On `$EDITOR` editing a fragment: the agent told if it failed.
+/// On the editor editing a fragment: the agent told if it failed.
 #[derive(Component)]
 struct Editing(Entity);
 
@@ -555,7 +554,7 @@ fn name(path: &Path) -> &str {
 }
 
 /// Tells what a `/changelog` command found, or opens the fragment it
-/// names in `$EDITOR` with the terminal.
+/// names in the editor with the terminal.
 fn answered(
     done: On<Insert<Done<Answer>>>,
     jobs: Query<(&Job, &Done<Answer>)>,
@@ -570,16 +569,15 @@ fn answered(
             notices.write(Notice::info(agent, text.clone()));
         }
         Answer::Edit(path) => {
-            let editor = std::env::var("EDITOR").unwrap_or_else(|_| "vi".to_owned());
-            let mut run = Command::new(editor);
-            run.arg(path);
+            let line = corpus_shared::editor::line();
+            let run = corpus_shared::editor::command(line.as_deref(), &[path]);
             commands.spawn((RunInTerminal(run), Editing(agent)));
         }
     }
     commands.entity(done.entity).despawn();
 }
 
-/// Says when `$EDITOR` failed, and lets its run go.
+/// Says when the editor failed, and lets its run go.
 fn edited(
     exit: On<Insert<TerminalExit>>,
     runs: Query<(&Editing, &TerminalExit)>,
@@ -589,11 +587,7 @@ fn edited(
     let Ok((&Editing(agent), terminal_exit)) = runs.get(exit.entity) else {
         return;
     };
-    if !terminal_exit.success() {
-        let why = match &terminal_exit.0 {
-            Ok(status) => status.to_string(),
-            Err(why) => why.clone(),
-        };
+    if let Some(why) = terminal_exit.failure() {
         notices.write(Notice::warn(
             agent,
             format!("changelog: the editor failed: {why}"),

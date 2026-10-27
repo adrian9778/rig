@@ -8,7 +8,7 @@ use bevy_reflect::prelude::{ReflectDefault, ReflectDeserialize, ReflectSerialize
 use bevy_reflect::serde::TypedReflectSerializer;
 use bevy_reflect::{Reflect, TypePath};
 use rig_core::completion::{Message, Reasoning, Usage};
-use rig_core::conversation::{Author, Change, Entry, Halt, MessageId, STOPPED};
+use rig_core::conversation::{Author, Change, Entry, MessageId, STOPPED};
 use rig_memory::{Files, LogWriteError, MemoryStore, Store};
 use serde_json::Value;
 
@@ -287,32 +287,20 @@ fn session(store: &MemoryStore, act: impl FnOnce(&mut World, Entity)) -> Vec<Mes
 }
 
 #[test]
-fn a_message_after_a_stopped_request_says_it_was_stopped_unless_it_was_retried() {
+fn a_message_after_a_stopped_request_says_it_was_stopped() {
     let store = MemoryStore::default();
-    let texts = [
-        "run sleep 120 && echo finished",
-        "what is 2 + 2?",
-        "and 3 + 3?",
-    ];
-    // The second is asked for again, and that turn fails and keeps it.
-    let keep = |conversation: &mut Conversation| {
-        assert!(conversation.resume());
-        conversation.halt(Halt::Kept);
-    };
+    let texts = ["run sleep 120 && echo finished", "what is 2 + 2?"];
     let live = session(&store, |world, agent| {
-        for (at, text) in texts.into_iter().enumerate() {
+        for text in texts {
             world.trigger(Deliver::new(agent, text, DeliveryMode::Steer));
             // A pass accepts the message and starts the turn.
             world.run_schedule(AgentPass);
             world.trigger(StopTurn::new(agent));
             world.flush();
-            if at == 1 {
-                edit(world, agent, keep);
-            }
         }
     });
-    let [first, second, third] = texts;
-    let said = [first, STOPPED, second, third].map(Message::user);
+    let [first, second] = texts;
+    let said = [first, STOPPED, second].map(Message::user);
     assert_eq!(live, said);
     assert_eq!(session(&store, |_, _| {}), live);
 }
@@ -1098,6 +1086,48 @@ fn a_saved_value_that_no_longer_reads_is_skipped_and_replaced_at_the_next_save()
     assert_eq!(now, serde_json::to_value(&changed).ok());
 }
 
+/// A plugin's type that is registered but not saved.
+#[derive(Reflect, Default)]
+struct Unsaved(u32);
+
+/// A saved value is checked as a restore reads it: under its key's type,
+/// when a plugin saves that type; a value of a type no plugin saves, or
+/// of no registered type, passes.
+#[test]
+fn a_saved_value_is_checked_against_the_type_a_plugin_saves() {
+    let mut world = World::new();
+    let registry = AppTypeRegistry::default();
+    {
+        let mut registry = registry.write();
+        registry.register::<Labelled>();
+        registry.register::<Goal>();
+        registry.register::<Unsaved>();
+    }
+    world.insert_resource(registry);
+    let mut keys = crate::restore::SavedKeys::default();
+    assert!(keys.add(Goal::type_path(), "goals.goal").is_ok());
+    world.insert_resource(keys);
+    let labelled = serde_json::json!({"id": 1, "label": "kept"});
+    let checks = [
+        (Labelled::type_path(), labelled, true),
+        (Labelled::type_path(), serde_json::json!("seven"), false),
+        ("goals.goal", serde_json::json!("ship it"), true),
+        ("goals.goal", serde_json::json!(7), false),
+        (Unsaved::type_path(), serde_json::json!("seven"), true),
+        ("uninstalled.state", serde_json::json!("seven"), true),
+    ];
+    for (key, value, fits) in checks {
+        let checked = crate::restore::check_saved(&world, key, &value);
+        let refused = checked
+            .as_ref()
+            .is_err_and(|error| error.kind() == io::ErrorKind::InvalidData);
+        assert!(
+            checked.is_ok() == fits && refused != fits,
+            "{key} {value}: {checked:?}"
+        );
+    }
+}
+
 /// The goal of a plugin, saved under its stable key.
 #[derive(Resource, Reflect, Clone, Debug, Default, PartialEq)]
 #[reflect(Resource, Saved, Default)]
@@ -1116,6 +1146,7 @@ fn a_value_saved_under_its_key_survives_a_rename_of_its_type() {
     let keyed = |app: &mut App, path: &str| {
         let mut keys = app.world_mut().resource_mut::<crate::restore::SavedKeys>();
         assert!(keys.add(path, "goals.goal").is_ok());
+        assert_eq!(keys.iter().collect::<Vec<_>>(), [("goals.goal", path)]);
     };
     let mut first = App::new();
     first

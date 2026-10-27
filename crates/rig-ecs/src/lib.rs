@@ -51,9 +51,9 @@ pub mod prelude {
 
     pub use crate::AgentPlugin;
     pub use crate::agent::{
-        ActiveTurn, Agent, AgentId, CacheKey, CallOf, Calls, Conversation, EffectParent, LastUsage,
-        Notice, NoticeLevel, Partial, Retry, Spawned, SpawnedBy, StopTurn, SystemPrompt,
-        ToolAccess, Turn, TurnOf, TurnOutcome,
+        ActiveTurn, Agent, AgentId, CacheKey, CallOf, Calls, ContextStale, Conversation,
+        EffectParent, LastUsage, Notice, NoticeLevel, Partial, Spawned, SpawnedBy, StopTurn,
+        SystemPrompt, ToolAccess, Turn, TurnOf, TurnOutcome,
     };
     pub use crate::fork::{AgentForked, ForkAgent};
     pub use crate::inbox::{
@@ -61,7 +61,7 @@ pub mod prelude {
         Recalled, Unsent,
     };
     pub use crate::model::{
-        Connection, ModelChoice, Models, ReasoningSetting, SetModel, SetReasoning,
+        Connection, ModelChoice, ModelRefused, Models, ReasoningSetting, SetModel, SetReasoning,
     };
     pub use crate::prompt::{AgentSections, PromptSection, SectionOf};
     pub use crate::restore::{Interrupted, Restored, SavedKeys};
@@ -82,8 +82,8 @@ pub mod prelude {
         ToolRequest, WorldToolsExt,
     };
     pub use crate::turn::{
-        Adapter, Adapters, Backoff, DroppedOptions, ModelRequest, ModelStarts, Recovery,
-        RetryVerdict, SentTo, SideCall, StreamDelta, StreamTiming, TurnCall,
+        Adapted, Backoff, DroppedOptions, FirstStreamed, ModelRequest, Recovery, RetryVerdict,
+        SentTo, SideCall, StreamDelta, StreamTiming, TurnCall,
     };
     pub use rig_core::conversation::{
         Aside, AsideId, Author, AuthorKind, Change, ChangeRecord, Entry, EntryRef, Halt, MessageId,
@@ -221,7 +221,6 @@ impl Plugin for AgentPlugin {
             .add_observer(session_log::retire)
             .add_observer(fork::fork_agent)
             .add_observer(inbox::on_deliver)
-            .add_observer(turn::on_retry)
             .add_observer(turn::on_stop_turn)
             .add_observer(inbox::unsent_on_turn_end)
             .add_observer(inbox::unmark)

@@ -12,8 +12,9 @@ use crate::catalog::ModelSpec;
 use crate::completion::options::{Mapping, OptionFields, OptionMap};
 use crate::completion::{CacheRetention, CompletionRequest, Effort, Reasoning, ServiceTier};
 use crate::message::ToolChoice;
+use crate::providers::minimax::{Family as MiniMaxFamily, family as minimax_family};
 
-use super::wire::{ANTHROPIC, MINIMAX, MOONSHOT, Messages, XIAOMIMIMO, ZAI};
+use super::wire::{ANTHROPIC, MINIMAX, MOONSHOT, Messages, OLLAMA, XIAOMIMIMO, ZAI};
 
 /// The `thinking` and `output_config` Anthropic's Messages API takes for
 /// `reasoning` on the model `spec` describes (`None`: a model the catalog
@@ -159,6 +160,7 @@ pub(super) fn map_options(
         }
         name if name == MINIMAX.name => minimax(model, fields),
         name if name == XIAOMIMIMO.name => xiaomimimo(request, has_tools, fields),
+        name if name == OLLAMA.name => ollama(fields),
         name if name == ZAI.name || name == MOONSHOT.name => implicit_cache_gateway(fields),
         _ => unknown(fields),
     }
@@ -219,17 +221,17 @@ fn anthropic(
 /// MiniMax's Messages endpoint: block-level cache markers, and reasoning
 /// only on the M3 models.
 fn minimax(model: &str, fields: OptionFields<'_>) -> OptionMap {
-    let model = model.to_ascii_lowercase();
-    let flash = model.starts_with("minimax-m3.1");
-    let m3 = !flash && model.starts_with("minimax-m3");
+    let family = minimax_family(model);
     OptionMap {
         reasoning: Mapping::of(fields.reasoning, |reasoning| match reasoning {
-            Reasoning::Off if m3 => Mapping::Send(json!({"thinking": {"type": "disabled"}})),
+            Reasoning::Off if family == MiniMaxFamily::M3 => {
+                Mapping::Send(json!({"thinking": {"type": "disabled"}}))
+            }
             Reasoning::Off => Mapping::unsupported("thinking cannot be disabled on this model"),
             Reasoning::Effort(Effort::Minimal) => {
                 Mapping::unsupported("MiniMax has no `minimal` effort level")
             }
-            Reasoning::Effort(effort) if flash => {
+            Reasoning::Effort(effort) if family == MiniMaxFamily::M31Flash => {
                 Mapping::Send(json!({"output_config": {"effort": effort.as_str()}}))
             }
             Reasoning::Effort(_) => Mapping::unsupported("this model takes no effort level"),
@@ -294,6 +296,39 @@ fn xiaomimimo(request: &CompletionRequest, has_tools: bool, fields: OptionFields
         seed: Mapping::of(fields.seed, |_| {
             Mapping::unsupported("unverified for xiaomimimo")
         }),
+        stop: Mapping::of_stop(fields.stop, stop_sequences),
+        cache_key: Mapping::unrouted(fields.cache_key),
+    }
+}
+
+/// An Ollama daemon's Messages endpoint, which reads `thinking` as on or
+/// off, `output_config.effort`, `top_p` and `stop_sequences`.
+fn ollama(fields: OptionFields<'_>) -> OptionMap {
+    const UNSUPPORTED: &str = "Ollama's Anthropic-compatible API does not support it";
+    OptionMap {
+        reasoning: Mapping::of(fields.reasoning, |reasoning| match reasoning {
+            Reasoning::Off => Mapping::Send(json!({"thinking": {"type": "disabled"}})),
+            Reasoning::Effort(effort @ (Effort::Low | Effort::Medium | Effort::High)) => {
+                Mapping::Send(json!({"output_config": {"effort": effort.as_str()}}))
+            }
+            Reasoning::Effort(_) => {
+                Mapping::unsupported("Ollama takes only low, medium or high effort")
+            }
+            Reasoning::Budget { .. } => {
+                Mapping::unsupported("Ollama takes an effort level, not a budget")
+            }
+        }),
+        cache: Mapping::of(fields.cache, |cache| match cache {
+            CacheRetention::Short => Mapping::Omit("Ollama reuses the loaded prompt"),
+            CacheRetention::None | CacheRetention::Long => Mapping::unsupported(UNSUPPORTED),
+        }),
+        service_tier: Mapping::of(fields.service_tier, |_| Mapping::unsupported(UNSUPPORTED)),
+        verbosity: Mapping::of(fields.verbosity, |_| Mapping::unsupported(UNSUPPORTED)),
+        parallel_tool_calls: Mapping::of(fields.parallel_tool_calls, |_| {
+            Mapping::unsupported(UNSUPPORTED)
+        }),
+        top_p: Mapping::of(fields.top_p, |top_p| Mapping::Send(json!({"top_p": top_p}))),
+        seed: Mapping::of(fields.seed, |_| Mapping::unsupported(UNSUPPORTED)),
         stop: Mapping::of_stop(fields.stop, stop_sequences),
         cache_key: Mapping::unrouted(fields.cache_key),
     }

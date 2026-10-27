@@ -136,9 +136,10 @@ listed with what covers it.
   wires and Candle the copy can be sent directly. In both cases nothing but
   review stops it.
 - **Guarantee 2.** Code reads raw keys through `options::param` and
-  `BaseInput::param` (section 2.1). Reading cannot change rank, and
+  `BaseInput::param` (section 2.1). Reading cannot change rank,
   `BaseInput::raw_tools` can take out only `tools`, which every wire
-  appends today.
+  appends today, and `BaseInput::claim` takes a field out of the provider
+  layer only, for the base to place itself (Responses `input`).
 - **Guarantee 3.** The guard resolves names within a file. A macro that
   expands to an extension path is not seen. No provider module defines such
   a macro today, and the guard rejects `macro_rules!` that mention
@@ -377,6 +378,9 @@ impl BaseInput<'_> {
     /// `additional_params.tools`, taken out of the raw layer for the base to
     /// append after rig's own tools. An error when it is not an array.
     pub fn raw_tools(&mut self) -> Result<Vec<Value>, EncodeError>;
+    /// The provider options' top-level `key`, which the base places itself;
+    /// the merge leaves it out of the provider layer.
+    pub fn claim(&mut self, key: &'static str) -> Option<Value>;
 }
 
 /// Where the raw layer merges. Data, not code.
@@ -1095,7 +1099,7 @@ and so is `"ollama"`.
 | OpenRouter, DeepSeek and the other Chat dialects share one wire | The Chat wire's `provider()` is the dialect name (`crates/rig-core/src/providers/openai/wire/chat.rs:878-880`), so each dialect reads only its own entry. A user gateway declared with `Dialect::gateway("mygw", ..)` gets typed options from a user `impl ProviderExtension { const PROVIDER = "mygw"; .. }`. |
 | OpenAI Chat and Responses share one provider | One `"openai"` entry. `"*"` goes to whichever route runs; `"openai.chat"` and `"openai.responses"` go only to their route. OpenAI defaults to Responses (`crates/rig-core/src/providers/openai/wire/dialects.rs:35`) and Copilot picks per model (`crates/rig-core/src/providers/copilot/wire.rs:79-85`). |
 | Cohere has two routes | Native (`api "cohere.chat"`) and Compatibility (`api "openai.chat"`) both read `"cohere"`. `ChatRoute::Auto` picks per request (`crates/rig-core/src/providers/cohere/wire.rs:131-137`), and each request takes the right half. |
-| Ollama has two routes | `/v1` (`"openai.chat"`) and native `/api/chat` (`"ollama.chat"`) both read `"ollama"`. A typed `"ollama.chat"` section (native-only `options.num_ctx`) is not the taken route on `/v1`, so it is skipped with a `tracing::debug!` (R2). A raw `num_ctx` or `options` on `/v1` is still refused by `finalize_ollama` (R17). |
+| Ollama has three routes | `/v1` (`"openai.chat"`), native `/api/chat` (`"ollama.chat"`) and `/v1/messages` (`"anthropic.messages"`) all read `"ollama"`. A typed `"ollama.chat"` section (native-only `options.num_ctx`) is not the taken route on `/v1` or `/v1/messages`, so it is skipped with a `tracing::debug!` (R2). A raw `num_ctx` or `options` on `/v1` is still refused by `finalize_ollama` (R17). The shared `keep_alive` is refused on `/v1/messages`, whose body has no such field, and so is a reasoning budget, which Ollama reads only as thinking on: pass an effort. |
 | Vertex reuses the Gemini wire | The shared body builder already takes the target (`crates/rig-core/src/providers/gemini/completion.rs:388-392`), so REST reads `"gcp.gemini"`, Vertex `"vertexai"` and gRPC `"gemini-grpc"`. Section structs are shared: `VertexOptions` embeds the GenerateContent fields. Only a provider key can say the Developer API takes `serviceTier` and `store` and Vertex takes `modelArmorConfig`. |
 | One vendor on two formats | `anthropic::wire::ZAI` and `openai::wire::ZAI` both say `"zai"` (`crates/rig-core/src/providers/anthropic/wire.rs:185`, `crates/rig-core/src/providers/openai/wire/dialects.rs:346`). `ZaiOptions` has an `"openai.chat"` and an `"anthropic.messages"` section. |
 
@@ -1129,7 +1133,7 @@ test:
 |---|---|
 | `ProviderExtension::PROVIDER`, rig-core | `anthropic`, `azure.openai`, `chatgpt`, `cohere`, `copilot`, `deepseek`, `gcp.gemini`, `groq`, `llamacpp`, `minimax`, `mistral`, `moonshot`, `ollama`, `openai`, `openrouter`, `perplexity`, `together`, `venice`, `xai`, `xiaomimimo`, `zai` |
 | `ProviderExtension::PROVIDER`, companion crates | `aws_bedrock` (rig-bedrock), `candle` (rig-candle), `gemini-grpc` (rig-gemini-grpc), `vertexai` (rig-vertexai) |
-| catalog vendor keys | the extension keys but `candle`, plus `doubleword`, `huggingface`, `hyperbolic` and `voyageai` |
+| catalog vendor keys | the extension keys but `candle`, plus `doubleword`, `huggingface`, `hyperbolic`, `opencode`, `opencode-go` and `voyageai` |
 | models.dev keys read under another vendor key (section 8) | `azure`, `google`, `google-vertex`, `amazon-bedrock`, `togetherai`, `moonshotai`, `xiaomi`, `ollama-cloud`, `github-copilot` |
 
 The test also counts the `impl ProviderExtension` items in each crate's
@@ -1152,7 +1156,7 @@ Until then:
 | option | kind | how it is set today |
 |---|---|---|
 | Anthropic betas (`anthropic-beta`) | header | `AnthropicConfig::with_beta` (`crates/rig-core/src/providers/anthropic/wire.rs:286`), on every request of the client |
-| ChatGPT `session_id` | header | no caller setter: the ChatGPT dialect's `Identity { session_ids: true }` sends a fresh id on every request (`crates/rig-core/src/providers/openai/wire/auth.rs:148-156`); `originator` and `user-agent` come from `CHATGPT_ORIGINATOR` and `CHATGPT_USER_AGENT` |
+| Session header (ChatGPT `session-id`, OpenCode Go `x-opencode-session`) | header | the dialect's `Quirks::session_header` names it, and it carries the request's `cache_key`, or a fresh id without one; ChatGPT's `originator` and `user-agent` come from `CHATGPT_ORIGINATOR` and `CHATGPT_USER_AGENT` |
 | Copilot intent (`openai-intent`) | header | `CopilotWire::with_intent(CopilotIntent)` (`crates/rig-core/src/providers/copilot/wire.rs:261`) |
 | Anthropic manual prompt caching | directive on the base arrays | `Messages::with_prompt_caching` and `with_static_prefix_cache_ttl` (`crates/rig-core/src/providers/anthropic/wire.rs:390`, `:417`) |
 | Gemini thought replay | directive | `thought_replay` (`crates/rig-core/src/providers/gemini/completion.rs:115`) |
@@ -1788,7 +1792,12 @@ Docs: [RC] https://developers.openai.com/api/reference/resources/responses/metho
 [RP] https://developers.openai.com/api/docs/guides/priority-processing,
 [XR] https://docs.x.ai/developers/rest-api-reference/inference/responses,
 [XT] https://docs.x.ai/developers/model-capabilities/text/reasoning,
-[OO] https://openrouter.ai/docs/api/api-reference/responses/create-a-response.
+[OO] https://openrouter.ai/docs/api/api-reference/responses/create-a-response,
+[GQR] https://console.groq.com/docs/responses-api,
+[MMR] https://platform.minimax.io/docs/api-reference/responses-create.md,
+[KMR] https://platform.kimi.ai/docs/api/responses,
+[DWA] https://docs.doubleword.ai/inference-api/async-inference,
+[DWE] https://docs.doubleword.ai/inference-api/reasoning-controls.
 
 The Responses API has no `seed` and no `stop` parameter.
 
@@ -1811,6 +1820,21 @@ The Responses API has no `seed` and no `stop` parameter.
 | `top_p` | `"top_p":p` | unsupported when the effective effort is not `none`: with no `reasoning` set that is the row's default, `none` on GPT-5.1 to 5.4 (rows that can turn reasoning off and name no default), `medium` on GPT-5.6 and GPT-6; o-series and gpt-5 reject it; gpt-5.5 unsupported by the name rule (OpenAI rejects `top_p` there with no effort set). The same rule as Chat | [RL] |
 | `seed`, `stop` | unsupported: no such parameter | | [RC] |
 
+A reasoning request adds `"include":["reasoning.encrypted_content"]` only
+where the dialect's `ResponsesQuirks::reasoning_ciphertext` says the
+endpoint returns it: not on Groq (which rejects `include`), Doubleword
+(which accepts it and returns none), MiniMax or Moonshot (which document
+none). Groq and Doubleword return reasoning as the item's own
+`reasoning_text` content, so with `store: false` such an item replays as
+returned rather than being left out.
+
+From GPT-5.6 on, OpenAI's own Responses API places
+`CompletionRequest::cache_points` as `"prompt_cache_breakpoint":{"mode":"explicit"}`
+on the last `input_text`, `input_image` or `input_file` part at or before
+each point, every point marked: the provider writes the latest three (four
+when `prompt_cache_options.mode` is `explicit`) and looks up the rest.
+`cache None` places none. Tools and `instructions` take no breakpoint. [RK].
+
 **xAI** (`"xai"`): `Off` unsupported on grok-4.5, 4.6, 4.7 (`{"effort":"none"}`
 on grok-4.3 only; omit on models that do not reason); `Effort(Low..XHigh)`
 `"reasoning":{"effort":..}` for the levels the catalog row lists, as on Chat
@@ -1831,13 +1855,49 @@ OpenRouter Chat (`auto` is not an OpenRouter value, [ORT]); `verbosity`
 `"text":{"verbosity":..}`; `parallel_tool_calls`, `top_p` as OpenAI; `seed`,
 `stop` unsupported. [OO].
 
+**Groq Responses** (`"groq"`, Responses route, beta): reasoning as Groq Chat,
+spelled `"reasoning":{"effort":..}`; cache, `service_tier`, `verbosity`,
+`parallel_tool_calls` and `top_p` as Groq Chat (the route takes Chat's
+`on_demand` and `performance` tiers); `seed`, `stop` unsupported (rejected as
+unknown fields); no `prompt_cache_key`. [GQR].
+
+**MiniMax Responses** (`"minimax"`, Responses route): `Off`
+`"reasoning":{"effort":"none"}` on MiniMax-M3, unsupported elsewhere
+(M3.1-Flash rejects it, M2.x ignores it); `Effort(e)` `{"effort":"<e>"}` on
+M3.1-Flash except `Minimal`, unsupported elsewhere, as on Chat; `Budget`
+unsupported; cache as MiniMax Chat; `Default` `"standard"` (omit on
+M3.1-Flash), `Priority` `"priority"` except on M3.1-Flash, `Auto`, `Flex`
+unsupported; `verbosity`, `seed`, `stop` unsupported; `parallel_tool_calls`
+and `top_p` unsupported (accepted and ignored); `cache_key`
+`"prompt_cache_key"`. [MMR].
+
+**Moonshot Responses** (`"moonshot"`, Responses route, Kimi K3 family only):
+the input takes no `system` role, so the leading system messages go to
+`instructions` and later ones stay in place as `developer` messages;
+`Effort(Low/High/Max)` `"reasoning":{"effort":..}` on K3, other levels and
+`Off` unsupported; `Budget` unsupported; cache as Moonshot Chat
+(`prompt_cache_options`; a `prompt_cache_breakpoint` is rejected);
+`service_tier`, `verbosity`, `parallel_tool_calls`, `top_p`, `seed`, `stop`
+unsupported; `cache_key` `"prompt_cache_key"`. [KMR].
+
+**Doubleword Responses** (`"doubleword"`, Responses route): `Flex`
+`"service_tier":"flex"`, which the call waits for unless
+`additional_params` sets `background`; `Priority` `"priority"` (realtime); `Auto`, `Default` unsupported;
+`Off` and `Effort(e)` `"reasoning":{"effort":..}` within the catalog row's
+levels; `Budget` unsupported; `top_p` `"top_p":p`; `parallel_tool_calls`
+unsupported (`false` is rejected); `seed`, `stop`, `verbosity`, `cache`
+and `cache_key` unsupported (accepted and ignored, live 2026-10-23). [DWA],
+[DWE].
+
 **ChatGPT / Codex backend** (`"chatgpt"`): no public doc; evidence is
 `references/codex/codex-rs/codex-api/src/common.rs:279-304`,
 `references/pi/packages/ai/src/api/openai-codex-responses.ts:553-597` and
 the recorded echoes in `crates/rig-cassette/fixtures/cassettes/chatgpt/codex_sessions/`.
-`Off` `"reasoning":{"effort":"none"}` (model); `Effort(e)` as OpenAI; `Budget`
-unsupported; cache `Short`, `None` unsupported, `Long` omit (the backend
-echoes `24h`); `Flex` `"service_tier":"flex"`, `Priority`
+`Off` `"reasoning":{"effort":"none"}` (model); `Effort(e)`
+`"reasoning":{"effort":..,"summary":"auto"}`, as pi sends, since without a
+summary the backend streams no reasoning text (with one, a model may still
+return empty summaries); `Budget` unsupported; cache
+`Short`, `None` unsupported, `Long` omit (the backend echoes `24h`); `Flex` `"service_tier":"flex"`, `Priority`
 `"service_tier":"priority"`, `Auto`, `Default` unsupported; `verbosity`
 `"text":{"verbosity":..}`; `parallel_tool_calls` `bool`; `top_p`, `seed`,
 `stop` unsupported. Today the Codex contract silently deletes
@@ -2020,7 +2080,7 @@ docs. Every `Options` type is serialize-only; every `Extras` type reads
 |---|---|---|---|---|
 | `anthropic` | `"*"` | `top_k` (refused where the model fixes its sampling), `metadata_user_id`, `inference_geo`, `speed` (`fast` + beta; refused off Opus 5.5, 5 and 4.8), `task_budget` (`output_config.task_budget` + beta), `fallbacks` (`"default"` or `[{"model"}]`) + beta, `container` (an id or `{id?, skills}`), `context_management` + beta, `mcp_servers` + beta, `diagnostics_previous_message_id` + beta | `stop_reason`, `stop_sequence`, `stop_details`, `cache_creation { ephemeral_5m_input_tokens, ephemeral_1h_input_tokens }`, `service_tier`, `inference_geo`, `speed`, `server_tool_use`, `container`, `fallback_model` | v0.43 `crates/rig-core/src/providers/anthropic/completion.rs` 57-121, 212-230, 350-355; [AM] |
 | `zai`, `minimax`, `moonshot`, `xiaomimimo` | `"openai.chat"`, `"anthropic.messages"` | Z.AI Chat: `do_sample`, `request_id`, `user_id`, `thinking.clear_thinking`. MiniMax Chat: `reasoning_split`; Messages: `metadata_user_id` (`metadata.user_id`). Moonshot Chat: `thinking.keep`, `prompt_cache_key`. MiMo: none (web search is a server tool). The Messages route takes no other documented field of these vendors' own | one flat type per vendor. Chat: Z.AI `request_id`; MiniMax `reasoning_details`, `base_resp`; MiMo `message.annotations`; Moonshot choice-level `usage`, `prompt_tokens_details`. Messages: `stop_reason`, `stop_sequence` | dialect docs in 6.1 and 6.2 |
-| `openai` | `"*"`, `"openai.chat"`, `"openai.responses"` | `"*"`: `store`, `metadata`, `prompt_cache_key`, `safety_identifier`. Chat: `logit_bias`, `prediction`, `logprobs`, `top_logprobs`, penalties, `modalities`, `audio`, `web_search_options`. Responses: `reasoning.{summary, mode, context}`, `include`, `conversation`, `truncation`, `context_management`, `prompt_cache_options.comparison_response_id`, `background` (refused on the WebSocket route), `max_tool_calls`, `top_logprobs`, `access_programs`. Not added: `n` (the decoder folds candidate 0), `include_obfuscation` (mode-only), `previous_response_id` (the WebSocket chain owns it), `prompt_cache_options.mode`/`.ttl` (`cache` owns them), `.prewarm` (the WebSocket warm-up), `service_tier_extra` (writes `service_tier`) | `OpenAiExtras`, flat: `service_tier` on both routes. Chat: `system_fingerprint`, `prompt_tokens_details`, `completion_tokens_details`, `annotations`. Responses: effective `reasoning` effort, summary, mode and context, `prompt_cache_retention`, `incomplete_details.reason`, `phase` per message item, `billing.payer` (unary only) | v0.43 `crates/rig-core/src/providers/openai/responses_api/mod.rs` 1378-1422, 1563-1610, 1659-1895; [OC], [RC] |
+| `openai` | `"*"`, `"openai.chat"`, `"openai.responses"` | `"*"`: `store`, `metadata`, `prompt_cache_key`, `safety_identifier`. Chat: `logit_bias`, `prediction`, `logprobs`, `top_logprobs`, penalties, `modalities`, `audio`, `web_search_options`. Responses: `input` (caller-built items, which the wire claims and places ahead of the request's own), `reasoning.{summary, mode, context}`, `include`, `conversation`, `truncation`, `context_management`, `prompt_cache_options.comparison_response_id`, `background` (refused on the WebSocket route), `max_tool_calls`, `top_logprobs`, `access_programs`. Not added: `n` (the decoder folds candidate 0), `include_obfuscation` (mode-only), `previous_response_id` (the WebSocket chain owns it), `prompt_cache_options.mode`/`.ttl` (`cache` owns them), `.prewarm` (the WebSocket warm-up), `service_tier_extra` (writes `service_tier`) | `OpenAiExtras`, flat: `service_tier` on both routes. Chat: `system_fingerprint`, `prompt_tokens_details`, `completion_tokens_details`, `annotations`. Responses: effective `reasoning` effort, summary, mode and context, `prompt_cache_retention`, `incomplete_details.reason`, `phase` per message item, `billing.payer` (unary only) | v0.43 `crates/rig-core/src/providers/openai/responses_api/mod.rs` 1378-1422, 1563-1610, 1659-1895; [OC], [RC] |
 | `azure.openai` | `"openai.chat"` | the `openai` Chat fields, `data_sources`; no Responses section (unverified, and every option is refused there) | `service_tier`, `system_fingerprint`, token details, `prompt_filter_results`, `content_filter_results` | Azure docs in 6.2 |
 | `openrouter` | `"*"` | `provider: ProviderPreferences { order, only, ignore, allow_fallbacks, require_parameters, data_collection, zdr, sort, preferred_min_throughput, preferred_max_latency, max_price, quantizations }`, `models` (fallbacks, never empty), `plugins`, `session_id`, `metadata`, `reasoning.exclude`, `reasoning.summary`, `top_k`, `min_p`, `top_a`, `repetition_penalty`, `user`. Not added: `route` (deprecated in the current docs), `trace` (unverified schema), `service_tier_extra` (writes `service_tier`) | `provider`, `native_finish_reason`, `service_tier`, `system_fingerprint`, `cost`, `cost_details`, `is_byok`, `prompt_tokens_details`, `server_tool_use_details`, `openrouter_metadata`, `annotations`, each read per route | v0.43 `crates/rig-core/src/providers/openrouter/completion.rs` 30-621; [OR], https://openrouter.ai/docs/guides/routing/provider-selection |
 | `deepseek` | `"*"` | none: `thinking` and `reasoning_effort` are portable | `prompt_cache_hit_tokens`, `prompt_cache_miss_tokens`, `reasoning_tokens`, `system_fingerprint` | v0.43 `crates/rig-core/src/providers/deepseek.rs` 20-55; [DS] |
@@ -2048,7 +2108,8 @@ search, web fetch, code execution) stay in `additional_params.tools`, which
 every wire appends to rig's tools (section 2.1), or a later typed-tools
 phase. Per-block cache
 breakpoints are out of scope: a content-level marker belongs to neither
-`GenerationOptions` nor a request-level `Options` type.
+`GenerationOptions` nor a request-level `Options` type. Where a wire places
+them, they come from `CompletionRequest::cache_points`.
 
 **Field setters on the top-level `Options` type.** Where a common field
 sits two builder levels deep, the top-level type has a setter that writes
@@ -2324,6 +2385,9 @@ until it is listed here and the golden is regenerated.
 | Fix | ChatGPT (`chatgpt` wire, Chat and Responses): the session header is `session-id`, the spelling the Codex CLI sends, where it was `session_id`; its value is unchanged (the request's cache key, else a fresh id). Every `chat\|chatgpt` and `resp\|chatgpt` golden cell moves by that header name only | none: no caller sets the header | "The ChatGPT dialect now sends `session-id` instead of `session_id`." |
 | 0.45 review (#2848) | rig-gemini-grpc: `Reasoning::Effort` maps to `thinkingConfig.thinkingLevel` as on the REST route, instead of the refusal "Google's proto has no thinking level" (`crates/rig-core/src/providers/gemini/options.rs`); and `gemini-grpc` now lists every `gcp.gemini` catalog row (`xtask/src/catalog.rs` mirror), so a Gemini 3 id resolves on gRPC with the same facts as on REST | gRPC callers who set an effort, and callers of a current Gemini model over gRPC | "On rig-gemini-grpc, `GenerationOptions::reasoning` effort is sent as Gemini's thinking level instead of being refused, and every model the Gemini REST catalog lists resolves on gRPC." |
 | Catalog refresh (#2878) | The catalog follows models.dev as of 2026-10-22. Ids models.dev retired are no longer listed and take each wire's rule for an unlisted id: OpenRouter `kwaipilot/kat-coder-pro-v2.5`, `microsoft/wizardlm-2-8x22b`, `qwen/qwen3-coder-plus`, `qwen/qwen3-max`, `qwen/qwen3-vl-32b-instruct`, `sao10k/l3.3-euryale-70b`, `unbiased/pareto` and `unbiased/pareto-26.10-preview` send an effort or budget where it was refused, and they and `apodex/apodex-1.1-mini:free`, `inclusionai/ling-3.0-flash-fin` and `inclusionai/ling-3.0-flash-sante:free` send images; Mistral `open-mistral-7b`, `open-mixtral-8x7b` and `open-mixtral-8x22b` send `reasoning_effort`. Listed rows whose models.dev facts changed: Mistral `magistral-medium-latest` and `ministral-3b-latest`/`ministral-8b-latest` (and snapshots) send images, `codestral-2508` refuses an effort; Together `Qwen/Qwen3.7-Max` sends an effort, `MiniMaxAI/MiniMax-M3` refuses one, `deepseek-ai/DeepSeek-V4.1-Flash` and `moonshotai/Kimi-K3` send `Reasoning::Off`; Z.ai, Ollama and Ollama native `glm-5.2` send `Off` where it was refused; Ollama `minimax-m2.7` sends an effort; OpenRouter `openai/gpt-5.1-codex-mini` refuses `Off`; Vertex AI `mistral-small-2503` and `qwen/qwen3-235b-a22b-instruct-2507-maas` refuse reasoning, `deepseek-ai/deepseek-v3.1-maas`/`v3.2-maas` refuse an effort and a budget, `xai/grok-4.6` refuses a budget. OpenAI `gpt-5.2-chat-latest` and `gpt-5.3-chat-latest` and Venice `qwen3-5-9b`, which models.dev no longer lists, keep their last rows in `xtask/src/catalog/review.json`. The golden blanks the user agent's platform (`<os> <arch>`) | callers of those models who set reasoning or send images | "The model catalog follows models.dev as of 2026-10-22: reasoning and image support changed for the models listed in TYPED_OPTIONS.md 12.0 (Catalog refresh), and models models.dev retired follow each provider's rule for an unlisted model." |
+| Fix | Responses on Groq, Doubleword, MiniMax and Moonshot (`ResponsesQuirks::reasoning_ciphertext` false): with `store: false`, an earlier turn's reasoning item goes back as returned, where it was left out and the item after it lost its id. These endpoints return no ciphertext and read the item's own text (Groq and Doubleword live, 2026-10-23; Moonshot and MiniMax by their docs) | callers replaying reasoning turns with `store: false` on those vendors | "On Groq, Doubleword, MiniMax and Moonshot Responses, a `store: false` conversation now sends earlier reasoning back to the model." |
+| Fix | MiniMax China: `minimax::CHINA_API_BASE_URL` and `CHINA_ANTHROPIC_API_BASE_URL` are on `api.minimax.cn`, the host MiniMax's China docs name, where they were on `api.minimaxi.com` (which answers the same). The golden's MiniMax China rows move only in their URL | MiniMax China callers | "MiniMax's China base URLs now use `api.minimax.cn`, the host its docs name." |
+| Fix | ChatGPT (`chatgpt` wire, Responses): `Reasoning::Effort` sends `"reasoning":{"effort":..,"summary":"auto"}` where it sent the effort alone, so the backend summarises the reasoning of the models that summarise (`gpt-6-astra` does; `gpt-6.1-sol` returned empty summaries live, 2026-10-26); `Reasoning::Off` and unset reasoning are unchanged, and a raw `reasoning.summary` still wins. The golden's `resp\|chatgpt` cells move at the `high` shape only, and `chatgpt/codex_sessions/reasoning_session_two_tool_calls_streaming.yaml` is re-recorded | ChatGPT callers who set an effort | "On the ChatGPT backend, an effort level now also asks for an `auto` reasoning summary, which the models that summarise stream as reasoning text; set `additional_params` `{"reasoning":{"summary":..}}` to choose another." |
 
 ### 12.1 P2: options
 

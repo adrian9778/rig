@@ -5,7 +5,8 @@
 //! chat-completions [`MINIMAX`](crate::providers::openai::wire::MINIMAX)
 //! dialect; [`anthropic_from_env`] and [`anthropic_new`] build a Messages-format
 //! client. The chat-completions client also generates images and speech, and
-//! `voice_clone` clones a voice from uploaded audio.
+//! `voice_clone` clones a voice from uploaded audio, and `.responses(model)`
+//! speaks MiniMax's Responses API on either endpoint.
 //!
 //! ```no_run
 //! use rig_core::providers::minimax;
@@ -20,11 +21,11 @@
 /// Global OpenAI-compatible base URL.
 pub const GLOBAL_API_BASE_URL: &str = "https://api.minimax.io/v1";
 /// China OpenAI-compatible base URL.
-pub const CHINA_API_BASE_URL: &str = "https://api.minimaxi.com/v1";
+pub const CHINA_API_BASE_URL: &str = "https://api.minimax.cn/v1";
 /// Global Anthropic-compatible base URL.
 pub const GLOBAL_ANTHROPIC_API_BASE_URL: &str = "https://api.minimax.io/anthropic";
 /// China Anthropic-compatible base URL.
-pub const CHINA_ANTHROPIC_API_BASE_URL: &str = "https://api.minimaxi.com/anthropic";
+pub const CHINA_ANTHROPIC_API_BASE_URL: &str = "https://api.minimax.cn/anthropic";
 
 /// `MiniMax-M3`
 pub const MINIMAX_M3: &str = "MiniMax-M3";
@@ -36,6 +37,24 @@ pub const MINIMAX_M2_7_HIGHSPEED: &str = "MiniMax-M2.7-highspeed";
 pub const MINIMAX_M2_5: &str = "MiniMax-M2.5";
 /// `MiniMax-M2.5-highspeed`
 pub const MINIMAX_M2_5_HIGHSPEED: &str = "MiniMax-M2.5-highspeed";
+
+/// The MiniMax model families whose options differ on every wire.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Family {
+    M31Flash,
+    M3,
+    Other,
+}
+
+/// `model`'s family, matched in any case; `minimax-m3.1` wins over `minimax-m3`.
+pub(crate) fn family(model: &str) -> Family {
+    let model = model.to_ascii_lowercase();
+    match model.as_str() {
+        id if id.starts_with("minimax-m3.1") => Family::M31Flash,
+        id if id.starts_with("minimax-m3") => Family::M3,
+        _ => Family::Other,
+    }
+}
 
 /// Whether MiniMax `model` reads images: M2 models are text only, and M3
 /// reads images. The name is matched in any case, as gateways lowercase it.

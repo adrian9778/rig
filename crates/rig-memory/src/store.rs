@@ -1,10 +1,11 @@
 //! Where a session is kept: [`Files`] by name, and a [`Store`] that also
-//! holds each log of the session. The blobs its messages name are files
-//! under `blobs/`, named by their content. [`AsyncStore`] is the same
-//! storage reached asynchronously, such as a database, an object store or
-//! IndexedDB; every [`Store`] is one. A log write names the length the
-//! writer read, and the store writes only if the log is still that long,
-//! checking and writing in one step ([`LogWriteError::Changed`]).
+//! holds each log of the session. The blobs its messages name are its
+//! files `blobs/<name>`, named by their content, which a directory store
+//! keeps under `files/blobs/`. [`AsyncStore`] is the same storage reached
+//! asynchronously, such as a database, an object store or IndexedDB; every
+//! [`Store`] is one. A log write names the length the writer read, and the
+//! store writes only if the log is still that long, checking and writing
+//! in one step ([`LogWriteError::Changed`]).
 
 use std::collections::BTreeMap;
 use std::future::{Future, ready};
@@ -71,7 +72,9 @@ pub trait Files: Send + Sync + 'static {
 /// Where a session is kept: its [`Files`], with the content-addressed
 /// blobs its messages name under `blobs/`, and a log per agent plus the
 /// session's own, appended to and read whole. Log names are one part of a
-/// name ([`check_name`] without `/`).
+/// name ([`check_name`] without `/`). The files under
+/// [`migration::KEPT`](crate::migration::KEPT) are the copies a migration
+/// kept of the session as it was.
 pub trait Store: Files {
     /// The names of the logs, in no particular order.
     fn logs(&self) -> io::Result<Vec<String>>;
@@ -298,7 +301,18 @@ pub fn check_name(name: &str) -> io::Result<()> {
 }
 
 /// Refuses `name` as a log name: [`check_name`], in one part.
-pub(crate) fn check_leaf(name: &str) -> io::Result<()> {
+///
+/// ```
+/// use rig_memory::check_log_name;
+///
+/// assert!(check_log_name("main").is_ok());
+/// assert!(check_log_name("agents/main").is_err());
+/// ```
+///
+/// # Errors
+///
+/// [`io::ErrorKind::InvalidInput`], naming it.
+pub fn check_log_name(name: &str) -> io::Result<()> {
     check_name(name)?;
     if name.contains('/') {
         let why = format!("{name:?} is no log name");
@@ -365,11 +379,12 @@ impl Store for MemoryStore {
     }
 
     fn read_log(&self, name: &str) -> io::Result<Vec<u8>> {
+        check_log_name(name)?;
         self.memory().logs.get(name).cloned().ok_or_else(not_found)
     }
 
     fn append_log(&self, name: &str, len: u64, bytes: &[u8]) -> Result<(), LogWriteError> {
-        check_leaf(name)?;
+        check_log_name(name)?;
         let mut memory = self.memory();
         if memory.logs.get(name).map_or(0, Vec::len) as u64 != len {
             return Err(LogWriteError::Changed);
@@ -380,7 +395,7 @@ impl Store for MemoryStore {
     }
 
     fn replace_log(&self, name: &str, len: u64, bytes: &[u8]) -> Result<(), LogWriteError> {
-        check_leaf(name)?;
+        check_log_name(name)?;
         let mut memory = self.memory();
         if memory.logs.get(name).map_or(0, Vec::len) as u64 != len {
             return Err(LogWriteError::Changed);

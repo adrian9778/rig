@@ -62,28 +62,23 @@ fn app(
     }
     let (mut app, wakes) = app_on(&MemoryStore::default());
     let valve = valve.clone();
-    let held = move |mut calls: Query<&mut Adapters, (Added<Admitted>, With<TurnCall>)>| {
-        for mut adapters in &mut calls {
+    let held = move |mut calls: Query<&mut Adapted, (Added<Admitted>, With<TurnCall>)>| {
+        for mut adapted in &mut calls {
             let valve = valve.clone();
-            adapters
-                .0
-                .push(Adapter::new("held", move |mut connection: Connection| {
-                    let valve = valve.clone();
-                    let hold = move |_| {
-                        let valve = valve.clone();
-                        move |item| {
-                            valve.wait();
-                            vec![item]
-                        }
-                    };
-                    connection.handler = Handler(connection.handler.0.map_stream("held", hold));
-                    connection
-                }));
+            let hold = move |_| {
+                let valve = valve.clone();
+                move |item| {
+                    valve.wait();
+                    vec![item]
+                }
+            };
+            let handler = adapted.0.handler.0.clone().map_stream("held", hold);
+            adapted.0.handler = Handler(handler);
         }
     };
     app.insert_resource(models)
         .add_plugins((AgentPlugin, SessionLogPlugin, ReplyPrefillPlugin))
-        .add_systems(AgentPass, held.in_set(PrepareSystems::Edit))
+        .add_systems(AgentPass, held.in_set(PrepareSystems::Adapt))
         .add_open_tool("read", "Read a file.", ToolOptions::default(), read)
         .init_resource::<Ended>()
         .add_observer(log_ended)
@@ -299,13 +294,10 @@ fn a_prefill_starts_one_stored_reply_and_is_cleared_after_it() {
         Some(&Prefill(r#"{""#.to_owned()))
     );
 
-    // Asked to instruct, B is told to begin with it, and its reply is kept
-    // as it wrote it.
+    // Asked to instruct, B is told to begin with it when the refused prompt
+    // is sent again, and its reply is kept as it wrote it.
     app.world_mut().resource_mut::<PrefillSettings>().fallback = Fallback::Instruct;
-    app.world_mut().trigger(Retry { entity: agent });
-    run_until(&mut app, &wakes, |world| {
-        world.resource::<Ended>().0.len() == 4
-    });
+    ask(&mut app, &wakes, agent, "", "Give me JSON.", 4);
     let asked = last_sent(&b, 0);
     assert!(
         format!("{asked:?}").contains(

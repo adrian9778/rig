@@ -18,6 +18,8 @@ use std::collections::{BTreeMap, VecDeque};
 use bevy_log::info;
 use rig_harness::pick::PickPlugin;
 use rig_harness::prelude::*;
+use rig_harness::rig_core::redact;
+use rig_harness::rig_tools::{Edit, Read, Search, Shell, Write};
 use serde::Deserialize;
 
 #[cfg(test)]
@@ -366,10 +368,10 @@ fn count_tool_call(
 /// What a tool's calls are counted as.
 fn kind(tool: &str) -> &'static str {
     match tool {
-        "read" => "read",
-        "edit" | "write" => "edited",
-        "shell" => "ran",
-        "search" => "searched",
+        Read::NAME => "read",
+        Edit::NAME | Write::NAME => "edited",
+        Shell::NAME => "ran",
+        Search::NAME => "searched",
         _ => "called",
     }
 }
@@ -472,7 +474,8 @@ fn report_recalled(
 ) {
     for recalled in recalled.read() {
         if let Ok(thread) = threads.get(recalled.agent) {
-            let text = format!("Not sent, send it again: {}", recalled.text);
+            let text = redact::text(&recalled.text);
+            let text = format!("Not sent, send it again: {text}");
             bridge.post(thread, text);
         }
     }

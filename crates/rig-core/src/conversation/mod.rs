@@ -51,6 +51,20 @@ pub use turn::{TURN, TurnEnd, TurnRecord};
 
 use pairing::{Normalized, PairingError};
 
+/// How a text file attached to a user's message starts, followed by its
+/// label and `">`.
+pub const FILE_OPEN: &str = "<file path=\"";
+
+/// How a text file attached to a user's message ends.
+pub const FILE_CLOSE: &str = "</file>";
+
+/// The label and the contents of an attached text file, when `text` is
+/// one, so a view can show it without the markup around it.
+pub fn attached_file(text: &str) -> Option<(&str, &str)> {
+    let rest = text.strip_prefix(FILE_OPEN)?.strip_suffix(FILE_CLOSE)?;
+    rest.split_once("\">\n")
+}
+
 /// A conversation: its entries (each a message with an id and, when it is
 /// not the user's own or the model's, an author), its asides, why its last
 /// user message is unanswered, and the changes made to it that nobody has
@@ -283,6 +297,12 @@ impl Entry {
         }
     }
 
+    /// Whether it is the [`STOPPED`] note, as
+    /// [`EntryRef::is_stop_marker`].
+    pub fn is_stop_marker(&self) -> bool {
+        is_stop_marker(&self.message, self.author.as_ref())
+    }
+
     /// This entry, written by `author`.
     #[must_use]
     pub fn by(self, author: Author) -> Self {
@@ -363,19 +383,23 @@ impl EntryRef<'_> {
     /// Whether it is the [`STOPPED`] note rig puts between a request the
     /// user stopped and what came next.
     pub fn is_stop_marker(&self) -> bool {
-        let by_rig = self
-            .author
-            .is_some_and(|author| author.kind == AuthorKind::Rig);
-        by_rig
-            && matches!(self.message, Message::User { content }
-                if matches!(content.as_slice(), [UserContent::Text(text)] if text.text == STOPPED))
+        is_stop_marker(self.message, self.author)
     }
+}
+
+/// Whether `message` by `author` is the [`STOPPED`] note.
+fn is_stop_marker(message: &Message, author: Option<&Author>) -> bool {
+    let by_rig = author.is_some_and(|author| author.kind == AuthorKind::Rig);
+    by_rig
+        && matches!(message, Message::User { content }
+            if matches!(content.as_slice(), [UserContent::Text(text)] if text.text == STOPPED))
 }
 
 /// The text of the entry that goes between a request the user stopped and
 /// the next entry, so the model does not carry the request out. rig pushes
 /// it as its own entry, by [`Author::rig`].
-pub const STOPPED: &str = "[The request above was stopped by the user before it was answered. \
+pub const STOPPED: &str = "[The user stopped the request above before it was fully answered; \
+                           any reply to it above was cut off there. \
                            Do not carry it out unless asked again.]";
 
 /// Why the user's last message is left without an answer, so a restore
@@ -386,8 +410,8 @@ pub enum Halt {
     /// The user stopped the turn answering it: the next entry pushed goes
     /// after [`STOPPED`].
     Stopped,
-    /// It is left for the next turn: a note to an idle agent, or a request
-    /// whose turn failed or a plugin stopped.
+    /// It is left for the next turn: a note to an idle agent, a request a
+    /// plugin stopped, or another author's message a failed turn left.
     #[default]
     Kept,
 }
@@ -612,7 +636,7 @@ impl Conversation {
 
     /// Whether the model owes an answer: the last message a model reads is
     /// the user's, and it was not halted. A failed or stopped reply after it
-    /// is never read ([`StopReason::is_failure`]), so the answer is still
+    /// is no answer ([`StopReason::is_failure`]), so the answer is still
     /// owed.
     pub fn awaits_model(&self) -> bool {
         let read = self.messages.iter().rev().map(Arc::as_ref).find(|message| {
@@ -1031,13 +1055,6 @@ impl Conversation {
             self.record(Change::Halt { halt: Some(halt) }, None);
         }
         halts
-    }
-
-    /// Asks the model again for an answer to the user's last message, also
-    /// a halted one; whether the last message is the user's.
-    pub fn resume(&mut self) -> bool {
-        self.clear_halt();
-        self.awaits_model()
     }
 
     fn clear_halt(&mut self) {

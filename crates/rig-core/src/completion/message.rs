@@ -73,8 +73,8 @@ impl AssistantMessage {
         }
     }
 
-    /// The turn a run failed on before the reply ended: kept in history,
-    /// never replayed.
+    /// The turn a run stopped before the reply ended: kept in history as no
+    /// answer, replayed as its text alone.
     pub fn aborted(
         origin: Option<Origin>,
         content: Vec<AssistantContent>,
@@ -139,10 +139,10 @@ pub fn turn_delivered_no_answer(choice: &[AssistantContent]) -> bool {
     !choice.iter().any(AssistantContent::is_answer)
 }
 
-/// Why a run fails on a turn, or `None` when it goes on. A turn that will
-/// not replay ([`StopReason::is_failure`], the rule `adapt` skips it by)
-/// runs none of its tool calls. A turn the provider failed
-/// ([`StopReason::Error`]) fails even when it holds an answer, so the caller
+/// Why a run fails on a turn, or `None` when it goes on. A turn that failed
+/// or was stopped ([`StopReason::is_failure`]) runs none of its tool calls.
+/// A turn the provider failed ([`StopReason::Error`]) fails even when it
+/// holds an answer, so the caller
 /// never takes as a success a turn the next request leaves out. A turn that
 /// delivered no answer ([`turn_delivered_no_answer`]) also fails when the
 /// output budget or a filter cut it (`finish` is truncating). A turn that
@@ -318,7 +318,7 @@ impl AssistantContent {
         }
     }
 
-    fn native_slot(&mut self) -> Option<&mut Option<Native>> {
+    pub(crate) fn native_slot(&mut self) -> Option<&mut Option<Native>> {
         match self {
             Self::Text(text) => Some(&mut text.native),
             Self::ToolCall(call) => Some(&mut call.native),
@@ -333,7 +333,11 @@ impl AssistantContent {
     pub fn with_native(mut self, item: serde_json::Value) -> Self {
         let fingerprint = self.fingerprint();
         if let Some(native) = self.native_slot() {
-            *native = Some(Native { item, fingerprint });
+            *native = Some(Native {
+                item,
+                fingerprint,
+                blob_slot: None,
+            });
         }
         self
     }
@@ -965,7 +969,8 @@ pub enum VideoMediaType {
     WEBM,
 }
 
-/// Describes the detail of the image content, which can be low, high, or auto (open-ai specific).
+/// The resolution a wire that takes one reads an image at. Wires without the
+/// setting ignore it.
 #[derive(Default, Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(rename_all = "lowercase")]
 pub enum ImageDetail {
@@ -1347,19 +1352,6 @@ impl_mime_type!(VideoMediaType {
     MOV => "video/mov",
     WEBM => "video/webm",
 });
-
-impl std::str::FromStr for ImageDetail {
-    type Err = ();
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.to_lowercase().as_str() {
-            "low" => Ok(ImageDetail::Low),
-            "high" => Ok(ImageDetail::High),
-            "auto" => Ok(ImageDetail::Auto),
-            _ => Err(()),
-        }
-    }
-}
 
 /// `From` impls for [`Text`] from string-like types.
 macro_rules! text_from {

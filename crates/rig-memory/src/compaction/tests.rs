@@ -32,8 +32,11 @@ fn a_later_set_overrides_an_earlier_one_in_the_summary() {
     };
     let messages = [
         call("1", "read", "a.rs"),
+        result("1", "ok"),
         call("2", "read", "b.rs"),
+        result("2", "ok"),
         call("3", "edit", "b.rs"),
+        result("3", "ok"),
     ];
     state.track(
         &messages,
@@ -366,4 +369,183 @@ fn a_clear_plan_keeps_small_outputs_and_its_notes_survive_the_next_clearing() {
     everything.clear_conversation(&mut conversation, summary_author());
     let expected = ["text", "cleared", "cleared", "cleared", "notes", "cleared"];
     assert_eq!(parts(&conversation), expected);
+}
+
+/// A summary of its own reads the conversation and fits the model,
+/// whatever share of the window its output limit takes.
+#[test]
+fn a_summary_of_its_own_on_a_small_model_reads_the_conversation() {
+    for (window, output, reason, asked) in [
+        (32_768, 4_096, CompactReason::Threshold, 4_096),
+        (32_768, 16_384, CompactReason::Threshold, 8_192),
+        (40_960, 32_768, CompactReason::Threshold, 12_288),
+        (65_536, 32_768, CompactReason::Overflow, 8_192),
+        // Just above the reserve, and after an overflow, half the limit.
+        (16_385, 16_384, CompactReason::Threshold, 4_096),
+        (40_960, 32_768, CompactReason::Overflow, 5_120),
+    ] {
+        let spec = spec(window).map(|spec| spec.with_max_output_tokens(output));
+        let request = spec.map(|spec| Summarizer::default().request(&turns(3), "", &reason, &spec));
+        assert!(
+            matches!(&request, Some(Ok(request)) if request.max_tokens == Some(asked)
+                && format!("{:?}", request.chat_history).contains("question 2")
+                && estimate_tokens(&request.chat_history) + asked <= u64::from(window)),
+            "{window}, {output}: {request:?}"
+        );
+    }
+}
+
+/// A model with neither its window nor its output limit known is asked for
+/// a summary with no output limit, as a turn is, even when it knows its
+/// input limit.
+#[test]
+fn a_summary_of_its_own_for_a_model_of_unknown_limits_sends_no_output_limit() {
+    let spec = rig_core::providers::registry::ProviderId::catalog("ollama")
+        .map(|vendor| ModelSpec::new(vendor, "test"));
+    let reason = CompactReason::Threshold;
+    for spec in [
+        spec.clone(),
+        spec.map(|spec| spec.with_max_input_tokens(8_000)),
+    ] {
+        let request = spec.map(|spec| Summarizer::default().request(&turns(3), "", &reason, &spec));
+        assert!(
+            matches!(&request, Some(Ok(request)) if request.max_tokens.is_none()),
+            "{request:?}"
+        );
+    }
+}
+
+/// A reply cut at the output limit, stopped for tool calls or for a reason
+/// the provider does not name is no summary, whatever text it has.
+#[test]
+fn a_summary_cut_at_the_output_limit_is_not_used() {
+    use rig_core::completion::{AssistantContent, CompletionResponse, FinishReason, Usage};
+    let reply = |finish| {
+        let text = vec![AssistantContent::text("## Goal\nAnswer.")];
+        let origin = rig_core::message::Origin::new("test.api", "mock", "");
+        let reply = CompletionResponse::new(text, Usage::default(), origin, serde_json::json!({}));
+        reply.with_finish_reason(finish)
+    };
+    let cut = Summarizer::summary_text(&reply(FinishReason::Length));
+    assert_eq!(cut, Err(SummaryError::Truncated));
+    let called = Summarizer::summary_text(&reply(FinishReason::ToolCalls));
+    assert_eq!(called, Err(SummaryError::CalledTool));
+    let unknown = Summarizer::summary_text(&reply(FinishReason::Other("pause".to_owned())));
+    assert!(
+        matches!(unknown, Err(SummaryError::Failed(_))),
+        "{unknown:?}"
+    );
+    let whole = Summarizer::summary_text(&reply(FinishReason::Stop));
+    assert_eq!(whole.as_deref(), Ok("## Goal\nAnswer."));
+}
+
+#[test]
+fn only_successful_paired_calls_track_files() {
+    let failure = |id: &str| {
+        let mut message = result(id, "failed");
+        if let Message::User { content } = &mut message {
+            for part in content {
+                if let UserContent::ToolResult(result) = part {
+                    result.is_error = true;
+                }
+            }
+        }
+        message
+    };
+    let mut aborted = call("aborted", "write", "aborted.rs");
+    if let Message::Assistant(reply) = &mut aborted {
+        reply.stop = Some(StopReason::Aborted("stopped".to_owned()));
+    }
+    let messages = [
+        call("same", "read", "missing.txt"),
+        failure("same"),
+        call("same", "read", "a.rs"),
+        result("same", "ok"),
+        call("same", "edit", "a.rs"),
+        failure("same"),
+        call("missing", "write", "no-result.rs"),
+        aborted,
+        result("aborted", "orphan success"),
+        Message::assistant("boundary"),
+        result("missing", "late success"),
+    ];
+    let mut state = SummaryState {
+        summary: "Done".to_owned(),
+        ..Default::default()
+    };
+    state.track(
+        &messages,
+        &[
+            TrackArgument::new("read", "path", "read-files"),
+            TrackArgument::new("edit", "path", "modified-files"),
+            TrackArgument::new("write", "path", "modified-files"),
+        ],
+    );
+    assert_eq!(
+        state.tracked.first().map(|set| &set.values),
+        Some(&["a.rs".to_owned()].into())
+    );
+    assert!(
+        state
+            .tracked
+            .get(1)
+            .is_some_and(|set| set.values.is_empty())
+    );
+}
+
+/// One pass over the log reads what each compaction replaced, and a
+/// summary an undo put back keeps what it first replaced.
+#[test]
+fn the_log_holds_what_each_summary_first_replaced() {
+    use crate::{MemoryStore, load, save};
+
+    let store = MemoryStore::default();
+    let mut conversation = load(&store, "agent").expect("loaded");
+    for text in ["one", "two", "three", "four"] {
+        conversation.push(Message::user(text));
+    }
+    let ids = |conversation: &Conversation| -> Vec<MessageId> {
+        conversation.entries().map(|entry| entry.id).collect()
+    };
+    let before = ids(&conversation);
+    let state = SummaryState {
+        summary: "summary".to_owned(),
+        tracked: Vec::new(),
+    };
+    let compact = |conversation: &mut Conversation| {
+        let upto = conversation.id(2);
+        let spliced = apply_summary(conversation, upto, &state).expect("applied");
+        save(&store, "agent", conversation).expect("saved");
+        spliced.changed.first().copied().expect("a summary")
+    };
+    let first = compact(&mut conversation);
+    let after_first = ids(&conversation);
+    let second = compact(&mut conversation);
+    let by = Author::plugin("undo");
+    undo_summary(&mut conversation, &store, "agent", by).expect("undone");
+    save(&store, "agent", &mut conversation).expect("saved");
+    let third = compact(&mut conversation);
+
+    let Summarized {
+        replaced: found,
+        records,
+    } = summarized_in_log(&store, "agent").expect("read");
+    let replaced = |summary| -> Option<Vec<MessageId>> {
+        let entries = found.get(&summary)?;
+        entries.iter().map(|entry| entry.id).collect()
+    };
+    assert_eq!(found.len(), 3);
+    assert_eq!(replaced(first).as_deref(), before.get(..2));
+    assert_eq!(replaced(second).as_deref(), after_first.get(..2));
+    assert_eq!(replaced(third).as_deref(), after_first.get(..2));
+    let texts = found.get(&first).into_iter().flatten();
+    let texts: Vec<_> = texts.map(|entry| entry.message.clone()).collect();
+    assert_eq!(
+        texts,
+        [Message::user("one"), Message::user("two")].map(Arc::new)
+    );
+    assert_eq!(
+        records.get(&first).map(|record| &record.state),
+        Some(&state)
+    );
 }

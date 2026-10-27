@@ -10,11 +10,19 @@ The view tells the terminal when a turn of an agent nothing spawned runs, as a
 shell does a command: OSC 133 marks (`C` as it starts, `D;0` or `D;1` as it
 ends, then `A` and `B`), a state report (`133;S;activity=busy` or `reading`)
 for a multiplexer such as fux, and the title (`rig · working`, `rig · idle`).
+When the shell's marks carry a nonce, `mark_nonce_env` under `[tui]` in
+`settings.toml` names the variable holding it (for fux, `FUX_MARK_NONCE`).
 
 Plugins add panels, transcript looks, status line items, key bindings and
 completion without touching the view. The plugin guide shows each
 ([PLUGINS.md](https://github.com/0xPlaygrounds/rig/blob/main/crates/rig-harness/PLUGINS.md#the-transcript-notes-looks-and-scrolling)),
-and the crate docs list every type.
+and the crate docs list every type. Transcript looks are systems in
+`TranscriptRender`, ordered in `RenderSystems::Render`, `Decorate`, and `Edit`.
+They select owned inputs from `RenderBatch` and write lines and named
+contributions to `RenderOutput`. The batch includes the pane, source agent and
+width; exports run the same systems with no pane. A cached item enters the
+batch again when its inputs change; increment `RenderRevision.0` when anything
+else a look reads changes, or when looks are added or removed at runtime.
 
 A crate that also builds without the view puts its rig-tui code behind a
 default `tui` feature. `rig_tui::ratatui` and `rig_tui::crossterm` are

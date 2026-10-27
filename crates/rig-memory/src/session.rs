@@ -13,9 +13,9 @@ use crate::blobs::{
     BLOBS, load_images, load_images_with, messages_mut, named_blobs, put_blob, read_blob,
 };
 use crate::format::{Body, Header, LogLines, Meta, SESSION, parse, stamp_of};
-use crate::store::{check_leaf, now};
+use crate::store::now;
 use crate::writer::Book;
-use crate::{FORMAT, LogRewrite, Repair, SessionError, Stamp, Store};
+use crate::{FORMAT, LogRewrite, Repair, SessionError, Stamp, Store, check_log_name};
 
 /// A session as its logs left it.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -238,6 +238,17 @@ pub(crate) fn fold_lines(
     how: Fold,
     blob: &dyn Fn(&str) -> io::Result<Vec<u8>>,
 ) -> Result<Option<Folded>, SessionError> {
+    fold_lines_with(name, lines, (how, blob), &mut |_, _| {})
+}
+
+/// [`fold_lines`], giving `each` every change with the conversation the
+/// changes before it left.
+fn fold_lines_with(
+    name: &str,
+    lines: &LogLines,
+    (how, blob): (Fold, &dyn Fn(&str) -> io::Result<Vec<u8>>),
+    each: &mut dyn FnMut(&Conversation, &ChangeRecord),
+) -> Result<Option<Folded>, SessionError> {
     let mut conversation = Conversation::new();
     let mut state = BTreeMap::new();
     let mut retired = false;
@@ -257,6 +268,7 @@ pub(crate) fn fold_lines(
                         Ok(())
                     });
                 }
+                each(&conversation, &recorded);
                 conversation
                     .apply(&recorded)
                     .map_err(|error| error.to_string())?;
@@ -287,7 +299,7 @@ pub(crate) fn fold_lines(
 
 /// A saved value set or removed, or the log retired, noted into `state`
 /// and `retired`.
-fn note_meta(meta: Meta, state: &mut BTreeMap<String, Value>, retired: &mut bool) {
+pub(crate) fn note_meta(meta: Meta, state: &mut BTreeMap<String, Value>, retired: &mut bool) {
     match meta {
         Meta::State { key, value } => {
             match value.filter(|value| !value.is_null()) {
@@ -599,7 +611,7 @@ fn check_continues(
 /// As [`Session::read`], for that log; when `log` is no log name; or when
 /// a blob it names cannot be read for a reason other than that it is gone.
 pub fn load(store: &dyn Store, log: &str) -> Result<Conversation, SessionError> {
-    check_leaf(log)?;
+    check_log_name(log)?;
     conversation_of(fold(store, log, Fold::WHOLE)?)
 }
 
@@ -664,7 +676,7 @@ pub async fn load_async<S: crate::AsyncStore + ?Sized>(
     store: &S,
     log: &str,
 ) -> Result<Conversation, SessionError> {
-    check_leaf(log)?;
+    check_log_name(log)?;
     let bytes = match store.read_log_async(log).await {
         Err(failure) if failure.kind() == io::ErrorKind::NotFound => {
             return Ok(Conversation::new());
@@ -783,6 +795,25 @@ pub fn history(store: &dyn Store, log: &str) -> Result<Vec<(Stamp, LogRecord)>, 
         Ok(ControlFlow::Continue(()))
     })?;
     Ok(records)
+}
+
+/// Reads the log `log` of `store` once, as [`load`] does, giving `each`
+/// every change with the conversation the changes before it left. Nothing
+/// when there is no log.
+///
+/// # Errors
+///
+/// As [`load`].
+pub(crate) fn replay(
+    store: &dyn Store,
+    log: &str,
+    mut each: impl FnMut(&Conversation, &ChangeRecord),
+) -> Result<(), SessionError> {
+    if let Some(lines) = log_lines(store, log)? {
+        let blob = |blob: &str| read_blob(store, blob);
+        fold_lines_with(log, &lines, (Fold::WHOLE, &blob), &mut each)?;
+    }
+    Ok(())
 }
 
 /// The conversation of the log `log` of `store` as the records made before

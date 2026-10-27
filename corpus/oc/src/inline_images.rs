@@ -4,17 +4,17 @@
 //! of the terminal's width and [`ImagesSettings::max_rows`] rows, keeping
 //! its aspect ratio:
 //!
-//! - with a terminal that shows images ([`TerminalGraphics`]: the kitty
-//!   graphics protocol, iTerm2's inline images or sixel, inside tmux only
-//!   with its passthrough on), the transcript keeps blank rows, and after
+//! - with a terminal that shows images ([`ImagesSettings::protocol`]: the
+//!   kitty graphics protocol, iTerm2's inline images or sixel, inside tmux
+//!   only with its passthrough on), the transcript keeps blank rows, and after
 //!   each frame the image is placed over the rows of them on screen, and
 //!   taken off once they scroll away, the screen is resized or a box opens
 //!   over it;
 //! - otherwise half-block characters coloured as the image
 //!   ([`Mode::Blocks`]), or with [`Mode::Off`] one line saying what it is.
 //!
-//! A message's images are drawn by a content renderer and a call's by a
-//! call decorator. `o` on a selected image or call opens the image in the
+//! A render system draws a message's images in place of the block and a
+//! call's under it, as a decoration. `o` on a selected image or call opens the image in the
 //! system viewer and `y` copies the path it was saved to. The images are
 //! drawn from the conversation, so a resumed session draws them again.
 
@@ -24,7 +24,7 @@ use std::hash::{DefaultHasher, Hash, Hasher};
 use std::io::Cursor;
 use std::ops::Range;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::Arc;
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
@@ -41,9 +41,9 @@ use rig_tui::ratatui::layout::Rect;
 use rig_tui::ratatui::style::{Color, Style, Stylize};
 use rig_tui::ratatui::text::{Line, Span};
 use rig_tui::{
-    AppKeyBindingsExt, AppToolRenderersExt, CallDecorator, ContentBlock, ContentKind,
-    CopyToClipboard, DrawnTranscript, KeyBinding, KeyPress, KeyPressed, KeyScope, MainPane,
-    RedrawArea, TerminalSize, TerminalWrite, ToolCallView, TranscriptItem, TranscriptView,
+    AppKeyBindingsExt, ContentBlock, ContentKind, CopyToClipboard, DrawnTranscript, KeyBinding,
+    KeyPress, KeyPressed, KeyScope, MainPane, RedrawArea, RenderBatch, RenderRevision,
+    RenderSystems, TerminalSize, TerminalWrite, TranscriptItem, TranscriptRender, TranscriptView,
     TuiFrame, TuiSystems,
 };
 use serde::Deserialize;
@@ -51,7 +51,7 @@ use serde::Deserialize;
 /// Columns an image is indented by in the transcript.
 const INDENT: u16 = 4;
 
-/// The name of this plugin's call decorator.
+/// The name of this plugin's decoration under calls.
 const DECORATOR: &str = "images";
 
 /// What an image looks like in the transcript.
@@ -77,6 +77,8 @@ pub struct ImagesSettings {
     pub max_width_percent: u16,
     /// The tallest an image is drawn, in rows.
     pub max_rows: u16,
+    /// How the terminal draws images itself; unset, it does not.
+    pub protocol: Option<Protocol>,
 }
 
 impl Default for ImagesSettings {
@@ -85,18 +87,21 @@ impl Default for ImagesSettings {
             mode: Mode::Auto,
             max_width_percent: 60,
             max_rows: 20,
+            protocol: None,
         }
     }
 }
 
-/// How a terminal draws an image itself.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// How a terminal draws an image itself, read from settings as `kitty`,
+/// `iterm2` or `sixel`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Protocol {
-    /// The kitty graphics protocol (kitty, WezTerm, Ghostty).
+    /// The kitty graphics protocol.
     Kitty,
     /// iTerm2's inline images (OSC 1337).
     Iterm2,
-    /// DEC sixel graphics (foot, mlterm, contour).
+    /// DEC sixel graphics.
     Sixel,
 }
 
@@ -132,28 +137,13 @@ impl Default for TerminalGraphics {
 }
 
 impl TerminalGraphics {
-    /// What this process's terminal says of itself through its environment,
-    /// asking tmux, when inside it, whether it passes images through.
-    /// Terminals are not queried: the view reads every reply as input.
-    pub fn detect(launcher: &Launcher) -> Self {
-        let var = |name: &str| std::env::var(name).unwrap_or_default();
-        let (term, program) = (var("TERM"), var("TERM_PROGRAM"));
-        let kitty = !var("KITTY_WINDOW_ID").is_empty()
-            || term.contains("kitty")
-            || matches!(program.as_str(), "WezTerm" | "ghostty");
-        let iterm = program == "iTerm.app" || var("LC_TERMINAL") == "iTerm2";
-        let sixel = ["foot", "mlterm", "contour"]
-            .iter()
-            .any(|name| term.starts_with(name));
-        let in_tmux = !var("TMUX").is_empty();
-        let passes = in_tmux && tmux_passes_through(launcher);
-        let protocol = match (kitty, iterm, sixel) {
-            _ if in_tmux && !passes => None,
-            (true, _, _) => Some(Protocol::Kitty),
-            (false, true, _) => Some(Protocol::Iterm2),
-            (false, false, true) => Some(Protocol::Sixel),
-            (false, false, false) => None,
-        };
+    /// The terminal drawing with the `protocol` the user set, asking tmux,
+    /// when inside it, whether it passes images through. Terminals are not
+    /// queried: the view reads every reply as input.
+    pub fn detect(launcher: &Launcher, protocol: Option<Protocol>) -> Self {
+        let in_tmux = std::env::var_os("TMUX").is_some_and(|tmux| !tmux.is_empty());
+        let passes = in_tmux && protocol.is_some() && tmux_passes_through(launcher);
+        let protocol = protocol.filter(|_| !in_tmux || passes);
         let size = rig_tui::crossterm::terminal::window_size().ok();
         let cell = size
             .filter(|size| size.width > 0 && size.columns > 0 && size.rows > 0)
@@ -190,40 +180,41 @@ enum Look {
     Line,
 }
 
-/// What an image's look depends on: the settings, the terminal, its
-/// width and the transcript's.
+/// What an image's look depends on besides the width it is drawn in: the
+/// settings, the terminal and its width.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct Params {
     look: Look,
     cell: (u16, u16),
-    /// The most cells an image takes, columns and rows.
-    bounds: (u16, u16),
+    /// The most columns an image takes in the terminal's width.
+    cols: u16,
+    /// The most rows it takes.
+    rows: u16,
 }
 
 impl Params {
-    /// With `widths` the terminal's and the transcript's, which side
-    /// panels may narrow (0 before the first frame).
-    fn of(settings: &ImagesSettings, graphics: &TerminalGraphics, widths: (u16, u16)) -> Self {
+    /// With `width` the terminal's.
+    fn of(settings: &ImagesSettings, graphics: &TerminalGraphics, width: u16) -> Self {
         let look = match (settings.mode, graphics.protocol) {
             (Mode::Off, _) => Look::Line,
             (Mode::Blocks, _) | (Mode::Auto, None) => Look::Blocks,
             (Mode::Auto, Some(protocol)) => Look::Escape(protocol),
         };
         let percent = u32::from(settings.max_width_percent.min(100));
-        let cols = u32::from(widths.0.saturating_sub(INDENT)) * percent / 100;
-        let cols = match widths.1 {
-            0 => cols,
-            transcript => cols.min(u32::from(transcript.saturating_sub(INDENT))),
-        };
-        let bounds = (
-            u16::try_from(cols).unwrap_or(u16::MAX).max(1),
-            settings.max_rows.max(1),
-        );
+        let cols = u32::from(width.saturating_sub(INDENT)) * percent / 100;
         Self {
             look,
             cell: graphics.cell,
-            bounds,
+            cols: u16::try_from(cols).unwrap_or(u16::MAX),
+            rows: settings.max_rows.max(1),
         }
+    }
+
+    /// The most cells an image takes, columns and rows, drawn in `width`
+    /// columns, such as a pane's or an export's.
+    fn bounds(&self, width: u16) -> (u16, u16) {
+        let cols = self.cols.min(width.saturating_sub(INDENT));
+        (cols.max(1), self.rows)
     }
 }
 
@@ -271,23 +262,12 @@ struct Fitted {
     rows: u16,
 }
 
-/// What the renderers, which run inside the view's layout with no world,
-/// share with the plugin's systems: the look to draw and the decoded
-/// images.
-#[derive(Default)]
-struct Shared {
+/// The look to draw images in and the images decoded, which the render
+/// systems share with the plugin's other systems.
+#[derive(Resource, Default)]
+struct Images {
     params: Params,
     decoded: HashMap<u64, Arc<Decoded>>,
-}
-
-/// The state the renderers share with the plugin's systems.
-#[derive(Resource, Clone, Default)]
-struct Images(Arc<Mutex<Shared>>);
-
-impl Images {
-    fn lock(&self) -> MutexGuard<'_, Shared> {
-        self.0.lock().unwrap_or_else(PoisonError::into_inner)
-    }
 }
 
 /// The key of an image's bytes.
@@ -310,10 +290,10 @@ fn fit((width, height): (u32, u32), cell: (u16, u16), max: (u16, u16)) -> (u16, 
     (cells(cols, max_cols), cells(rows, max_rows))
 }
 
-impl Shared {
-    /// The image decoded and sized, if the conversation holds its bytes
-    /// and they decode.
-    fn fit(&mut self, image: &Image) -> Option<Fitted> {
+impl Images {
+    /// The image decoded, with the key of its bytes, if the conversation
+    /// holds them and they decode.
+    fn decode(&mut self, image: &Image) -> Option<(u64, Arc<Decoded>)> {
         let bytes = match &image.data {
             DocumentSourceKind::Base64(data) => STANDARD.decode(data).ok()?,
             DocumentSourceKind::Raw(bytes) => bytes.clone(),
@@ -335,11 +315,14 @@ impl Shared {
                 decoded
             }
         };
-        let (cols, rows) = fit(
-            decoded.pixels.dimensions(),
-            self.params.cell,
-            self.params.bounds,
-        );
+        Some((key, decoded))
+    }
+
+    /// The image decoded and sized to be drawn in `width` columns.
+    fn fit(&mut self, image: &Image, width: u16) -> Option<Fitted> {
+        let (key, decoded) = self.decode(image)?;
+        let bounds = self.params.bounds(width);
+        let (cols, rows) = fit(decoded.pixels.dimensions(), self.params.cell, bounds);
         Some(Fitted {
             key,
             decoded,
@@ -348,10 +331,10 @@ impl Shared {
         })
     }
 
-    /// The lines of an image, and the image when the terminal draws it
-    /// over the blank rows after the first line.
-    fn lines(&mut self, image: &Image) -> (Vec<Line<'static>>, Option<Fitted>) {
-        let Some(fitted) = self.fit(image) else {
+    /// The lines of an image drawn in `width` columns, and the image when
+    /// the terminal draws it over the blank rows after the first line.
+    fn lines(&mut self, image: &Image, width: u16) -> (Vec<Line<'static>>, Option<Fitted>) {
+        let Some(fitted) = self.fit(image, width) else {
             return (
                 vec![Line::from("  [image with no data to show]").dim()],
                 None,
@@ -380,15 +363,16 @@ impl Shared {
         }
     }
 
-    /// The lines of `images` one after another, and where among them each
-    /// one the terminal draws starts.
+    /// The lines of `images` one after another in `width` columns, and
+    /// where among them each one the terminal draws starts.
     fn all_lines<'a>(
         &mut self,
         images: impl IntoIterator<Item = &'a Image>,
+        width: u16,
     ) -> (Vec<Line<'static>>, Vec<(usize, Fitted)>) {
         let (mut lines, mut drawn) = (Vec::new(), Vec::new());
         for image in images {
-            let (more, fitted) = self.lines(image);
+            let (more, fitted) = self.lines(image, width);
             if let Some(fitted) = fitted {
                 drawn.push((lines.len() + 1, fitted));
             }
@@ -476,12 +460,12 @@ fn line_starts(drawn: &DrawnTranscript, rows: &Range<usize>) -> Vec<usize> {
 /// The images an item of the transcript draws, each with its first row:
 /// a message's image block, or this plugin's decoration of a call.
 fn drawn_in(
-    shared: &mut Shared,
+    images: &mut Images,
     (conversation, drawn): (&Conversation, &DrawnTranscript),
     item: &TranscriptItem,
     rows: &Range<usize>,
 ) -> Vec<(usize, Fitted)> {
-    let images = match item {
+    let found = match item {
         TranscriptItem::Content(id, index) => {
             image_in(conversation, *id, *index).into_iter().collect()
         }
@@ -490,7 +474,7 @@ fn drawn_in(
         }
         _ => return Vec::new(),
     };
-    let (_, fitted) = shared.all_lines(images);
+    let (_, fitted) = images.all_lines(found, drawn.area().width);
     let starts = line_starts(drawn, rows);
     let at_row = |(line, fitted): (usize, Fitted)| Some((*starts.get(line)?, fitted));
     fitted.into_iter().filter_map(at_row).collect()
@@ -508,32 +492,48 @@ fn keep_drawn(
 }
 
 /// Keeps the look of images in step with the settings, the terminal and
-/// its width, and draws the transcript again when it changes.
+/// its width, and draws the transcript again when it changes. A pane's own
+/// width lays it out again by itself.
 fn follow_look(
-    images: Res<Images>,
+    mut images: ResMut<Images>,
     (settings, graphics): (Res<ImagesSettings>, Res<TerminalGraphics>),
-    (screen, view): (
-        Res<TerminalSize>,
-        Option<Single<&TranscriptView, With<MainPane>>>,
-    ),
-    mut decorators: Query<&mut CallDecorator>,
+    screen: Res<TerminalSize>,
+    mut revision: ResMut<RenderRevision>,
 ) {
     let width = match screen.0.width {
         0 => 80,
         width => width,
     };
-    let transcript = view.and_then(|view| view.width()).unwrap_or(0);
-    let params = Params::of(&settings, &graphics, (width, transcript));
-    let mut shared = images.lock();
-    if shared.params == params {
+    let params = Params::of(&settings, &graphics, width);
+    if images.params == params {
         return;
     }
-    shared.params = params;
+    images.params = params;
     // A changed look draws the whole transcript again, images and all.
-    for mut decorator in &mut decorators {
-        if decorator.name == DECORATOR {
-            decorator.set_changed();
+    revision.0 = revision.0.wrapping_add(1);
+}
+
+/// Draws the image blocks of messages, sized to the batch's width.
+fn draw_images(mut images: ResMut<Images>, mut batch: ResMut<RenderBatch>) {
+    let width = batch.width;
+    for (content, output) in batch.contents_mut(ContentKind::Image) {
+        if let ContentBlock::Image(image) = content.view().block {
+            output.lines = images.lines(image, width).0;
         }
+    }
+}
+
+/// Draws the images a tool call's result holds under the call, sized to
+/// the batch's width.
+fn decorate_calls(mut images: ResMut<Images>, mut batch: ResMut<RenderBatch>) {
+    let width = batch.width;
+    for (call, output) in batch.calls_mut() {
+        let content = call
+            .result
+            .as_ref()
+            .map_or(&[][..], |result| result.content.as_slice());
+        let lines = images.all_lines(result_images(content), width).0;
+        output.decorate(DECORATOR, lines);
     }
 }
 
@@ -575,7 +575,7 @@ struct Placed {
 /// Where each image the terminal draws is on screen, at least in part
 /// and with no overlay over it.
 fn wanted(
-    shared: &mut Shared,
+    images: &mut Images,
     conversation: &Conversation,
     drawn: &DrawnTranscript,
     frame: &TuiFrame,
@@ -586,7 +586,7 @@ fn wanted(
         if rows.end <= on_screen.start || rows.start >= on_screen.end {
             continue;
         }
-        for (index, (start, fitted)) in drawn_in(shared, (conversation, drawn), item, rows)
+        for (index, (start, fitted)) in drawn_in(images, (conversation, drawn), item, rows)
             .into_iter()
             .enumerate()
         {
@@ -815,7 +815,7 @@ fn at_spot(spot: &Spot, sequence: &str) -> String {
 /// those that left it, through the view's writer; the cells an image drawn
 /// in them leaves are written again by the view.
 fn place_images(
-    images: Res<Images>,
+    mut images: ResMut<Images>,
     graphics: Res<TerminalGraphics>,
     (drawn, frame): (Single<Ref<DrawnTranscript>, With<MainPane>>, Res<TuiFrame>),
     conversations: Query<&Conversation>,
@@ -834,14 +834,13 @@ fn place_images(
     let Some(protocol) = graphics.protocol else {
         return;
     };
-    let mut shared = images.lock();
     // With another look now, such as after a settings change, every
     // placed image comes off.
     let conversation = drawn
         .agent()
         .and_then(|agent| conversations.get(agent).ok());
-    let wanted = match (shared.params.look, conversation) {
-        (Look::Escape(_), Some(conversation)) => wanted(&mut shared, conversation, &drawn, &frame),
+    let wanted = match (images.params.look, conversation) {
+        (Look::Escape(_), Some(conversation)) => wanted(&mut images, conversation, &drawn, &frame),
         _ => HashMap::new(),
     };
     let (out, repaint) = writes(&mut placed, wanted, protocol, &graphics);
@@ -892,15 +891,16 @@ fn selected_image(world: &mut World) -> Result<PathBuf, String> {
         }
         _ => None,
     };
-    let images = world.resource::<Images>().clone();
-    let fitted = image.and_then(|image| images.lock().fit(&image));
-    let fitted = fitted.ok_or_else(|| "The selected item has no image.".to_owned())?;
+    let mut images = world.get_resource_mut::<Images>();
+    let decoded = image.zip(images.as_deref_mut());
+    let decoded = decoded.and_then(|(image, images)| images.decode(&image));
+    let (key, decoded) = decoded.ok_or_else(|| "The selected item has no image.".to_owned())?;
     let directory = world.get_resource::<Scratch>().and_then(Scratch::images);
     let directory = directory.ok_or_else(|| "This session keeps no files.".to_owned())?;
     std::fs::create_dir_all(&directory).map_err(|failure| failure.to_string())?;
-    let path = directory.join(format!("{:016x}.{}", fitted.key, fitted.decoded.format));
+    let path = directory.join(format!("{key:016x}.{}", decoded.format));
     if !path.exists() {
-        std::fs::write(&path, &fitted.decoded.bytes).map_err(|failure| failure.to_string())?;
+        std::fs::write(&path, &decoded.bytes).map_err(|failure| failure.to_string())?;
     }
     Ok(path)
 }
@@ -952,28 +952,25 @@ impl Plugin for InlineImagesPlugin {
                 .world()
                 .get_resource::<Processes>()
                 .map(Processes::launcher);
-            let graphics = TerminalGraphics::detect(&launcher.unwrap_or_default());
+            let settings = app.world().get_resource::<ImagesSettings>();
+            let protocol = settings.and_then(|settings| settings.protocol);
+            let graphics = TerminalGraphics::detect(&launcher.unwrap_or_default(), protocol);
             app.insert_resource(graphics);
         }
-        let images = Images::default();
-        let (content, call) = (images.clone(), images.clone());
-        app.insert_resource(images)
+        app.init_resource::<Images>()
             .init_resource::<Placed>()
             .init_resource::<TuiFrame>()
             .init_resource::<TerminalSize>()
             .add_message::<TerminalWrite>()
             .add_message::<RedrawArea>()
             .add_message::<CopyToClipboard>()
-            .add_content_renderer(ContentKind::Image, move |view| match view.block {
-                ContentBlock::Image(image) => content.lock().lines(image).0,
-                _ => view.default_lines(),
-            })
-            .add_call_decorator(DECORATOR, move |view: &ToolCallView<'_>| {
-                let content = view
-                    .result
-                    .map_or(&[][..], |result| result.content.as_slice());
-                call.lock().all_lines(result_images(content)).0
-            })
+            .add_systems(
+                TranscriptRender,
+                (
+                    draw_images.in_set(RenderSystems::Render),
+                    decorate_calls.in_set(RenderSystems::Decorate),
+                ),
+            )
             .add_systems(
                 PostUpdate,
                 (

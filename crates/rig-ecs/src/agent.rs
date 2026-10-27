@@ -182,11 +182,19 @@ impl LastUsage {
     }
 
     /// The tokens the last reply read and wrote, which the next request
-    /// sends again, when it reported them.
+    /// sends again, when it reported them. Check [`ContextStale`] before
+    /// displaying this figure as the current context.
     pub fn context(&self) -> Option<u64> {
         self.usage()?.context_tokens()
     }
 }
+
+/// The agent's [`LastUsage`] no longer counts its conversation after a
+/// compaction summarized, cleared or restored part of it. The kernel removes
+/// this marker when a reply reports a new context figure. Saved with the session.
+#[derive(Component, Reflect, Clone, Copy, Debug, Default, Serialize, Deserialize)]
+#[reflect(opaque, Component, Saved, Default, Clone, Serialize, Deserialize)]
+pub struct ContextStale {}
 
 /// The agent's own part of its system prompt: who it is and how it works.
 /// Each request's prompt adds the app's
@@ -253,6 +261,7 @@ pub struct TurnOf(pub Entity);
 /// ([`TurnRecord`](conversation::TurnRecord)), and keeps it.
 #[derive(Component, Reflect, Clone, Debug, Default)]
 #[component(on_add = start_turn)]
+#[require(super::tools::MissingTools)]
 #[reflect(Component, Default)]
 pub struct Turn {
     /// How many turns its agent started before this one, over the whole
@@ -313,16 +322,6 @@ pub struct Partial {
     pub text: String,
     /// Reasoning text.
     pub reasoning: String,
-}
-
-/// Send the agent's conversation to its model again as it stands: after a
-/// turn that failed on a transient error and kept the user's message, or
-/// one that stopped before the model answered the last tool results.
-#[derive(EntityEvent, Reflect, Clone, Debug)]
-#[reflect(Event, Clone, Debug)]
-pub struct Retry {
-    /// The agent.
-    pub entity: Entity,
 }
 
 /// Stop the agent's running turn at once, and the running turns of every

@@ -150,9 +150,56 @@ pub struct SseEvent {
     pub data: String,
     /// The stream's last event id, empty when none was ever set.
     pub id: String,
-    /// Most recent parsed `retry:` value since the previous emitted event.
-    /// This value does not trigger automatic reconnection.
+    /// Most recent parsed `retry:` value since the previous emitted event,
+    /// saturating at `u64::MAX`. This value does not trigger automatic
+    /// reconnection.
     pub retry: Option<u64>,
+}
+
+/// A field recognized by the SSE grammar.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SseField {
+    /// A payload line.
+    Data,
+    /// An event type.
+    Event,
+    /// An accepted event id.
+    Id,
+    /// A blank dispatch line.
+    Blank,
+    /// A comment, retry, ignored id or unknown field.
+    Other,
+}
+
+/// Original byte ranges of one line consumed by [`SseFramer`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SseLine {
+    /// Whole line, including its line ending, at saturating stream offsets.
+    pub span: std::ops::Range<usize>,
+    /// Line content without its ending or an initial BOM.
+    pub content: std::ops::Range<usize>,
+    /// Field value after a colon and optional space, when present.
+    pub value: Option<std::ops::Range<usize>>,
+    /// The field accepted by the grammar.
+    pub field: SseField,
+}
+
+/// A parsed event and the byte offset where it became dispatchable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecordedSseEvent {
+    /// The grammar's parsed event.
+    pub event: SseEvent,
+    /// Saturating stream offset of its completing line ending or retained EOF.
+    pub end: usize,
+}
+
+/// Parsed events and source lines consumed by a recording operation.
+#[derive(Debug, Default)]
+pub struct SseBatch {
+    /// Events emitted in order, with their completion offsets.
+    pub events: Vec<RecordedSseEvent>,
+    /// Source lines in order, including non-dispatching lines.
+    pub lines: Vec<SseLine>,
 }
 
 /// The optional leading byte-order mark, which the grammar ignores.
@@ -165,6 +212,9 @@ pub struct SseFramer {
     buffer: Vec<u8>,
     /// How many bytes at the start of `buffer` hold no line end.
     scanned: usize,
+    /// The last line ended at a CR that was the last byte pushed, so an LF
+    /// opening the next chunk completes that CRLF.
+    after_cr: bool,
     /// Events completed by the current `push`.
     ready: Vec<SseEvent>,
     event_type: String,
@@ -176,6 +226,8 @@ pub struct SseFramer {
     bom_done: bool,
     /// Bytes of complete lines consumed since the last blank line.
     since_dispatch: usize,
+    /// Absolute byte position after the last consumed line or BOM.
+    offset: usize,
 }
 
 impl SseFramer {
@@ -186,24 +238,96 @@ impl SseFramer {
 
     /// Feed one transport chunk; yields every event it completed.
     pub fn push(&mut self, chunk: &[u8]) -> std::vec::Drain<'_, SseEvent> {
-        let chunk = self.strip_bom(chunk);
+        self.push_inner(chunk, None);
+        self.ready.drain(..)
+    }
+
+    /// Feed a chunk and retain parsed events with source ranges for recording.
+    pub fn push_recording(&mut self, chunk: &[u8]) -> SseBatch {
+        let mut batch = SseBatch::default();
+        self.push_inner(chunk, Some(&mut batch));
+        batch
+    }
+
+    /// Retain an incomplete final event for a recording, without changing
+    /// the normal SSE rule that EOF does not dispatch it.
+    pub fn finish_recording(&mut self) -> SseBatch {
+        let mut batch = SseBatch::default();
+        if self.bom_prefix > 0 {
+            self.buffer
+                .extend_from_slice(BOM.get(..self.bom_prefix).unwrap_or_default());
+            self.bom_prefix = 0;
+            self.bom_done = true;
+        }
+        if !self.buffer.is_empty() {
+            let buffer = std::mem::take(&mut self.buffer);
+            let start = self.offset;
+            self.offset = self.offset.saturating_add(buffer.len());
+            let (field, value) = self.line(&String::from_utf8_lossy(&buffer));
+            batch.lines.push(SseLine {
+                span: start..self.offset,
+                content: start..self.offset,
+                value: value.map(|at| start.saturating_add(at)..self.offset),
+                field,
+            });
+        }
+        self.dispatch();
+        if let Some(event) = self.ready.pop() {
+            batch.events.push(RecordedSseEvent {
+                event,
+                end: self.offset,
+            });
+        }
+        batch
+    }
+
+    fn push_inner(&mut self, chunk: &[u8], mut recording: Option<&mut SseBatch>) {
+        let mut chunk = self.strip_bom(chunk);
+        if self.after_cr
+            && let Some((&first, rest)) = chunk.split_first()
+        {
+            self.after_cr = false;
+            if first == b'\n' {
+                chunk = rest;
+                self.offset = self.offset.saturating_add(1);
+                // Pending bytes are counted as if the CRLF had arrived whole.
+                if self.since_dispatch > 0 {
+                    self.since_dispatch = self.since_dispatch.saturating_add(1);
+                }
+            }
+        }
         self.buffer.extend_from_slice(chunk);
         // Taken out, so its lines are read in place while `line` changes the rest.
         let buffer = std::mem::take(&mut self.buffer);
         let mut rest = buffer.as_slice();
         while let Some((line, next)) = terminated_line(rest, self.scanned) {
             self.scanned = 0;
+            let start = self.offset;
+            self.offset = self.offset.saturating_add(rest.len() - next.len());
             self.since_dispatch = self.since_dispatch.saturating_add(rest.len() - next.len());
-            self.line(&String::from_utf8_lossy(line));
+            self.after_cr = next.is_empty() && rest.last() == Some(&b'\r');
+            let (field, value) = self.line(&String::from_utf8_lossy(line));
+            if let Some(batch) = recording.as_deref_mut() {
+                batch.lines.push(SseLine {
+                    span: start..self.offset,
+                    content: start..start.saturating_add(line.len()),
+                    value: value
+                        .map(|at| start.saturating_add(at)..start.saturating_add(line.len())),
+                    field,
+                });
+                if let Some(event) = self.ready.pop() {
+                    batch.events.push(RecordedSseEvent {
+                        event,
+                        end: self.offset,
+                    });
+                }
+            }
             rest = next;
         }
-        // What is left holds no line end, unless its last byte is a `\r`
-        // waiting to see whether a `\n` follows.
-        self.scanned = rest.len().saturating_sub(1);
+        self.scanned = rest.len();
         let consumed = buffer.len() - rest.len();
         self.buffer = buffer;
         self.buffer.drain(..consumed);
-        self.ready.drain(..)
     }
 
     /// Saturating count of buffered bytes and complete lines since the last
@@ -231,6 +355,7 @@ impl SseFramer {
             self.bom_prefix += 1;
             rest = rest.get(1..).unwrap_or_default();
             if self.bom_prefix == BOM.len() {
+                self.offset = self.offset.saturating_add(BOM.len());
                 self.bom_prefix = 0;
                 self.bom_done = true;
                 return rest;
@@ -240,39 +365,51 @@ impl SseFramer {
     }
 
     /// Process one complete line of the grammar.
-    fn line(&mut self, line: &str) {
+    fn line(&mut self, line: &str) -> (SseField, Option<usize>) {
         if line.is_empty() {
             self.dispatch();
-            return;
+            return (SseField::Blank, None);
         }
         // A line starting with a colon is a comment.
-        if let Some(rest) = line.strip_prefix(':') {
-            let _ = rest;
-            return;
+        if line.starts_with(':') {
+            return (SseField::Other, None);
         }
-        let (field, value) = match line.split_once(':') {
-            Some((field, value)) => (field, value.strip_prefix(' ').unwrap_or(value)),
-            None => (line, ""),
+        let (field, value, at) = match line.split_once(':') {
+            Some((field, value)) => {
+                let trimmed = value.strip_prefix(' ').unwrap_or(value);
+                (
+                    field,
+                    trimmed,
+                    Some(field.len() + 1 + value.len() - trimmed.len()),
+                )
+            }
+            None => (line, "", None),
         };
-        match field {
+        let field = match field {
             "event" => {
                 self.event_type.clear();
                 self.event_type.push_str(value);
+                SseField::Event
             }
             "data" => {
                 self.data.push_str(value);
                 self.data.push('\n');
+                SseField::Data
             }
             // A NUL in an id is ignored outright, per the grammar.
             "id" if !value.contains('\0') => {
                 self.last_event_id.clear();
                 self.last_event_id.push_str(value);
+                SseField::Id
             }
             "retry" if !value.is_empty() && value.bytes().all(|b| b.is_ascii_digit()) => {
-                self.retry = value.parse().ok();
+                // Digits only is a valid field, so a value past `u64` saturates.
+                self.retry = Some(value.parse().unwrap_or(u64::MAX));
+                SseField::Other
             }
-            _ => {}
-        }
+            _ => SseField::Other,
+        };
+        (field, at)
     }
 
     /// A blank line ends an event. An event with no data is not dispatched:
@@ -334,9 +471,13 @@ impl NdjsonFramer {
         self.ready.drain(..)
     }
 
-    /// The unterminated last line, if the stream ended with one.
+    /// The unterminated last line, if the stream ended with a nonempty one.
+    /// A CR ending it is part of the line end, as in [`Self::push`].
     pub fn finish(&mut self) -> Option<Vec<u8>> {
-        let line = std::mem::take(&mut self.buffer);
+        let mut line = std::mem::take(&mut self.buffer);
+        if line.last() == Some(&b'\r') {
+            line.pop();
+        }
         (!line.is_empty()).then_some(line)
     }
 
@@ -349,14 +490,12 @@ impl NdjsonFramer {
 /// The first complete line in `buffer`, without its line end, and the
 /// bytes after that line end; the first `scanned` bytes hold no line end.
 ///
-/// Defers a trailing CR until another byte arrives so a split CRLF is consumed
-/// as one terminator.
+/// A CR ends a line at once, as the grammar says; an LF right after it in
+/// `buffer` belongs to the same line end.
 fn terminated_line(buffer: &[u8], scanned: usize) -> Option<(&[u8], &[u8])> {
-    match split_line(buffer, scanned, |byte| *byte == b'\n' || *byte == b'\r')? {
-        (line, [b'\r', b'\n', rest @ ..]) => Some((line, rest)),
-        (_, [b'\r'] | []) => None,
-        (line, [_, rest @ ..]) => Some((line, rest)),
-    }
+    let (line, end) = split_line(buffer, scanned, |byte| *byte == b'\n' || *byte == b'\r')?;
+    let rest = end.strip_prefix(b"\r\n").or_else(|| end.get(1..));
+    Some((line, rest.unwrap_or_default()))
 }
 
 /// `buffer` split before its first byte that `ends` a line, if it has one;

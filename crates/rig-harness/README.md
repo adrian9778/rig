@@ -46,13 +46,14 @@ The default `plugins.toml`, in order:
 | `rig-basics` | `sessions::agents::AgentsPlugin` | `/fork`, `/agents` and rewind (Alt+Up to an earlier message, then Enter): the agents of this session |
 | `rig-basics` | `compaction::CompactionPlugin` | summarizing a conversation near the context window; `/compact` |
 | `rig-basics` | `telemetry::usage::UsagePlugin` | what model calls cost; `/usage` |
+| `rig-traffic` | `TrafficPlugin` | with `--traffic-log` or `[traffic] log = true`, provider HTTP exchanges in the session's `traffic.jsonl` |
 | `rig-basics` | `activity::ActivityPlugin` | what each agent is doing, for views |
 | `rig-basics` | `coding_tools::ReadTool`, `coding_tools::EditTool`, `coding_tools::WriteTool`, `coding_tools::ShellTool` | the coding tools of [`rig-tools`](https://github.com/0xPlaygrounds/rig/tree/main/crates/rig-tools), one plugin each, acting in the app's workspace; the library's `search`, `list`, `delete` and `move` are left to `shell` |
 | `rig-basics` | `coding_tools::AttachPlugin` | the files the user names as `@path`, from the agent's directory, go with the message |
 | `rig-basics` | `coding_tools::remote::RemoteHostsPlugin` | a path written `HOST:PATH` is that host's for every tool, through the transport `[remote.hosts]` in `settings.toml` gives it (such as `ssh` or `koh exec`); nothing without hosts |
-| `rig-basics` | `reload::ReloadPlugin` | `/reload` and the `reload` tool, with which the agent rebuilds itself, and, when the launcher started the agent, the system prompt's fixed `self_extension` section on how it writes plugins |
+| `rig-basics` | `reload::ReloadPlugin` | `/reload`, which rebuilds the agent with the plugins in `plugins.toml` and restarts it in the session |
 | `rig-basics` | `reload::plugins::PluginsPlugin` | `/plugins`: every entry of `plugins.toml`, enabled and disabled, in a picker that turns them on and off and rebuilds at once |
-| `rig-basics` | `BasicCommandsPlugin` | `/help`, `/retry`, `/quit` |
+| `rig-basics` | `BasicCommandsPlugin` | `/help`, `/quit` |
 | `rig-basics` | `print::PrintPlugin` | `--print` and `--json`: the fronts of a run with `-p`, with stdin piped in, or driven by JSON lines (`rig help-agents`) |
 | `rig-tui` | `TuiPlugin` | the terminal view: the front of a run on an interactive terminal, with the status line and pickers other plugins add to |
 
@@ -70,16 +71,18 @@ Listed disabled by default, each a commented-out entry that `/plugins` or
 | `rig-basics` | `telemetry::diagnostics::DiagnosticsPlugin` | the process's warnings and errors, Bevy's included, as the `Diagnostics` resource |
 | `rig-inspect` | `InspectPlugin` | the `inspect` tool, with which the agent reads its own running world |
 | `rig-steel` | `SteelPlugin` | the `run_steel` tool, whose Steel program orchestrates agents and tools |
+| `rig-claude-cloak` | `ClaudeCloakPlugin` | `claude-cloak/*` models signed in with a Claude subscription (OAuth), and `/claude-cloak login` and `logout` |
 
-An entry names its crate, `crate = "rig-tui"`, and no source: the agent
-builds rig's own crates from crates.io at the launcher's version, or from
-the rig checkout it is built from (`RIG_SOURCE`). A plugin crate that adds to the terminal view (status
-line items, pickers, tool renderers) does so behind a default `tui` cargo
-feature, so it also builds without `rig-tui`.
+An entry names its crate, `crate = "rig-tui"`, and no source: the agent builds
+rig's own crates from crates.io at the launcher's version, or from the rig
+checkout it is built from (`RIG_SOURCE`). A plugin crate that adds to the
+terminal view (status line items, pickers, transcript render systems) does so
+behind a default `tui` cargo feature, so it also builds without `rig-tui`.
 
 The optional [`rig-inspect`](https://github.com/0xPlaygrounds/rig/tree/main/plugins/rig-inspect) plugin adds the
 `inspect` tool, with which the agent reads its own Bevy world, read-only.
 [`rig-steel`](https://github.com/0xPlaygrounds/rig/tree/main/plugins/rig-steel) adds code mode.
+[`rig-claude-cloak`](https://github.com/0xPlaygrounds/rig/tree/main/plugins/rig-claude-cloak) signs in with a Claude subscription instead of an API key.
 
 [`PLUGINS.md`](https://github.com/0xPlaygrounds/rig/blob/main/crates/rig-harness/PLUGINS.md) shows how to write a plugin: an index from task to
 section, then one example per extension point.

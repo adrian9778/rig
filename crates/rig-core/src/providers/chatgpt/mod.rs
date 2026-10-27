@@ -40,6 +40,12 @@ pub const GPT_5_3_INSTANT: &str = "gpt-5.3-instant";
 /// Stable descriptor name reported on normalized ChatGPT responses.
 pub const PROVIDER_NAME: &str = "chatgpt";
 
+/// The name users know the subscription plan by.
+pub const PLAN_TITLE: &str = "ChatGPT";
+
+/// The model a fresh sign-in switches to: the plan's latest frontier model.
+pub const DEFAULT_MODEL: &str = crate::providers::openai::GPT_6_1_SOL;
+
 /// Subscription-backend dialect with SSE replies, Codex parameters, and caller identity.
 /// All system messages become top-level instructions; replayed frames omit envelope metadata.
 pub const DIALECT: Dialect = Dialect {
@@ -55,12 +61,16 @@ pub const DIALECT: Dialect = Dialect {
         // The subscription backend keeps no files, so no file id resolves
         // there.
         accepts_file_ids: false,
+        // ChatGPT bills a subscription, not the catalog's API rates.
+        catalog_priced: false,
         identity: Some(Identity {
             originator: DEFAULT_ORIGINATOR,
             originator_env: "CHATGPT_ORIGINATOR",
             user_agent_env: "CHATGPT_USER_AGENT",
-            session_ids: true,
         }),
+        // The backend routes its prompt cache by this header, over
+        // `prompt_cache_key`.
+        session_header: Some("session-id"),
         responses: ResponsesQuirks {
             system_instructions: SystemInstructionsPlacement::AllInstructions,
             contract: ResponsesContract::Codex,
@@ -70,10 +80,5 @@ pub const DIALECT: Dialect = Dialect {
     },
     ..Dialect::gateway(PROVIDER_NAME, CHATGPT_API_BASE_URL, "CHATGPT_ACCESS_TOKEN")
 };
-
-/// Generate a per-request session correlator for transport headers only.
-pub(crate) fn session_id() -> String {
-    crate::id::generate()
-}
 
 crate::client::macros::openai_vendor!(DIALECT, "ChatGPT");

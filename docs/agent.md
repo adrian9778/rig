@@ -78,9 +78,10 @@ instead when set.
 
 The input takes several lines. Enter sends; Shift+Enter, Ctrl+J or `\` before
 Enter starts a new line; Up and Down move between lines and through the
-prompts sent before (kept in `RIG_HOME/data/tui/history.jsonl`); the usual
+prompts sent before in this project, each once, the shown conversation's
+first (kept in `RIG_HOME/projects/<name>-<key>/tui/history.jsonl`); the usual
 emacs keys edit (Ctrl+A/E/K/U/W, Alt+B/F/D); Ctrl+C clears the input, and
-Ctrl+D pressed twice on an empty input quits. A
+Ctrl+D on an empty input quits. A
 leading `/` completes command names and `@` completes the project's paths
 (skipping what `.gitignore` leaves out); Tab or Enter takes the selected one.
 A command that is unknown or refused comes back in the input with the reason,
@@ -112,13 +113,16 @@ and every note, nothing cut or folded. A call's row is tinted by where it
 stands (waiting, running, done, failed). Code is highlighted in the terminal's
 own palette, so it follows the terminal's theme. PageUp, PageDown and
 Shift+Up/Down scroll the transcript. With `NO_COLOR` set, nothing is drawn in
-color. A plugin can draw its own tools' calls with `app.add_tool_renderer`
-(`rig_tui::AppToolRenderersExt`).
+color. A plugin draws its tools' calls with ordinary systems in
+`rig_tui::TranscriptRender`, selecting inputs through
+`rig_tui::RenderBatch::tools_mut` and writing their output lines.
 
 ## Sessions
 
 Each `rig` starts a new session. `/quit` ends it, `/new` starts a new one and
-`/name` names it. `/resume` lists the earlier sessions (name or first
+`/name` names it. A session is kept once it has a user or assistant message; one
+that only changed settings is removed when it ends, and `/resume` never
+lists it. `/resume` lists the earlier sessions (name or first
 message, cost, directory, age) and resumes the one picked, in its own
 directory; `rig --resume <id or name>` (or `/resume <id or name>`) resumes a
 given one, such as after a crash.
@@ -175,7 +179,8 @@ the summary; a resumed session starts from the messages the summary kept.
 A model call that fails on a rate limit, an overloaded provider or a dropped
 connection is retried up to four times, waiting as long as the provider's
 `Retry-After` asks (or 2, 4, 8, 16 seconds). If it still fails, your message
-stays in the conversation and `/retry` sends it again.
+goes back into the input: press Enter to send it again, or switch models
+first.
 
 ## Tools
 
@@ -267,22 +272,16 @@ cargo's latest line, keeps the current build running if the new one does not
 compile (its error notice names the build log), and rolls back to it if the
 new one crashes during startup.
 
-The agent can ask for a reload itself with its `reload` tool, which waits the
-same way and shows a notice. A reload the model asked for reports back: one
-message that starts a turn says the new build started, carries the build's
-errors, or says the new build was rolled back, so the model carries on without
-a second prompt. It may ask for at most 3 reloads per message of yours, and
-Esc or `/reload cancel` drops the report. A `-p` run whose model asks for a
-reload waits for it and carries on on the new build too.
+A `-p` run in which a plugin asks for a reload waits for it and carries on on
+the new build.
 
 Every build, the one before each start and `/reload`'s, writes its whole
 output (the launcher's and cargo's) to `RIG_HOME/build.log`, and a failure
 message names its reason and first compiler error. The agent sees build
-failures too: the reason, the first errors and the paths of `build.log`,
-`plugins.toml` and the generated project go into its conversation as a message
-from the `build` plugin, which starts no turn when the agent is idle (unless
-the model asked for that reload) and is saved with the session. Ask it why the
-build failed and it can read the log, fix the cause, and reload.
+failures too: the reason, the first errors and the path of `build.log` go into
+its conversation as a message from the `build` plugin, which starts no turn
+when the agent is idle and is saved with the session. Ask it why the build
+failed and it can read the log and fix the cause; `/reload` then tries again.
 
 `rig build` regenerates and builds the agent without starting it.
 `CARGO_BUILD_JOBS` sets cargo's `-j` for these builds, as for any cargo build.
@@ -315,16 +314,17 @@ plugin = "hello::HelloPlugin"     # implements Plugin + Default
 
 `rig plugin new hello` makes that crate in `$RIG_HOME/plugins/hello`, outside
 any workspace, and adds its entry; `rig plugin add <type> --path <dir>` (or
-`--git`, `--version`) adds an entry for an existing crate, and `rig plugin
-remove <type>` takes one out (its crate stays), each checked before
-`plugins.toml` is written. A commented-out entry is a disabled plugin: the
-template lists every plugin rig ships, the ones not on by default commented
-out. `rig plugin list` shows each entry, `on` or `off`, with its crate and the
-comment above it, and `rig plugin enable <type>` and `disable <type>`
-uncomment and comment out an entry, keeping every other line. In the agent,
-`/plugins` is a picker of the same list: tick and untick plugins, press Enter,
-and the agent rebuilds and restarts at once (without a terminal it prints the
-list).
+`--git`, `--version`) adds an entry for an existing crate; `rig plugin add
+<type>` with no source adds one for a plugin rig ships, at the launcher's
+version; and `rig plugin remove <type>` takes one out (its crate stays), each
+checked before `plugins.toml` is written. A commented-out entry is a disabled
+plugin: the template lists every plugin rig ships, the ones not on by default
+commented out. `rig plugin list` shows each entry, `on` or `off`, with its
+crate and the comment above it, and `rig plugin enable <type>` and `disable
+<type>` uncomment and comment out an entry, keeping every other line. In the
+agent, `/plugins` is a picker of the same list: tick and untick plugins, press
+Enter, and the agent rebuilds and restarts at once (without a terminal it
+prints the list).
 
 `rig plugin check` checks the list. With `--build` it also builds the agent
 with its plugins in `$RIG_HOME/target` without staging it, and names the
@@ -333,17 +333,24 @@ between them; a debug build of the agent warns of those at start.
 
 A plugin crate depends on `rig-harness`, and on another plugin crate whose
 types it uses (such as `rig-tui` for a terminal panel), and registers tools,
-slash commands, tool renderers, terminal panels or a window the way the
-built-in ones do, never by editing rig's crates.
+slash commands, transcript render systems, terminal panels or a window the way
+the built-in ones do, never by editing rig's crates.
 [`crates/rig-harness/PLUGINS.md`](../crates/rig-harness/PLUGINS.md) is the
 plugin guide, with a copy-ready example of each kind, its names from
 `rig_harness::prelude` and the plugin crates, and the `src/lib.rs` that `rig
-plugin new` writes is a working, commented slash command. An agent started by
-the launcher knows its plugins, commands and tools, and how to write and add
-its own plugins, from its system prompt.
+plugin new` writes is a working, commented slash command.
+
+The default [`rig-traffic`](../plugins/rig-traffic) plugin optionally records
+provider HTTP exchanges in the session's `traffic.jsonl`. Its README covers
+`--traffic-log`, persistent settings, transport coverage, and joining traffic
+with the separately enabled effect log.
 
 The optional [`rig-inspect`](../plugins/rig-inspect) plugin adds the `inspect`
 tool, with which the agent reads its own Bevy world, read-only.
+
+The optional [`rig-claude-cloak`](../plugins/rig-claude-cloak) plugin adds
+`claude-cloak/*` models signed in with a Claude subscription instead of an API
+key, on Linux and macOS: `rig plugin add rig_claude_cloak::ClaudeCloakPlugin`.
 
 Code mode is the optional [`rig-steel`](../plugins/rig-steel) plugin: a
 `run_steel` tool whose [Steel](https://github.com/mattwparas/steel) (Scheme)
@@ -374,14 +381,14 @@ processes can share one:
 | Path | What it holds |
 | --- | --- |
 | `plugins.toml` | The plugin list. |
-| `settings.toml` | Settings, such as `[shell]`, `[checkpoints]` and `[remote.hosts]`. |
+| `settings.toml` | Settings, such as `[shell]`, `[checkpoints]`, `[remote.hosts]` and `[traffic]`. |
 | `auth/` | `/login`'s credentials: `chatgpt.json` and the API keys in `keys/`. |
 | `project/`, `target/`, `bin/` | The generated agent project, cargo's build of it (a few gigabytes), and the builds. |
 | `build.log` | The last build's whole output. |
 | `defaults.json` | The last chosen model and reasoning, which a new session starts with. |
-| `data/` | Plugins' data across sessions, such as the prompt history `data/tui/history.jsonl`. |
-| `projects/` | Plugins' data per project. |
-| `sessions/<id>/` | A session: the agent logs in `logs/`, the name `/name` gave it in `name`, and `files/` (`meta.json`, the images in `blobs/`, the effect log `effects.jsonl` with `EffectLogPlugin`, plugins' files). |
+| `data/` | Plugins' data across sessions and projects. |
+| `projects/` | Plugins' data per project, such as the prompt history `projects/<name>-<key>/tui/history.jsonl`. |
+| `sessions/<id>/` | A session: the agent logs in `logs/`, the name `/name` gave it in `name`, and `files/` (`meta.json`, the images in `blobs/`, the effect log `effects.jsonl` with `EffectLogPlugin`, opt-in `traffic.jsonl` with `TrafficPlugin`, plugins' files). |
 | `spill/` | The whole output of a `shell` call that was cut. |
 | `agent.log` | The agent's log. |
 

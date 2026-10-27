@@ -322,7 +322,7 @@ pub struct CompletionResponse {
     pub error: Option<String>,
     /// Why the reply stopped before the provider ended it, when the caller
     /// stopped reading: the turn's message then ends in
-    /// [`StopReason::Aborted`] and is never replayed.
+    /// [`StopReason::Aborted`] and is replayed as its text alone.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub aborted: Option<String>,
     /// Request identifier from HTTP headers or SDK metadata, not the body's
@@ -1262,12 +1262,13 @@ pub struct CompletionRequest {
     #[serde(default, skip_serializing_if = "ProviderOptions::is_empty")]
     pub provider_options: ProviderOptions,
     /// Where a provider that caches prompts by marker (Anthropic's Messages
-    /// family) may mark the end of a stable prefix that later requests
-    /// repeat, beside its own markers, so content after it (per-turn
-    /// memory, a reminder) does not cost the cached prefix. A provider that
-    /// takes fewer markers keeps the points furthest into the request; one
-    /// that caches prefixes without markers ignores them. Empty marks
-    /// nothing.
+    /// family, OpenAI's Responses API from GPT-5.6 on) may mark the end of a
+    /// stable prefix that later requests repeat, beside its own markers, so
+    /// content after it (per-turn memory, a reminder) does not cost the
+    /// cached prefix. A provider that takes fewer markers keeps the points
+    /// furthest into the request; one that caches prefixes without markers
+    /// ignores them. A provider that marks only some parts of a request moves
+    /// a point back to the last part it can mark. Empty marks nothing.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub cache_points: Vec<CachePoint>,
 }

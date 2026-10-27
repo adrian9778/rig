@@ -19,7 +19,6 @@
 //! built, so `/reload` takes a change.
 
 use std::path::PathBuf;
-use std::process::Command;
 
 use rig_harness::prelude::*;
 use rig_tui::{
@@ -39,9 +38,9 @@ pub struct KeyBindingsPlugin;
 #[derive(Component, Debug)]
 pub struct UserKey;
 
-/// A program writing the input's draft in this file.
+/// A program writing the input's draft in this file, for this agent.
 #[derive(Component)]
-struct Draft(PathBuf);
+struct Draft(PathBuf, Option<Entity>);
 
 impl Plugin for KeyBindingsPlugin {
     fn build(&self, app: &mut App) {
@@ -138,7 +137,7 @@ impl Entry {
             return Err("it needs exactly one action".to_owned());
         };
         let label = match &action {
-            Action::Editor => "Write the input in $EDITOR".to_owned(),
+            Action::Editor => "Write the input in the editor".to_owned(),
             Action::Command(line) => format!("Run {line}"),
             Action::Insert(text) => format!("Insert {text:?}"),
             Action::CycleModel(models) if models.is_empty() => {
@@ -256,25 +255,30 @@ fn edit(
         ));
         return;
     }
-    let editor = std::env::var("VISUAL")
-        .or_else(|_| std::env::var("EDITOR"))
-        .unwrap_or_else(|_| "vi".to_owned());
-    let mut words = editor.split_whitespace();
-    let mut command = Command::new(words.next().unwrap_or("vi"));
-    command.args(words).arg(&path);
-    commands.spawn((RunInTerminal(command), Draft(path)));
+    let line = corpus_shared::editor::line();
+    let command = corpus_shared::editor::command(line.as_deref(), &[&path]);
+    commands.spawn((RunInTerminal(command), Draft(path, pressed.agent)));
 }
 
 /// Puts the draft as the editor left it in the input, unless the editor
-/// failed.
+/// failed, which a notice says.
 fn take_draft(
     done: Query<(Entity, &TerminalExit, &Draft), Added<TerminalExit>>,
     mut input: MainInput,
     mut commands: Commands,
+    mut notices: MessageWriter<Notice>,
 ) {
-    for (run, exit, Draft(path)) in &done {
-        if let (true, Ok(text)) = (exit.success(), std::fs::read_to_string(path)) {
-            input.set(text.trim_end());
+    for (run, exit, Draft(path, agent)) in &done {
+        match exit.failure() {
+            Some(why) => {
+                let text = format!("The editor failed ({why}); the draft is unchanged.");
+                notices.write(Notice::error(*agent, text));
+            }
+            None => {
+                if let Ok(text) = std::fs::read_to_string(path) {
+                    input.set(text.trim_end());
+                }
+            }
         }
         std::fs::remove_file(path).ok();
         commands.entity(run).despawn();

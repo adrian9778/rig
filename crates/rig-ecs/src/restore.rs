@@ -37,6 +37,7 @@
 //! ```
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::io;
 
 use bevy_ecs::prelude::*;
 use bevy_ecs::reflect::{AppTypeRegistry, ReflectComponent};
@@ -423,6 +424,12 @@ impl SavedKeys {
     pub fn listed(&self) -> &BTreeSet<String> {
         &self.listed
     }
+
+    /// Each stable key, with the path of the type saved under it, in key
+    /// order.
+    pub fn iter(&self) -> impl Iterator<Item = (&str, &str)> {
+        (self.paths.iter()).map(|(key, path)| (key.as_str(), path.as_str()))
+    }
 }
 
 /// The one reader of saved values, for a restore: each value is read under
@@ -462,6 +469,33 @@ impl SavedReader {
     /// The type path of the values saved under `key`.
     pub(crate) fn path<'k>(&'k self, key: &'k str) -> &'k str {
         self.keys.path(key).unwrap_or(key)
+    }
+}
+
+/// Checks the saved value `value` of `key` as a restore of `world` reads
+/// it, such as one a migration wrote: under its key's type, when a plugin
+/// saves that type. A value no plugin of `world` saves passes, as a
+/// restore leaves it in the session as it is.
+///
+/// # Errors
+///
+/// [`io::ErrorKind::InvalidData`] when a plugin saves the type and
+/// `value` no longer fits it.
+pub fn check_saved(world: &World, key: &str, value: &Value) -> io::Result<()> {
+    let Some(registry) = world.get_resource::<AppTypeRegistry>() else {
+        return Ok(());
+    };
+    let registry = registry.read();
+    let reader = SavedReader::new(world);
+    let Ok((registration, _)) = saved_type(reader.path(key), &registry) else {
+        return Ok(());
+    };
+    match reflected(registration, value, &registry) {
+        Ok(_) => Ok(()),
+        Err(why) => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("the saved value `{key}`: {why}"),
+        )),
     }
 }
 

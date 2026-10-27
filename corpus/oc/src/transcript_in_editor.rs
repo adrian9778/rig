@@ -3,7 +3,7 @@
 //!
 //! `/edit-history` writes the focused agent's conversation to a Markdown
 //! file, one section per message part (`## [n] user`, `## [n] assistant`,
-//! `## [n] tool-result <tool> <call id>`), and opens `$EDITOR` on it with
+//! `## [n] tool-result <tool> <call id>`), and opens the editor on it with
 //! the terminal (rig-tui's `RunInTerminal`). Tool calls are fenced
 //! ```` ```call <tool> <id> ```` blocks of JSON arguments; reasoning, images
 //! and other parts are placeholder lines that keep the original part.
@@ -84,7 +84,7 @@ impl Plugin for TranscriptInEditorPlugin {
         app.add_setting::<EditHistorySettings>("edit-history")
             .add_command(
                 "edit-history",
-                "Edit the conversation in $EDITOR: /edit-history, /edit-history undo",
+                "Edit the conversation in the editor: /edit-history, /edit-history undo",
                 edit_history,
             )
             .add_systems(
@@ -165,7 +165,7 @@ struct Built {
     orphans: BTreeSet<String>,
 }
 
-/// On a `RunInTerminal` of `$EDITOR`: whose conversation it edits, the
+/// On a `RunInTerminal` of the editor: whose conversation it edits, the
 /// file, what the file held when it opened, and the conversation then.
 #[derive(Component, Clone, Debug)]
 struct Editing {
@@ -794,17 +794,8 @@ fn undone(
 // The command and the editor.
 
 fn editor_command(settings: &EditHistorySettings, path: &Path) -> Command {
-    let editor = settings
-        .editor
-        .clone()
-        .or_else(|| std::env::var("VISUAL").ok())
-        .or_else(|| std::env::var("EDITOR").ok())
-        .filter(|editor| !editor.trim().is_empty())
-        .unwrap_or_else(|| "vi".to_owned());
-    let mut words = editor.split_whitespace();
-    let mut command = Command::new(words.next().unwrap_or("vi"));
-    command.args(words).arg(path);
-    command
+    let line = settings.editor.clone().or_else(corpus_shared::editor::line);
+    corpus_shared::editor::command(line.as_deref(), &[path])
 }
 
 /// Writes `text` to the editing's file and opens the editor on it.
@@ -1002,12 +993,9 @@ fn editor_closed(
     for (run, exit, editing) in &done {
         commands.entity(run).despawn();
         let agent = editing.agent;
-        let read = match exit.success() {
-            true => std::fs::read_to_string(&editing.path).map_err(|why| why.to_string()),
-            false => Err(match &exit.0 {
-                Ok(status) => format!("the editor exited with {status}"),
-                Err(why) => why.clone(),
-            }),
+        let read = match exit.failure() {
+            None => std::fs::read_to_string(&editing.path).map_err(|why| why.to_string()),
+            Some(why) => Err(format!("the editor failed ({why})")),
         };
         let text = match read {
             Ok(text) if text != editing.written => text,

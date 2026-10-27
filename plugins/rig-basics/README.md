@@ -5,7 +5,7 @@ the services only some plugins add. One crate, one module per group, all on
 rig-harness's public API. Each plugin is its own entry in `plugins.toml`,
 so each can be turned off alone.
 
-- the root: `BasicCommandsPlugin` (`/help`, `/retry`, `/quit`);
+- the root: `BasicCommandsPlugin` (`/help`, `/quit`);
 - `prompt`: rig's fixed system prompt for an agent without one
   (`DefaultPromptPlugin`, `DEFAULT_SYSTEM_PROMPT`);
 - `agents_md`: the project's and the user's `AGENTS.md` files in the system
@@ -36,7 +36,7 @@ so each can be turned off alone.
 - `preview`: what a tool call would change on disk, before it runs
   (`PreviewPlugin`);
 - `checkpoint`: what each tool call changed on disk (`CheckpointPlugin`);
-- `reload`: `/reload` and the `reload` tool (`ReloadPlugin`), and
+- `reload`: `/reload` (`ReloadPlugin`), and
   `/plugins` (`plugins::PluginsPlugin`);
 - `print`: `--print` and `--json`, the fronts of a run with `-p`, piped
   stdin or JSON lines (`PrintPlugin`), and the loop of any run nobody sits
@@ -55,6 +55,10 @@ Subagents cannot use this flag to broaden their inherited restrictions.
 Access is intersected in Prepare Input and already-built tool advertisements
 are pruned in Prepare Edit, before dispatch and in a defined order with session
 persistence.
+
+Without an explicit output limit, a turn asks for 64,000 tokens plus any
+thinking budget and 1,024, within the model's output limit, or the server's
+default for a model whose limits are unknown. The room left in the window caps it.
 
 `/usage` reports provider-supplied cost when available, otherwise API list-price
 estimates. These are not subscription charges or verified invoices. Missing

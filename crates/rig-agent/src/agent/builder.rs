@@ -16,7 +16,7 @@ use crate::handlers::Handlers;
 use rig_core::serve::adapters::{ModelAdapter, RetrieveAdapter};
 use rig_core::serve::{ErasedHandler, Recorder};
 use rig_core::{
-    completion::{Document, ModelRef},
+    completion::{Document, ModelRef, ProviderToolDefinition},
     effect::{HandlerKey, Key, family},
     vector_store::{VectorSearchRequest, VectorStoreIndex, request::DynamicSearchFilter},
     wasm_compat::{WasmCompatSend, WasmCompatSync},
@@ -247,6 +247,24 @@ impl AgentBuilder {
         self
     }
 
+    /// Add a provider-hosted tool (web search, code execution and the like)
+    /// to every request, after the agent's function tools. The provider runs
+    /// it; the agent never dispatches it. Calls accumulate. A
+    /// [`RequestPatch`]'s `active_tools` does not filter it; a turn's
+    /// [`ToolChoice::None`] keeps the model off it.
+    pub fn provider_tool(self, tool: ProviderToolDefinition) -> Self {
+        self.provider_tools([tool])
+    }
+
+    /// Add provider-hosted tools in order, as [`Self::provider_tool`] does.
+    pub fn provider_tools(
+        mut self,
+        tools: impl IntoIterator<Item = ProviderToolDefinition>,
+    ) -> Self {
+        self.config.spec_mut().provider_tools.extend(tools);
+        self
+    }
+
     /// Set the portable generation options every request of this agent
     /// carries. A run's [`AgentRunner::options`](crate::agent::AgentRunner::options)
     /// overlays them field by field. Calls apply in order: this replaces
@@ -301,7 +319,8 @@ impl AgentBuilder {
     }
 
     /// Enable or disable sensitive message content on telemetry spans.
-    /// Disabled by default; enabling may expose prompts, responses, and tool data.
+    /// Disabled by default; enabling may expose prompts, responses, tool data,
+    /// and the tool definitions sent with each completion.
     pub fn record_content_telemetry(mut self, enabled: bool) -> Self {
         self.config.record_telemetry_content = enabled;
         self

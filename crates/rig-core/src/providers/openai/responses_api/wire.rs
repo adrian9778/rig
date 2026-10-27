@@ -175,6 +175,12 @@ impl Wire for Responses {
 }
 
 impl crate::completion::ReplayTarget for Responses {
+    /// Whether the catalog prices this dialect's replies
+    /// ([`Quirks::catalog_priced`](crate::providers::openai::wire::Quirks::catalog_priced)).
+    fn catalog_priced(&self) -> bool {
+        self.provider.dialect.quirks.catalog_priced
+    }
+
     /// Section 6.3 of the typed-options design, by dialect.
     fn map_options(
         &self,
@@ -208,6 +214,10 @@ impl crate::completion::ReplayTarget for Responses {
     /// A call item names its id in `call_id`.
     fn call_id_slot(&self) -> Option<&'static str> {
         Some("/call_id")
+    }
+
+    fn blob_slots(&self) -> &'static [&'static str] {
+        &["/encrypted_content"]
     }
 
     /// An edited block keeps its item's `id` and `type`, a message its
@@ -274,13 +284,16 @@ impl crate::completion::ReplayTarget for Responses {
     }
 
     /// A request naming `previous_response_id` or a `conversation`
-    /// continues state the provider stores, which holds the calls its first
-    /// results answer.
+    /// continues state the provider stores, and one with caller-built
+    /// `input` items state the caller holds. Either holds the calls its
+    /// first results answer.
     fn continues_stored(&self, request: &completion::CompletionRequest) -> bool {
-        ["previous_response_id", "conversation"].iter().any(|key| {
-            crate::completion::options::param(self, request, key)
-                .is_some_and(|value| !value.is_null())
-        })
+        ["previous_response_id", "conversation", "input"]
+            .iter()
+            .any(|key| {
+                crate::completion::options::param(self, request, key)
+                    .is_some_and(|value| !value.is_null())
+            })
     }
 
     /// Characters outside `[a-zA-Z0-9_-]` become `_`, and the id is cut to

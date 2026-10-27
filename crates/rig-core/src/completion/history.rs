@@ -69,17 +69,15 @@ use base64::prelude::{BASE64_STANDARD, BASE64_STANDARD_NO_PAD};
 use crate::conversation::pairing::is_result;
 use crate::message::{
     Api, AssistantContent, AssistantMessage, CallId, DocumentData, DocumentMediaType,
-    DocumentSourceKind, ImageMediaType, Message, Origin, Text, ToolResult, ToolResultContent,
-    UserContent,
+    DocumentSourceKind, ImageMediaType, Message, Origin, StopReason, Text, ToolResult,
+    ToolResultContent, UserContent,
 };
 use crate::wasm_compat::WasmCompatSync;
 
-/// What replaces a user image for a model without image input.
-pub const USER_IMAGE_OMITTED: &str = "(image omitted: model does not support images)";
-
-/// What replaces another model's assistant image for a model that reads no
-/// images in assistant turns.
-pub const ASSISTANT_IMAGE_OMITTED: &str = "(image omitted: model does not support images)";
+/// What replaces a user image for a model without image input, and another
+/// model's assistant image for a model that reads no images in assistant
+/// turns.
+pub const IMAGE_OMITTED: &str = "(image omitted: model does not support images)";
 
 /// What replaces a tool-result image for a model without image input.
 pub const TOOL_IMAGE_OMITTED: &str = "(tool image omitted: model does not support images)";
@@ -265,10 +263,25 @@ pub trait ReplayTarget: std::fmt::Debug + WasmCompatSync {
         None
     }
 
+    /// Where this wire's items keep a reasoning blob (a signature or an
+    /// encrypted copy of the reasoning), as JSON pointers tried in order.
+    /// The reply fold records the first that holds one on the block's
+    /// [`Native`](crate::message::Native). By default there are none.
+    fn blob_slots(&self) -> &'static [&'static str] {
+        &[]
+    }
+
     /// Whether every reply on this wire states why it stopped. A reply that
     /// then names no reason failed; a wire
     /// with no finish vocabulary, such as a local runtime, says `false`.
     fn states_finish_reason(&self) -> bool {
+        true
+    }
+
+    /// Whether the catalog's per-token API prices apply to this wire's
+    /// replies. A subscription backend, or a server that is usually local,
+    /// says `false`: its replies then carry only a cost they report.
+    fn catalog_priced(&self) -> bool {
         true
     }
 
@@ -472,7 +485,9 @@ fn set_pointer(item: &mut serde_json::Value, pointer: &str, value: serde_json::V
 ///   to a user message after the results when only user images are read,
 ///   and without tools calls and results become text.
 /// - Opaque items marked not to replay are always dropped, and so is a turn
-///   that ended in an error or was aborted, with the results answering it.
+///   that ended in an error, with the results answering it. An aborted turn
+///   is read as the text it had sent, as a turn from no known model: its
+///   reasoning, its calls and the results answering them are dropped.
 /// - Calls and results pair by [`crate::conversation::pairing::pair`]: an
 ///   unanswered call gets a
 ///   [`NO_RESULT_PROVIDED`](crate::conversation::pairing::NO_RESULT_PROVIDED)
@@ -672,6 +687,9 @@ pub(crate) fn adapt_for(
                         .into_iter()
                         .map(Some),
                 );
+            }
+            Message::Assistant(turn) if matches!(turn.stop, Some(StopReason::Aborted(_))) => {
+                shaped.push(stopped(turn));
             }
             // A failed turn is skipped, with the results answering it.
             Message::Assistant(turn)
@@ -1221,18 +1239,16 @@ fn assistant<'a>(
                             // A rename is rig's, not an edit: replay spells
                             // the new id into the item's slot, so the item
                             // stays.
-                            let item = block
-                                .native_item()
-                                .filter(|_| target.call_id_slot().is_some());
+                            let keep =
+                                block.native_item().is_some() && target.call_id_slot().is_some();
                             let id = id.into_owned();
                             let renamed = crate::message::ToolCall { id, ..call.clone() };
-                            let renamed = AssistantContent::ToolCall(renamed);
-                            Cow::Owned(match item {
-                                Some(item) if renamed.native_item().is_none() => {
-                                    renamed.into_canonical().with_native(item.clone())
-                                }
-                                _ => renamed,
-                            })
+                            let mut renamed = AssistantContent::ToolCall(renamed);
+                            let fingerprint = renamed.fingerprint();
+                            if let Some(Some(native)) = renamed.native_slot().filter(|_| keep) {
+                                native.fingerprint = fingerprint;
+                            }
+                            Cow::Owned(renamed)
                         }
                     }
                     // The capability holds for the model's own turns too: an
@@ -1254,7 +1270,7 @@ fn assistant<'a>(
                     }
                     AssistantContent::Opaque(_) => return None,
                     AssistantContent::Image(_) if !accepts.assistant_images => {
-                        AssistantContent::Text(Text::new(ASSISTANT_IMAGE_OMITTED))
+                        AssistantContent::Text(Text::new(IMAGE_OMITTED))
                     }
                     AssistantContent::ToolCall(mut call) => {
                         let normalized = target.normalize_tool_call_id(
@@ -1325,6 +1341,21 @@ fn assistant<'a>(
         origin: turn.origin.clone(),
         stop: turn.stop.clone(),
     })))
+}
+
+/// The stopped turn `turn` as the text it had sent, shaped as a reply from
+/// no known model: canonical, blank text dropped, nothing when no text is
+/// left. Its reasoning and calls are dropped, so the results answering them
+/// go too.
+fn stopped(turn: &AssistantMessage) -> Option<Arc<Message>> {
+    let content: Vec<AssistantContent> = turn
+        .content
+        .iter()
+        .filter(|block| matches!(block, AssistantContent::Text(_)))
+        .map(AssistantContent::canonical)
+        .filter(|block| !block.is_blank())
+        .collect();
+    (!content.is_empty()).then(|| Arc::new(Message::Assistant(AssistantMessage::new(content))))
 }
 
 /// The hosted uses and results that pair, as (message, block) positions in
@@ -1512,7 +1543,7 @@ fn user<'a>(
                 if form.accepts.user_images {
                     IMAGE_UNSENDABLE
                 } else {
-                    USER_IMAGE_OMITTED
+                    IMAGE_OMITTED
                 }
             }
             UserContent::Audio(audio) => {

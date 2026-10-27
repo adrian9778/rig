@@ -67,6 +67,11 @@ plugin = "rig_basics::compaction::CompactionPlugin"
 crate = "rig-basics"
 plugin = "rig_basics::telemetry::usage::UsagePlugin"
 
+# With --traffic-log or [traffic] log = true, provider HTTP in traffic.jsonl.
+[[plugin]]
+crate = "rig-traffic"
+plugin = "rig_traffic::TrafficPlugin"
+
 # What each agent is doing, for views.
 [[plugin]]
 crate = "rig-basics"
@@ -115,8 +120,7 @@ plugin = "rig_basics::coding_tools::remote::RemoteHostsPlugin"
 # crate = "rig-basics"
 # plugin = "rig_basics::checkpoint::CheckpointPlugin"
 
-# /reload and the reload tool, with which the agent rebuilds itself, and the
-# system prompt's fixed section on how the agent writes plugins.
+# /reload, which rebuilds the agent with this list and restarts it.
 # Without it the agent runs the build it started with.
 [[plugin]]
 crate = "rig-basics"
@@ -128,7 +132,7 @@ plugin = "rig_basics::reload::ReloadPlugin"
 crate = "rig-basics"
 plugin = "rig_basics::reload::plugins::PluginsPlugin"
 
-# /help, /retry and /quit.
+# /help and /quit.
 [[plugin]]
 crate = "rig-basics"
 plugin = "rig_basics::BasicCommandsPlugin"
@@ -182,3 +186,8 @@ plugin = "rig_tui::TuiPlugin"
 # [[plugin]]
 # crate = "rig-basics"
 # plugin = "rig_basics::telemetry::diagnostics::DiagnosticsPlugin"
+
+# Claude Cloak: `claude-cloak/*` models signed in with a Claude subscription (OAuth) instead of an API key, and /claude-cloak login and logout; Linux and macOS.
+# [[plugin]]
+# crate = "rig-claude-cloak"
+# plugin = "rig_claude_cloak::ClaudeCloakPlugin"

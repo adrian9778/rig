@@ -139,6 +139,21 @@ pub enum OutputCap {
     OpenAiReasoningFamilies,
 }
 
+/// The tool schema a dialect's strict function calling takes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum StrictSchema {
+    /// OpenAI's: every object closed and every property required.
+    OpenAi,
+    /// DeepSeek's: every object closed and every property required,
+    /// keywords beside a `$ref` kept, a `$ref` in `anyOf` written out, a
+    /// one-member `allOf` merged, a type list naming `object` or `array`
+    /// split into an `anyOf`, and a plain string's `format` outside the five
+    /// it names dropped. A tool whose schema it cannot express, such as a
+    /// map, is sent without `strict`.
+    DeepSeek,
+}
+
 /// Dialect-specific transformation of the serialized chat request.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
@@ -200,10 +215,17 @@ pub struct ResponsesQuirks {
     /// placements (OpenAI's own `instructions`, Copilot's and OpenRouter's
     /// `system` items in `input`).
     pub system_instructions: SystemInstructionsPlacement,
+    /// The role a system message takes in `input`.
+    pub system_role: &'static str,
     /// Which contract this dialect's endpoint speaks.
     pub contract: ResponsesContract,
     /// Whether newly constructed Responses wires normalize tools for strict validation.
     pub strict_tools_by_default: bool,
+    /// Whether the endpoint returns reasoning ciphertext through
+    /// `include: ["reasoning.encrypted_content"]`, which the wire then asks
+    /// for whenever a request reasons or stores nothing. Where it does not,
+    /// a reasoning item carries its own text and replays with `store: false`.
+    pub reasoning_ciphertext: bool,
 }
 
 impl ResponsesQuirks {
@@ -212,8 +234,10 @@ impl ResponsesQuirks {
         Self {
             path: "/responses",
             system_instructions: SystemInstructionsPlacement::Instructions,
+            system_role: "system",
             contract: ResponsesContract::OpenAi,
             strict_tools_by_default: false,
+            reasoning_ciphertext: true,
         }
     }
 }
@@ -281,6 +305,11 @@ pub struct Quirks {
     /// dialect serves, so it is the baseline; OpenAI itself, xAI and ChatGPT
     /// serve `/responses` as their primary API and say so.
     pub completion_route: Route,
+    /// Whether a model's catalog row picks
+    /// [`OpenAI::completion`](crate::providers::openai::OpenAI::completion)'s
+    /// route when neither the configuration nor a hook does, for a gateway
+    /// that serves each model on the API models.dev lists for it.
+    pub routes_by_catalog: bool,
     /// The chat-completions path, relative to the base URL.
     pub completion_path: &'static str,
     /// The embeddings path.
@@ -298,6 +327,13 @@ pub struct Quirks {
     pub audio_generation_path: &'static str,
     /// Whether `tools`/`tool_choice` reach the provider at all.
     pub supports_tools: bool,
+    /// The prefix a wire with [`strict_tools`](Chat::strict_tools) puts
+    /// before [`completion_path`](Self::completion_path), for a dialect that
+    /// serves strict function calling apart. A base URL that already ends
+    /// with it gets no second one.
+    pub strict_tools_prefix: Option<&'static str>,
+    /// The tool schema the dialect's strict function calling takes.
+    pub strict_schema: StrictSchema,
     /// Whether `output_schema` maps to `response_format`.
     pub supports_response_format: bool,
     /// Whether to send `response_format` with tools before any tool result.
@@ -337,6 +373,9 @@ pub struct Quirks {
     pub accepts_bare_string_reply: bool,
     /// Whether document and file inputs may use provider file IDs.
     pub accepts_file_ids: bool,
+    /// Whether the credential is a session token that expires within the
+    /// hour, so a saved copy soon stops working.
+    pub short_lived_key: bool,
     /// The rewrite this dialect applies to the serialized chat body.
     pub rewrite: BodyRewrite,
     /// Paths that strip a trailing `/v1` from the configured base URL.
@@ -368,8 +407,14 @@ pub struct Quirks {
     pub instructions_env: Option<&'static str>,
     /// The caller identity this gateway requires on every request.
     pub identity: Option<Identity>,
+    /// The header every completion request carries a session id in: the
+    /// request's cache key when it has one, else a fresh id.
+    pub session_header: Option<&'static str>,
     /// What the Responses endpoint accepts.
     pub responses: ResponsesQuirks,
+    /// Whether the catalog's per-token API prices apply to replies. A
+    /// subscription backend or a server that is usually local has none.
+    pub catalog_priced: bool,
 }
 
 impl Quirks {
@@ -381,6 +426,7 @@ impl Quirks {
             auth: Auth::Bearer,
             routing: Routing::Path,
             completion_route: Route::Chat,
+            routes_by_catalog: false,
             completion_path: "/chat/completions",
             embeddings_path: "/embeddings",
             models_path: "/models",
@@ -389,6 +435,8 @@ impl Quirks {
             image_generation_path: "/images/generations",
             audio_generation_path: "/audio/speech",
             supports_tools: true,
+            strict_tools_prefix: None,
+            strict_schema: StrictSchema::OpenAi,
             supports_response_format: true,
             response_format_with_tools: false,
             supports_image_tool_results: false,
@@ -402,6 +450,7 @@ impl Quirks {
             reliable_reasoning_count: true,
             accepts_bare_string_reply: false,
             accepts_file_ids: true,
+            short_lived_key: false,
             rewrite: BodyRewrite::None,
             embedding: EmbeddingQuirks::openai(),
             // OpenAI has no reranking endpoint, and neither does any dialect
@@ -417,7 +466,9 @@ impl Quirks {
             default_instructions: None,
             instructions_env: None,
             identity: None,
+            session_header: None,
             responses: ResponsesQuirks::openai(),
+            catalog_priced: true,
         }
     }
 

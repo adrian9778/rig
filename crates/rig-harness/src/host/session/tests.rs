@@ -6,14 +6,17 @@ use std::sync::Arc;
 use bevy_app::TaskPoolPlugin;
 use bevy_app::prelude::*;
 use bevy_ecs::prelude::*;
-use rig_core::completion::Message;
+use rig_core::completion::{Message, Reasoning};
 use rig_core::conversation::{self, Author};
 use rig_ecs::AgentPlugin;
 use rig_ecs::agent::{Conversation, Notice};
-use rig_ecs::session_log::{SessionLogPlugin, SessionStore};
+use rig_ecs::model::ReasoningSetting;
+use rig_ecs::session_log::{SessionLog, SessionLogPlugin, SessionStore};
 use rig_harness_protocol::{Home, Invocation, SessionDir, SessionId, StartReason};
 use rig_harness_test_support::{commit_message, first_agent, scratch_home};
-use rig_memory::{DirStore, MemoryStore, SessionMeta, Store, Strings, save};
+use rig_memory::migration::KEPT;
+use rig_memory::migration::testing::{self, SYNTHETIC};
+use rig_memory::{DirStore, Files, MemoryStore, SessionMeta, Store, Strings, save};
 
 use super::{
     AppStart, DeleteSession, Scratch, SessionDeleteFailed, SessionDeleted, SessionPaths,
@@ -294,6 +297,46 @@ fn resuming_a_session_an_older_rig_saved_changes_none_of_its_bytes() {
         assert!(logged.starts_with("this run\n"), "{logged}");
         fs::remove_dir_all(run.path()).ok();
     }
+    fs::remove_dir_all(home.root()).ok();
+}
+
+/// A session in an earlier format a step of the chain starts from is
+/// migrated through its store as the run opens it, and restored; the
+/// store keeps a copy of it as it was. The chain of this crate's tests
+/// starts from the synthetic format.
+#[test]
+fn resuming_a_session_in_an_earlier_format_migrates_and_restores_it() {
+    let home = scratch_home("rig-session-migrated");
+    let session = home.session(&SessionId::generate());
+    let written = dir_store(&session).map(|store| testing::write_fixture(&store));
+    assert!(matches!(written, Some(Ok(()))), "{written:?}");
+    session.mark_saved().ok();
+
+    let mut app = App::new();
+    app.insert_resource(RigHome(home.clone()))
+        .insert_resource(SessionPaths(session.clone()))
+        .add_plugins((TaskPoolPlugin::default(), AgentPlugin, SessionLogPlugin))
+        .add_plugins(SessionPlugin);
+    app.finish();
+    app.update();
+    app.update();
+    let stored = app.world().contains_resource::<SessionStore>();
+    let mut conversations = app.world_mut().query::<&Conversation>();
+    let restored = conversations
+        .iter(app.world())
+        .any(|conversation| conversation.messages().len() == 2);
+    drop(app);
+    assert!(stored && restored, "stored {stored}, restored {restored}");
+    let store = dir_store(&session);
+    let read = store
+        .as_ref()
+        .map(|store| rig_memory::Session::read(store).is_ok());
+    assert_eq!(read, Some(true));
+    let files = store
+        .and_then(|store| store.files().ok())
+        .unwrap_or_default();
+    let kept = format!("{KEPT}{SYNTHETIC}/logs/agent.jsonl");
+    assert!(files.contains(&kept), "{files:?}");
     fs::remove_dir_all(home.root()).ok();
 }
 
@@ -585,8 +628,11 @@ fn a_restore_reads_the_agent_logs_and_leaves_a_plugins_files_alone() {
     };
     let mut first = start();
     let agent = first_agent(first.world_mut());
-    let said = agent.map(|agent| commit_message(first.world_mut(), agent, Message::user("hi")));
-    assert_eq!(said, Some(Ok(())));
+    // Answered, so the restore has nothing to carry on.
+    for message in [Message::user("hi"), Message::assistant("hello")] {
+        let said = agent.map(|agent| commit_message(first.world_mut(), agent, message));
+        assert_eq!(said, Some(Ok(())));
+    }
     first.update();
     drop(first);
     let plugin = session.path().join("tui");
@@ -598,22 +644,17 @@ fn a_restore_reads_the_agent_logs_and_leaves_a_plugins_files_alone() {
     let messages = agent
         .and_then(|agent| restored.world().get::<Conversation>(agent))
         .map(|conversation| conversation.messages().len());
-    assert_eq!(messages, Some(1));
+    assert_eq!(messages, Some(2));
     let notices = &restored.world().resource::<Seen>().notices;
     let failed = notices.iter().any(|notice| notice.contains("restore"));
     assert!(!failed, "{notices:?}");
     std::fs::remove_dir_all(session.path()).ok();
 }
 
-/// The running session's store comes from the app's stores; the session
-/// is marked saved once its log first writes, and stays saved after a
-/// clean exit.
-#[test]
-fn a_session_opened_by_the_stores_is_saved_by_its_first_log_and_stays_saved() {
-    let home = scratch_home("rig-session-saved");
-    let Ok(id) = "1700000000-5".parse::<SessionId>() else {
-        return;
-    };
+/// A new session of `home` with id `id`, opened by the app's stores, after
+/// its first frame.
+fn new_session(home: &Home, id: &str) -> Option<(App, SessionDir)> {
+    let id: SessionId = id.parse().ok()?;
     let session = home.session(&id);
     std::fs::create_dir_all(session.path()).ok();
     let mut app = App::new();
@@ -624,12 +665,67 @@ fn a_session_opened_by_the_stores_is_saved_by_its_first_log_and_stays_saved() {
     drop(std::panic::take_hook());
     app.finish();
     app.update();
+    Some((app, session))
+}
+
+/// Changes the first agent's saved reasoning setting, as `/effort` does,
+/// and logs it: whether the log has written then.
+fn change_a_setting(app: &mut App) -> bool {
+    let agent = first_agent(app.world_mut());
+    if let Some(mut agent) = agent.and_then(|agent| app.world_mut().get_entity_mut(agent).ok()) {
+        agent.insert(ReasoningSetting(Some(Reasoning::Off)));
+    }
+    app.update();
+    app.world()
+        .get_resource::<SessionLog>()
+        .is_some_and(SessionLog::has_written)
+}
+
+/// A session that only changed a setting is logged but not saved, and is
+/// gone after its exit.
+#[test]
+fn a_session_that_only_changed_a_setting_is_removed_on_exit() {
+    let home = scratch_home("rig-session-settings-only");
+    let Some((mut app, session)) = new_session(&home, "1700000000-20") else {
+        return;
+    };
+    assert!(change_a_setting(&mut app), "the setting was logged");
+    assert!(!session.is_saved());
+    app.world_mut().write_message(AppExit::Success);
+    app.update();
+    drop(app);
+    assert!(!session.path().exists());
+    std::fs::remove_dir_all(home.root()).ok();
+}
+
+/// The running session's store comes from the app's stores; the session
+/// is marked saved once its log wrote and a conversation has a message,
+/// and stays saved after the conversation is emptied and a clean exit.
+#[test]
+fn a_session_opened_by_the_stores_is_saved_by_its_first_message_and_stays_saved() {
+    let home = scratch_home("rig-session-saved");
+    let Some((mut app, session)) = new_session(&home, "1700000000-5") else {
+        return;
+    };
     assert!(app.world().contains_resource::<SessionStore>());
     assert!(!session.is_saved(), "nothing was logged yet");
+    assert!(change_a_setting(&mut app));
+    assert!(!session.is_saved(), "no message yet");
     let agent = first_agent(app.world_mut());
     let said = agent.map(|agent| commit_message(app.world_mut(), agent, Message::user("hi")));
     assert_eq!(said, Some(Ok(())));
     app.update();
+    assert!(session.is_saved());
+    let mut conversation = agent.and_then(|agent| app.world_mut().get_mut::<Conversation>(agent));
+    if let Some(conversation) = conversation.as_mut() {
+        conversation.splice(0.., [], Author::plugin("undo"));
+    }
+    app.update();
+    let left = agent.and_then(|agent| app.world().get::<Conversation>(agent));
+    assert_eq!(
+        left.map(|conversation| conversation.messages().len()),
+        Some(0)
+    );
     app.world_mut().write_message(AppExit::Success);
     app.update();
     drop(app);

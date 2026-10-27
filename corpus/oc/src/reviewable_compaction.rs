@@ -2,9 +2,9 @@
 //! summarizes everything before the newest turns (two by default,
 //! `[reviewable-compaction] keep_turns`), steered by the focus, and this
 //! plugin holds the summary for review before it replaces anything:
-//! Accept, Edit (the summary as an editable answer, or in `$EDITOR` with
-//! the `tui` feature), Regenerate or Cancel. A run nobody answers, and an
-//! automatic compaction, are not held.
+//! Accept, Edit (the summary as an editable answer, or in `$VISUAL` or
+//! `$EDITOR` with the `tui` feature), Regenerate or Cancel. A run nobody
+//! answers, and an automatic compaction, are not held.
 //!
 //! Every compaction keeps what it replaced in the session (rig-memory's
 //! [`Compacted`]), so `/uncompact` lists them and `/uncompact N` puts back
@@ -200,7 +200,7 @@ fn present(
         .choice("accept", "Accept")
         .choice("edit", "Edit");
     #[cfg(feature = "tui")]
-    let ask = ask.choice("editor", "Edit in $EDITOR");
+    let ask = ask.choice("editor", "Edit in the editor");
     let ask = ask
         .choice("regenerate", "Regenerate")
         .choice("cancel", "Cancel");
@@ -400,11 +400,10 @@ fn list(store: Option<&dyn Store>, log: &str, compactions: &[Compacted]) -> Vec<
 
 #[cfg(feature = "tui")]
 mod editor {
-    //! The review's "Edit in $EDITOR": the summary in a file of the
+    //! The review's "Edit in the editor": the summary in a file of the
     //! session's scratch directory, edited with the terminal.
 
     use std::path::PathBuf;
-    use std::process::Command;
 
     use rig_basics::compaction::Summarizing;
     use rig_harness::prelude::*;
@@ -416,7 +415,7 @@ mod editor {
     #[derive(Component, Clone, Debug)]
     pub(super) struct EditorFor(Entity, PathBuf);
 
-    /// Opens the summary of `call` in `$EDITOR`, else asks for it here.
+    /// Opens the summary of `call` in the user's editor, else asks for it here.
     pub(super) fn open(
         commands: &mut Commands,
         call: Entity,
@@ -433,26 +432,33 @@ mod editor {
             ask_edit(commands, call, agent, summary);
             return;
         };
-        let program = std::env::var("EDITOR").unwrap_or_else(|_| "vi".to_owned());
-        let mut editor = Command::new(program);
-        editor.arg(&path);
+        let line = corpus_shared::editor::line();
+        let editor = corpus_shared::editor::command(line.as_deref(), &[&path]);
         commands.spawn((RunInTerminal(editor), EditorFor(call, path), HoldOf(call)));
     }
 
-    /// Takes the summary as the editor left it, unless it failed, back to
-    /// the review.
+    /// Takes the summary as the editor left it back to the review, unless
+    /// it failed, which a notice says.
     pub(super) fn take_edit(
         done: Query<(Entity, &TerminalExit, &EditorFor), Added<TerminalExit>>,
         mut calls: Query<(&mut Summarizing, &Replaces, &ForAgent)>,
         mut commands: Commands,
+        mut notices: MessageWriter<Notice>,
     ) {
         for (run, exit, EditorFor(call, path)) in &done {
             commands.entity(run).despawn();
             let Ok((mut summarizing, &replaces, &ForAgent(agent))) = calls.get_mut(*call) else {
                 continue;
             };
-            let text = std::fs::read_to_string(path).ok();
-            edit(&mut summarizing, text.filter(|_| exit.success()));
+            let text = match exit.failure() {
+                Some(why) => {
+                    let why = format!("The editor failed ({why}); the summary is unchanged.");
+                    notices.write(Notice::error(agent, why));
+                    None
+                }
+                None => std::fs::read_to_string(path).ok(),
+            };
+            edit(&mut summarizing, text);
             let call = (*call, agent);
             present(&mut commands, call, &summarizing, replaces);
         }
